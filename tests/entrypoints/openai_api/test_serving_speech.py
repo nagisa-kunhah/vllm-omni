@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
+    StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
@@ -1234,6 +1235,49 @@ class TestTTSMethods:
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
+    def test_build_tts_params_base_non_streaming_mode_true(self, speech_server):
+        """Base task should pass through an explicit non_streaming_mode override."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference",
+            non_streaming_mode=True,
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert params["non_streaming_mode"] == [True]
+
+    def test_build_tts_params_base_omits_non_streaming_mode_by_default(self, speech_server):
+        """Base task should keep using the model default when no override is sent."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference",
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert "non_streaming_mode" not in params
+
+    def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
+        """Explicit false should not be replaced by the VoiceDesign fallback."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            non_streaming_mode=False,
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["VoiceDesign"]
+        assert params["non_streaming_mode"] == [False]
+
     def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""
         mock_engine_client = mocker.MagicMock()
@@ -1960,6 +2004,34 @@ class TestMergeBatchItem:
         assert merged.speed == 1.5
         assert merged.task_type == "CustomVoice"
         assert merged.max_new_tokens == 512
+
+    def test_non_streaming_mode_batch_default_used(self):
+        """Batch-level non_streaming_mode should be used when item doesn't specify one."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            non_streaming_mode=True,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.non_streaming_mode is True
+
+    def test_non_streaming_mode_item_override_wins(self):
+        """Per-item false should override a true batch-level default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", non_streaming_mode=False)],
+            non_streaming_mode=True,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.non_streaming_mode is False
+
+
+def test_streaming_speech_session_config_accepts_non_streaming_mode():
+    config = StreamingSpeechSessionConfig(non_streaming_mode=True)
+
+    assert config.non_streaming_mode is True
 
 
 class TestAsyncOmniSupportedTasks:
