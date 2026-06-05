@@ -4,6 +4,9 @@
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 
+import os
+import time
+
 import torch
 from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
@@ -41,6 +44,17 @@ def _restore_tensor_devices(devices: list[tuple[torch.Tensor, torch.device]]) ->
             first_error = first_error or exc
     if first_error is not None:
         raise RuntimeError("Failed to restore one or more tensor placements") from first_error
+
+
+def _trace_offload_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_OFFLOAD_TRACE") == "1"
+
+
+def _module_device(module: nn.Module) -> str:
+    try:
+        return str(next(module.parameters()).device)
+    except StopIteration:
+        return "no-params"
 
 
 class SequentialOffloadHook(ModelHook):
@@ -102,10 +116,14 @@ class SequentialOffloadHook(ModelHook):
         return moved
 
     def _to_cpu(self, module: nn.Module) -> None:
+        # Non-blocking device-to-CPU copies are only useful when the target CPU
+        # tensor is pinned. Without pinned memory, prefer blocking copies so
+        # large model-level offload swaps do not leave long-running async copy
+        # work behind the Python control flow.
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
-        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
+        non_blocking = self.pin_memory and not self.use_hsdp and not current_omni_platform.is_xpu()
         moved = self._move_params(
             module,
             torch.device("cpu"),
@@ -119,6 +137,17 @@ class SequentialOffloadHook(ModelHook):
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
+        trace_enabled = _trace_offload_enabled()
+        start = time.perf_counter() if trace_enabled else 0.0
+        if trace_enabled:
+            logger.info(
+                "[offload-trace] pre_forward start module=%s device=%s targets=%s target_devices=%s",
+                module.__class__.__name__,
+                _module_device(module),
+                [target.__class__.__name__ for target in self.offload_targets],
+                [_module_device(target) for target in self.offload_targets],
+            )
+
         # Offload target modules to CPU
         for target in self.offload_targets:
             self._to_cpu(target)
@@ -126,6 +155,16 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
+
+        if trace_enabled:
+            logger.info(
+                "[offload-trace] pre_forward done module=%s device=%s targets=%s target_devices=%s elapsed=%.2fs",
+                module.__class__.__name__,
+                _module_device(module),
+                [target.__class__.__name__ for target in self.offload_targets],
+                [_module_device(target) for target in self.offload_targets],
+                time.perf_counter() - start,
+            )
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
