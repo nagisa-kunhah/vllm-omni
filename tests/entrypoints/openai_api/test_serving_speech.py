@@ -2821,6 +2821,27 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_false(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """VoiceDesign explicit false should reach the model prompt additional_information."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            non_streaming_mode=False,
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["VoiceDesign"]
+        assert tts_params["non_streaming_mode"] == [False]
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"] is tts_params
+        assert prompt["additional_information"]["non_streaming_mode"] == [False]
+
     def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
         """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
         wav_list = [0.0] * 48000

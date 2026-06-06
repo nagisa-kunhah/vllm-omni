@@ -2346,8 +2346,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if request.non_streaming_mode is not None:
             params["non_streaming_mode"] = [request.non_streaming_mode]
-        # VoiceDesign requires non_streaming_mode (match offline script behaviour).
-        # CustomVoice and Base rely on the model default (True and False respectively).
+        # Preserve the legacy VoiceDesign fallback when the request omits an
+        # explicit override. CustomVoice and Base rely on model defaults
+        # (True and False respectively).
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
