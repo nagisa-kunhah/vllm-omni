@@ -3,8 +3,6 @@
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
-import os
-import time
 
 import torch
 from torch import nn
@@ -18,17 +16,6 @@ from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
 from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
-
-
-def _trace_offload_enabled() -> bool:
-    return os.environ.get("VLLM_OMNI_OFFLOAD_TRACE") == "1"
-
-
-def _module_device(module: nn.Module) -> str:
-    try:
-        return str(next(module.parameters()).device)
-    except StopIteration:
-        return "no-params"
 
 
 def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
@@ -132,17 +119,6 @@ class SequentialOffloadHook(ModelHook):
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
-        trace_enabled = _trace_offload_enabled()
-        start = time.perf_counter() if trace_enabled else 0.0
-        if trace_enabled:
-            logger.info(
-                "[offload-trace] pre_forward start module=%s device=%s targets=%s target_devices=%s",
-                module.__class__.__name__,
-                _module_device(module),
-                [target.__class__.__name__ for target in self.offload_targets],
-                [_module_device(target) for target in self.offload_targets],
-            )
-
         # Offload target modules to CPU
         for target in self.offload_targets:
             self._to_cpu(target)
@@ -150,16 +126,6 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
-
-        if trace_enabled:
-            logger.info(
-                "[offload-trace] pre_forward done module=%s device=%s targets=%s target_devices=%s elapsed=%.2fs",
-                module.__class__.__name__,
-                _module_device(module),
-                [target.__class__.__name__ for target in self.offload_targets],
-                [_module_device(target) for target in self.offload_targets],
-                time.perf_counter() - start,
-            )
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
