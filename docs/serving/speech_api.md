@@ -456,7 +456,7 @@ Content-Type: application/json
 | `ref_audio` | string | null | Default reference audio (Base task) |
 | `ref_text` | string | null | Default reference transcript (Base task) |
 | `max_new_tokens` | integer | null | Default max tokens |
-| `non_streaming_mode` | bool | null | Default Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. |
+| `non_streaming_mode` | bool | null | Default Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 
 Each item in the `items` array requires only `input` (the text). All other fields are optional and override the batch-level defaults when set:
 
@@ -472,7 +472,7 @@ Each item in the `items` array requires only `input` (the text). All other field
 | `ref_audio` | string | Override reference audio |
 | `ref_text` | string | Override reference transcript |
 | `max_new_tokens` | integer | Override max tokens |
-| `non_streaming_mode` | bool | Override Qwen3-TTS prompt construction mode. Does not affect HTTP response streaming or async-chunk pipelining. |
+| `non_streaming_mode` | bool | Override Qwen3-TTS prompt construction mode. Does not affect HTTP response streaming or async-chunk pipelining. When null, inherits the batch-level value (then the model default). |
 
 ### Response Format
 
