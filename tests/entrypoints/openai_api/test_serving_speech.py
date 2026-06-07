@@ -2842,6 +2842,31 @@ class TestTTSAsyncOffloading:
         assert prompt["additional_information"] is tts_params
         assert prompt["additional_information"]["non_streaming_mode"] == [False]
 
+    def test_prepare_speech_generation_qwen3_base_non_streaming_mode_true(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Base explicit true should reach the model prompt additional_information."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000))
+        qwen3_tts_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference transcript",
+            non_streaming_mode=True,
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["Base"]
+        assert tts_params["ref_text"] == ["reference transcript"]
+        assert tts_params["non_streaming_mode"] == [True]
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"] is tts_params
+        assert prompt["additional_information"]["non_streaming_mode"] == [True]
+
     def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
         """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
         wav_list = [0.0] * 48000

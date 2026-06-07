@@ -99,7 +99,8 @@ class OpenAICreateSpeechRequest(BaseModel):
     non_streaming_mode: bool | None = Field(
         default=None,
         description=(
-            "Qwen3-TTS prompt construction mode override. "
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control HTTP response streaming or async-chunk pipelining. "
             "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
         ),
     )
@@ -331,7 +332,8 @@ class StreamingSpeechSessionConfig(BaseModel):
     non_streaming_mode: bool | None = Field(
         default=None,
         description=(
-            "Qwen3-TTS prompt construction mode override. "
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control WebSocket audio streaming or async-chunk pipelining. "
             "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
         ),
     )
