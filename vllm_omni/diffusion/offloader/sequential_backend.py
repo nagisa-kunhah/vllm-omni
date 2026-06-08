@@ -76,14 +76,10 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
-        # Non-blocking device-to-CPU copies are only useful when the target CPU
-        # tensor is pinned. Without pinned memory, prefer blocking copies so
-        # large model-level offload swaps do not leave long-running async copy
-        # work behind the Python control flow.
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
-        non_blocking = self.pin_memory and not self.use_hsdp and not current_omni_platform.is_xpu()
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         self._move_params(
             module,
             torch.device("cpu"),
