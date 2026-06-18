@@ -153,6 +153,7 @@ The following tables show which models support each feature:
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **NAVA**                     |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 
 
@@ -160,6 +161,8 @@ The following tables show which models support each feature:
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
 - **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, Helios, HunyuanVideo-1.5, DreamID-Omni
+
+> NAVA currently uses an upstream bridge pipeline. Native vLLM-Omni SP, Cache-DiT, TP, HSDP, and layerwise offload are not listed as supported until the NAVA backbone is ported into vLLM-Omni modules and validated.
 
 ### AudioGen
 

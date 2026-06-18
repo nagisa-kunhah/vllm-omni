@@ -978,6 +978,12 @@ class OmniDiffusionConfig:
                         self.model_class_name = "NextStep11Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "NAVA" or "NAVAPipeline" in architectures:
+                    if self.model_class_name is None:
+                        self.model_class_name = "NAVAPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.model_config = cfg
+                    self.update_multimodal_support()
                 elif model_type == "s2v":
                     if self.model_class_name is None:
                         self.model_class_name = "WanS2VPipeline"

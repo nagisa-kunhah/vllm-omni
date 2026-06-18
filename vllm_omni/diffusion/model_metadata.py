@@ -15,6 +15,7 @@ class DiffusionModelMetadata:
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
+NAVA_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
@@ -25,6 +26,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+    ),
+    "NAVAPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=NAVA_MAX_INPUT_IMAGES,
     ),
 }
 

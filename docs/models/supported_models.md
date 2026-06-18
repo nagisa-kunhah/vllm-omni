@@ -76,6 +76,7 @@ th {
 | `Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | ✅︎ | ✅︎ | | |
 | `FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✅︎ | ✅︎ | | |
 | `DreamIDOmniPipeline` | DreamID-Omni | `XuGuo699/DreamID-Omni` | ✅︎ | ✅︎ | | |
+| `NAVAPipeline` | NAVA audio-video generation | `baidu/NAVA` (local prepared directory) | ✅︎ | | | |
 | `SenseNovaU1Pipeline` | SenseNova-U1 (DiT-only) | `SenseNova/SenseNova-U1-8B-MoT` | ✅︎ | | | |
 | `LancePipeline` | Lance | `bytedance-research/Lance` | ✅︎ | | | |
 | `HunyuanVideo15Pipeline` | HunyuanVideo-1.5-T2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | ✅︎ | ✅︎ | | |
