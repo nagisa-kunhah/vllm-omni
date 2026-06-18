@@ -113,7 +113,10 @@ def main() -> None:
     local_dir = Path(args.local_dir).expanduser().resolve()
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.verify_only:
+    if args.verify_only:
+        verify_model_dir(local_dir)
+        print(f"Verified {local_dir}")
+    else:
         cmd = ["huggingface-cli", "download", args.repo_id, "--local-dir", str(local_dir)]
         if args.bf16_only:
             cmd.extend(["--exclude", "NAVA_fp8.safetensors"])
@@ -121,9 +124,9 @@ def main() -> None:
             cmd.extend(["--exclude", "NAVA.safetensors"])
         subprocess.run(cmd, check=True)
 
-    model_index_path = local_dir / "model_index.json"
-    model_index_path.write_text(json.dumps(build_model_index(local_dir), indent=2) + "\n", encoding="utf-8")
-    print(f"Wrote {model_index_path}")
+        model_index_path = local_dir / "model_index.json"
+        model_index_path.write_text(json.dumps(build_model_index(local_dir), indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {model_index_path}")
     verify_model_dir(local_dir)
 
     if args.install_upstream:

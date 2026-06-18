@@ -135,7 +135,6 @@ class NAVAPipeline(
             "align_3d_cfg",
             "audio_align_guidance_scale",
             "audio_guidance_scale",
-            "disable_text_encoder_compile",
             "frames",
             "fps",
             "height",
@@ -172,6 +171,7 @@ class NAVAPipeline(
     ):
         super().__init__()
         self.od_config = od_config
+        self._validate_runtime_features()
         self.device = get_local_device()
         self.nava_config = self._load_nava_config(od_config)
         self.audio_sample_rate = self.nava_config.audio_sample_rate
@@ -191,6 +191,32 @@ class NAVAPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return set()
+
+    def _validate_runtime_features(self) -> None:
+        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
+            raise ValueError(
+                "NAVAPipeline bridge does not support vLLM-Omni CPU/layerwise offload yet. "
+                "Use NAVA extra parameter `offload_backbone` for the upstream runtime, or disable "
+                "`--enable-cpu-offload` and `--enable-layerwise-offload`."
+            )
+
+        parallel_config = self.od_config.parallel_config
+        unsupported_parallel = {
+            "tensor_parallel_size": parallel_config.tensor_parallel_size,
+            "sequence_parallel_size": parallel_config.sequence_parallel_size,
+            "cfg_parallel_size": parallel_config.cfg_parallel_size,
+            "vae_patch_parallel_size": parallel_config.vae_patch_parallel_size,
+            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
+            "data_parallel_size": parallel_config.data_parallel_size,
+        }
+        enabled = {name: value for name, value in unsupported_parallel.items() if int(value or 1) != 1}
+        if enabled or parallel_config.use_hsdp or parallel_config.enable_expert_parallel:
+            raise ValueError(
+                "NAVAPipeline bridge does not support native vLLM-Omni parallelism yet. "
+                f"Unsupported settings: {enabled}, use_hsdp={parallel_config.use_hsdp}, "
+                f"enable_expert_parallel={parallel_config.enable_expert_parallel}. "
+                "Run this bridge with single-process diffusion settings until the NAVA backbone is ported."
+            )
 
     def forward(
         self,
@@ -246,7 +272,7 @@ class NAVAPipeline(
             raise ValueError(
                 "NAVAPipeline requires a local NAVA weight directory. "
                 "Run `python examples/offline_inference/nava/download_nava.py --local-dir <dir>` "
-                "or pass a prepared local directory with NAVA.safetensors, configs/nava.yaml, "
+                "or pass a prepared local directory with NAVA.safetensors, nava.yaml or configs/nava.yaml, "
                 "Wan2.2-TI2V-5B/, and params/."
             )
 
@@ -365,6 +391,12 @@ class NAVAPipeline(
             patch_model_to_fp8(self.pipe.model)
 
         missing, unexpected = self.pipe.model.load_state_dict(state_dict, strict=False)
+        loaded_count = len(state_dict) - len(unexpected)
+        if loaded_count <= 0:
+            raise RuntimeError(
+                "NAVA checkpoint did not match the upstream model state dict. "
+                f"Loaded 0 parameter(s) from {ckpt_path}; first checkpoint keys: {list(state_dict)[:8]}."
+            )
         if missing:
             logger.warning("NAVA checkpoint missing %d keys, first keys: %s", len(missing), missing[:8])
         if unexpected:
@@ -382,10 +414,12 @@ class NAVAPipeline(
         if explicit:
             candidates.append(str(explicit))
 
-        weight_dtype = self._extra_arg("nava_weight_dtype")
+        weight_dtype = self._extra_arg("nava_weight_dtype", "auto")
         if weight_dtype == "fp8_e4m3fn":
             candidates.append(self.nava_config.fp8_ckpt_name)
-        candidates.extend([self.nava_config.ckpt_name, self.nava_config.fp8_ckpt_name])
+        candidates.append(self.nava_config.ckpt_name)
+        if weight_dtype != "bf16":
+            candidates.append(self.nava_config.fp8_ckpt_name)
 
         for candidate in candidates:
             path = candidate if os.path.isabs(candidate) else self._join_model_path(candidate)
@@ -550,6 +584,12 @@ class NAVAPipeline(
             return None
         if not hasattr(self.audio_vae, "encode"):
             raise RuntimeError("NAVA upstream audio VAE does not expose encode(); speaker conditioning is unavailable.")
+        if hasattr(self.audio_vae, "spk_model") and self.audio_vae.spk_model is None:
+            raise RuntimeError(
+                "NAVA reference timbre control requires ReDimNet speaker embedding. "
+                "Run `python examples/offline_inference/nava/download_nava.py --prepare-redimnet` "
+                "and set TORCH_HOME consistently before inference."
+            )
 
         speaker_embeddings = []
         for wav in ctx.speaker_condition.wavs:
@@ -568,7 +608,7 @@ class NAVAPipeline(
             "first_frames": [sample["first_frames"]],
             "audio_latents": [sample["audio_latents"]],
             "captions": [sample["captions"]],
-            "spk_embs": [sample["spk_embs"]],
+            "spk_embs": None if sample["spk_embs"] is None else [sample["spk_embs"]],
             "is_i2v": [sample["is_i2v"]],
             "t_h_w_list": t_h_w_list,
         }

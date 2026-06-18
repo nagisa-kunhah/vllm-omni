@@ -23,7 +23,7 @@ bash examples/online_serving/nava/run_server.sh
 The script runs:
 
 ```bash
-vllm serve "$MODEL" --omni \
+vllm-omni serve "$MODEL" --omni \
   --model-class-name NAVAPipeline \
   --served-model-name nava \
   --port "$PORT" \
@@ -31,11 +31,17 @@ vllm serve "$MODEL" --omni \
   --disable-log-stats
 ```
 
+If `vllm-omni` is not in `PATH`, the script falls back to `vllm`.
+
 ## Send Request
 
 ```bash
 bash examples/online_serving/nava/run_curl_nava.sh
 ```
+
+`num_frames` follows upstream NAVA's temporal latent unit. The default `37`
+matches upstream examples and usually decodes to about `(37 - 1) * 4 + 1`
+output video frames.
 
 For image-conditioned generation, use `image_reference`:
 
@@ -82,7 +88,7 @@ export NAVA_E2E_MODEL=/data/models/NAVA
 pytest -q tests/e2e/online_serving/test_nava_expansion.py -m "full_model and diffusion"
 ```
 
-The test starts `vllm serve` with `--model-class-name NAVAPipeline --enforce-eager` and sends one `/v1/videos` text-to-audio-video request.
+The test starts the vLLM-Omni server with `--model-class-name NAVAPipeline --enforce-eager` and sends one `/v1/videos` text-to-audio-video request.
 
 ## Safety
 

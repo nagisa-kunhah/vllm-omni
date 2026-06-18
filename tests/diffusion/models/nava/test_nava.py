@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import types
 from argparse import Namespace
@@ -17,7 +19,7 @@ from PIL import Image
 from safetensors.torch import save_file
 from torch import nn
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output, supports_multimodal_input
 from vllm_omni.diffusion.models.nava import pipeline_nava as nava_pipeline_module
 from vllm_omni.diffusion.models.nava.config import (
@@ -42,7 +44,7 @@ from vllm_omni.diffusion.registry import (
     _NO_CACHE_ACCELERATION,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -165,14 +167,24 @@ class _FakeModel(nn.Module):
         self.backbone = _FakeBackbone()
 
 
+class _FakeVideoVAE:
+    def encode(self, image, **kwargs):
+        return SimpleNamespace(latent_dist=SimpleNamespace(sample=lambda: torch.zeros(1, 44, 80, 48)))
+
+
+class _FakeAudioVAE:
+    def encode(self, payload):
+        return SimpleNamespace(latent_dist=SimpleNamespace(sample=lambda: {"spk_embs": torch.ones(1, 192)}))
+
+
 class _FakeAudioVideoPipeline:
     created_kwargs: dict | None = None
 
     def __init__(self) -> None:
         self.model = _FakeModel()
         self.text_model = SimpleNamespace(model=object())
-        self.video_vae = SimpleNamespace()
-        self.audio_vae = SimpleNamespace()
+        self.video_vae = _FakeVideoVAE()
+        self.audio_vae = _FakeAudioVAE()
         self.sample_kwargs: dict | None = None
         self.sample_batch: dict | None = None
         self.to_device = None
@@ -188,6 +200,7 @@ class _FakeAudioVideoPipeline:
 
     def sample(self, batch, **kwargs):
         self.sample_batch = batch
+        assert batch["spk_embs"] is None or isinstance(batch["spk_embs"], list)
         self.sample_kwargs = kwargs
         video = torch.zeros(1, 2, 3, 4, 5)
         audio = [{"waveform": torch.ones(160), "sample_rate": 16000}]
@@ -247,6 +260,48 @@ def _make_forward_request() -> OmniDiffusionRequest:
     )
 
 
+def _make_image_forward_request() -> OmniDiffusionRequest:
+    sampling_params = OmniDiffusionSamplingParams(
+        height=704,
+        width=1280,
+        num_frames=37,
+        fps=24,
+        num_inference_steps=3,
+        seed=11,
+    )
+    return OmniDiffusionRequest(
+        prompts=[
+            {
+                "prompt": "continue the reference frame",
+                "multi_modal_data": {"image": Image.new("RGB", (8, 8), color=(255, 0, 0))},
+            }
+        ],
+        sampling_params=sampling_params,
+        request_id="nava-image-forward-test",
+    )
+
+
+def _make_speaker_forward_request() -> OmniDiffusionRequest:
+    sampling_params = OmniDiffusionSamplingParams(
+        height=704,
+        width=1280,
+        num_frames=37,
+        fps=24,
+        num_inference_steps=3,
+        seed=11,
+    )
+    return OmniDiffusionRequest(
+        prompts=[
+            {
+                "prompt": "<S>Hello from a reference speaker<E>",
+                "multi_modal_data": {"spk_wavs": ["speaker.wav"]},
+            }
+        ],
+        sampling_params=sampling_params,
+        request_id="nava-speaker-forward-test",
+    )
+
+
 def _load_serving_video_module(monkeypatch: pytest.MonkeyPatch):
     entrypoints_pkg = types.ModuleType("vllm_omni.entrypoints")
     entrypoints_pkg.__path__ = [str(_REPO_ROOT / "vllm_omni" / "entrypoints")]
@@ -294,7 +349,7 @@ def test_latent_shape_37_frames_1280x704() -> None:
     cfg = NAVAConfig()
 
     assert cfg.video_latent_hw() == (44, 80)
-    assert cfg.audio_latent_length() == 151
+    assert cfg.audio_latent_length() == 152
 
 
 def test_latent_shape_rejects_non_patch_aligned_resolution() -> None:
@@ -318,6 +373,12 @@ def test_yaml_video_tgt_frames_does_not_override_runtime_default() -> None:
 
     assert cfg.frames == 37
     assert cfg.fps == 24
+
+
+def test_yaml_transformer_patch_size_does_not_override_latent_stride() -> None:
+    cfg = NAVAConfig.from_dict({"patch_size": 2})
+
+    assert cfg.video_latent_hw(height=704, width=1280) == (44, 80)
 
 
 def test_speech_span_parser_single_speaker() -> None:
@@ -355,6 +416,22 @@ def test_request_text_only_becomes_t2av_context() -> None:
     assert ctx.frames == 37
     assert ctx.seed == 7
     assert not ctx.timbre_cfg
+
+
+def test_request_accepts_omni_text_prompt_shape() -> None:
+    pipeline = _make_nava_pipeline_shell()
+    request = _make_request(
+        OmniTextPrompt(prompt="cinematic beach sunrise", modalities=["video"]),
+        height=704,
+        width=1280,
+    )
+
+    ctx = pipeline._parse_request(request)
+
+    assert ctx.prompt == "cinematic beach sunrise"
+    assert ctx.image is None
+    assert ctx.speaker_condition is None
+    assert not ctx.is_i2v
 
 
 def test_request_rejects_multiple_prompts() -> None:
@@ -513,9 +590,9 @@ def test_build_sample_batch_without_image_or_speakers() -> None:
     assert batch["captions"] == ["plain prompt"]
     assert batch["t_h_w_list"].tolist() == [[37, 44, 80]]
     assert batch["video_latents"].shape == (1, 37 * 44 * 80, 48)
-    assert batch["audio_latents"][0].shape == (151, 128)
+    assert batch["audio_latents"][0].shape == (152, 128)
     assert batch["first_frames"] == [None]
-    assert batch["spk_embs"] == [None]
+    assert batch["spk_embs"] is None
 
 
 def test_encode_speakers_uses_audio_vae_once_per_reference() -> None:
@@ -537,6 +614,24 @@ def test_encode_speakers_uses_audio_vae_once_per_reference() -> None:
     assert calls == [{"data_path": "speaker.wav", "use_spk_emb": True}]
     assert len(embeddings) == 1
     assert embeddings[0].shape == (1, 192)
+
+
+def test_encode_speakers_rejects_missing_redimnet_model() -> None:
+    pipeline = _make_nava_pipeline_shell()
+
+    class FakeAudioVAE:
+        spk_model = None
+
+        def encode(self, payload):
+            raise AssertionError("encode should not run without a speaker model")
+
+    pipeline.audio_vae = FakeAudioVAE()
+    ctx = pipeline._parse_request(
+        _make_request({"prompt": "<S>Hello<E>", "multi_modal_data": {"spk_wavs": ["speaker.wav"]}})
+    )
+
+    with pytest.raises(RuntimeError, match="ReDimNet speaker embedding"):
+        pipeline._encode_speakers(ctx)
 
 
 def test_encode_image_converts_pil_first_frame_for_video_vae() -> None:
@@ -620,7 +715,6 @@ def test_component_discovery_lists_match_plan() -> None:
 
 def test_extra_body_params_cover_request_aliases() -> None:
     assert {
-        "disable_text_encoder_compile",
         "height",
         "width",
         "num_frames",
@@ -632,6 +726,7 @@ def test_extra_body_params_cover_request_aliases() -> None:
         "audio_guidance_scale",
         "timbre_cfg",
     }.issubset(NAVAPipeline.EXTRA_BODY_PARAMS)
+    assert "disable_text_encoder_compile" not in NAVAPipeline.EXTRA_BODY_PARAMS
     assert "nava_weight_dtype" not in NAVAPipeline.EXTRA_BODY_PARAMS
     assert "negative_prompt" not in NAVAPipeline.EXTRA_BODY_PARAMS
     assert "video_negative_prompt" not in NAVAPipeline.EXTRA_BODY_PARAMS
@@ -655,6 +750,40 @@ def test_weight_loader_rejects_missing_checkpoint(tmp_path: Path) -> None:
         pipeline._load_upstream_checkpoint()
 
 
+def test_load_nava_config_error_mentions_supported_config_layouts() -> None:
+    pipeline = _make_nava_pipeline_shell("/missing/nava")
+
+    with pytest.raises(ValueError) as exc_info:
+        pipeline._load_nava_config(pipeline.od_config)
+
+    message = str(exc_info.value)
+    assert "nava.yaml or configs/nava.yaml" in message
+    assert "Wan2.2-TI2V-5B/" in message
+
+
+def test_weight_loader_rejects_checkpoint_with_no_matching_keys(tmp_path: Path) -> None:
+    save_file({"other.weight": torch.ones(1)}, tmp_path / "NAVA.safetensors")
+    pipeline = _make_nava_pipeline_shell(tmp_path)
+
+    class FakeModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        def load_state_dict(self, state_dict, strict=True):
+            return [], list(state_dict)
+
+    pipeline.pipe = SimpleNamespace(
+        model=FakeModel(),
+        to=lambda device: None,
+    )
+    pipeline.model = pipeline.pipe.model
+    pipeline.device = torch.device("cpu")
+
+    with pytest.raises(RuntimeError, match="did not match the upstream model state dict"):
+        pipeline._load_upstream_checkpoint()
+
+
 def test_load_weights_noops_after_eager_checkpoint_load(tmp_path: Path) -> None:
     pipeline = _make_nava_pipeline_shell(tmp_path)
 
@@ -671,6 +800,27 @@ def test_load_nava_config_reads_upstream_config_layout(tmp_path: Path) -> None:
 
     assert cfg.config_name == "configs/nava.yaml"
     assert cfg.log_height == 720
+
+
+def test_load_nava_config_keeps_assembled_audio_vae_dir_over_yaml_training_path(tmp_path: Path) -> None:
+    _write_model_index(tmp_path / "model_index.json", {"_class_name": "NAVAPipeline", "audio_vae_dir": "params"})
+    yaml_path = tmp_path / "nava.yaml"
+    yaml_path.write_text(
+        "\n".join(
+            [
+                "model_type: NAVA",
+                "model:",
+                "  audio_vae_ckpt_dir: ./huggingface_upload/params",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pipeline = _make_nava_pipeline_shell(tmp_path)
+
+    cfg = pipeline._load_nava_config(pipeline.od_config)
+
+    assert cfg.audio_vae_ckpt_dir == "params"
 
 
 def test_load_nava_config_accepts_legacy_root_config_layout(tmp_path: Path) -> None:
@@ -749,6 +899,22 @@ def test_checkpoint_resolution_prefers_fp8_when_requested(tmp_path: Path) -> Non
     assert pipeline._resolve_checkpoint_path() == str(fp8_ckpt)
 
 
+def test_checkpoint_resolution_auto_falls_back_to_fp8(tmp_path: Path) -> None:
+    fp8_ckpt = tmp_path / "NAVA_fp8.safetensors"
+    fp8_ckpt.write_bytes(b"")
+    pipeline = _make_nava_pipeline_shell(tmp_path)
+
+    assert pipeline._resolve_checkpoint_path() == str(fp8_ckpt)
+
+
+def test_checkpoint_resolution_bf16_does_not_fallback_to_fp8(tmp_path: Path) -> None:
+    fp8_ckpt = tmp_path / "NAVA_fp8.safetensors"
+    fp8_ckpt.write_bytes(b"")
+    pipeline = _make_nava_pipeline_shell(tmp_path, custom_pipeline_args={"nava_weight_dtype": "bf16"})
+
+    assert pipeline._resolve_checkpoint_path() is None
+
+
 def test_nava_registered_as_diffusion_pipeline() -> None:
     assert _DIFFUSION_MODELS["NAVAPipeline"] == ("nava", "pipeline_nava", "NAVAPipeline")
 
@@ -759,6 +925,53 @@ def test_nava_postprocess_registered() -> None:
 
 def test_nava_cache_acceleration_disabled_for_bridge_pipeline() -> None:
     assert "NAVAPipeline" in _NO_CACHE_ACCELERATION
+
+
+def test_nava_rejects_vllm_omni_cpu_offload_for_bridge_pipeline(tmp_path: Path) -> None:
+    _write_fake_upstream_model_dir(tmp_path)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        enable_cpu_offload=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support vLLM-Omni CPU/layerwise offload"):
+        NAVAPipeline(od_config=od_config)
+
+
+def test_nava_rejects_vllm_omni_layerwise_offload_for_bridge_pipeline(tmp_path: Path) -> None:
+    _write_fake_upstream_model_dir(tmp_path)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        enable_layerwise_offload=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support vLLM-Omni CPU/layerwise offload"):
+        NAVAPipeline(od_config=od_config)
+
+
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        pytest.param(DiffusionParallelConfig(tensor_parallel_size=2), id="tp"),
+        pytest.param(DiffusionParallelConfig(data_parallel_size=2), id="dp"),
+        pytest.param(DiffusionParallelConfig(enable_expert_parallel=True), id="expert"),
+    ],
+)
+def test_nava_rejects_native_parallelism_for_bridge_pipeline(
+    tmp_path: Path,
+    parallel_config: DiffusionParallelConfig,
+) -> None:
+    _write_fake_upstream_model_dir(tmp_path)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        parallel_config=parallel_config,
+    )
+
+    with pytest.raises(ValueError, match="does not support native vLLM-Omni parallelism"):
+        NAVAPipeline(od_config=od_config)
 
 
 def test_nava_multimodal_capabilities_are_advertised() -> None:
@@ -847,6 +1060,18 @@ def test_offline_example_text_only_prompt_stays_plain_string() -> None:
     assert prompt == "a person speaks"
 
 
+def test_offline_example_help_does_not_import_runtime_stack() -> None:
+    result = subprocess.run(
+        [sys.executable, str(_END2END_SCRIPT_PATH), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--model" in result.stdout
+    assert "--prompt" in result.stdout
+
+
 def test_offline_example_image_and_speakers_build_multimodal_prompt(tmp_path: Path) -> None:
     module = _load_end2end_script()
     image_path = tmp_path / "first.png"
@@ -887,6 +1112,42 @@ def test_offline_example_sampling_params_can_disable_timbre_cfg_with_speaker() -
     sampling_params = module._build_sampling_params(_base_args(spk_wavs=["speaker.wav"], disable_timbre_cfg=True))
 
     assert sampling_params.extra_args["timbre_cfg"] is False
+
+
+def test_online_run_server_prefers_vllm_omni_cli(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    called_path = tmp_path / "called.txt"
+    fake_cli = bin_dir / "vllm-omni"
+    fake_cli.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                f"printf '%s\\n' \"$@\" > {called_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "MODEL": "/models/nava",
+        "HOST": "127.0.0.1",
+        "PORT": "18000",
+        "SERVED_MODEL_NAME": "nava-test",
+    }
+
+    subprocess.run(["bash", str(_ONLINE_DIR / "run_server.sh")], check=True, env=env)
+
+    args = called_path.read_text(encoding="utf-8").splitlines()
+    assert args[:3] == ["serve", "/models/nava", "--omni"]
+    assert "--model-class-name" in args
+    assert args[args.index("--model-class-name") + 1] == "NAVAPipeline"
+    assert args[args.index("--served-model-name") + 1] == "nava-test"
+    assert args[args.index("--port") + 1] == "18000"
 
 
 def test_online_curl_script_uses_current_video_job_api() -> None:
@@ -937,6 +1198,7 @@ def test_nava_pipeline_init_and_text_forward_with_fake_upstream(
     assert pipeline.pipe.sample_batch is not None
     assert pipeline.pipe.sample_batch["captions"] == ["cinematic beach sunrise"]
     assert pipeline.pipe.sample_batch["video_latents"].shape == (1, 37 * 44 * 80, 48)
+    assert pipeline.pipe.sample_batch["spk_embs"] is None
     assert pipeline.pipe.sample_kwargs is not None
     assert pipeline.pipe.sample_kwargs["num_steps"] == 3
     assert pipeline.pipe.sample_kwargs["video_guidance_scale"] == 4.0
@@ -948,6 +1210,50 @@ def test_nava_pipeline_init_and_text_forward_with_fake_upstream(
     assert torch.equal(output["audio"], torch.ones(160))
     assert output["audio_sample_rate"] == 16000
     assert output["fps"] == 24
+
+
+def test_nava_pipeline_image_forward_marks_i2v_for_fake_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_fake_upstream(monkeypatch)
+    _write_fake_upstream_model_dir(tmp_path)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        enforce_eager=True,
+    )
+
+    pipeline = NAVAPipeline(od_config=od_config)
+    pipeline.forward(_make_image_forward_request())
+
+    assert pipeline.pipe.sample_batch is not None
+    assert isinstance(pipeline.pipe.sample_batch["first_frames"][0], torch.Tensor)
+    assert pipeline.pipe.sample_batch["spk_embs"] is None
+    assert pipeline.pipe.sample_kwargs is not None
+    assert pipeline.pipe.sample_kwargs["is_i2v"] is True
+
+
+def test_nava_pipeline_speaker_forward_passes_embeddings_to_fake_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_fake_upstream(monkeypatch)
+    _write_fake_upstream_model_dir(tmp_path)
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        enforce_eager=True,
+    )
+
+    pipeline = NAVAPipeline(od_config=od_config)
+    pipeline.forward(_make_speaker_forward_request())
+
+    assert pipeline.pipe.sample_batch is not None
+    assert pipeline.pipe.sample_batch["captions"] == ["<S><extra_id_2>Hello from a reference speaker<E>"]
+    assert pipeline.pipe.sample_batch["spk_embs"][0][0].shape == (1, 192)
+    assert pipeline.pipe.sample_kwargs is not None
+    assert pipeline.pipe.sample_kwargs["timbre_cfg"] is True
 
 
 def test_nava_pipeline_create_parses_string_bool_config(
@@ -1071,6 +1377,35 @@ def test_download_script_can_prepare_redimnet_without_installing_upstream(
     assert redimnet_calls == [str(tmp_path / "torch-cache")]
 
 
+def test_download_script_verify_only_can_prepare_redimnet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_download_script()
+    redimnet_calls: list[str | None] = []
+    _write_download_model_dir(tmp_path)
+
+    monkeypatch.setattr(module, "prepare_redimnet", lambda torch_home: redimnet_calls.append(torch_home))
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            "download_nava.py",
+            "--local-dir",
+            str(tmp_path),
+            "--verify-only",
+            "--prepare-redimnet",
+            "--torch-home",
+            str(tmp_path / "torch-cache"),
+        ],
+    )
+
+    module.main()
+
+    assert redimnet_calls == [str(tmp_path / "torch-cache")]
+    assert not (tmp_path / "model_index.json").exists()
+
+
 def test_download_script_verify_only_rejects_incomplete_model_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1092,6 +1427,7 @@ def test_download_script_verify_only_accepts_minimal_model_dir(
 ) -> None:
     module = _load_download_script()
     _write_download_model_dir(tmp_path)
+    model_index_path = tmp_path / "model_index.json"
     monkeypatch.setattr(
         module.sys,
         "argv",
@@ -1100,8 +1436,7 @@ def test_download_script_verify_only_accepts_minimal_model_dir(
 
     module.main()
 
-    model_index = json.loads((tmp_path / "model_index.json").read_text(encoding="utf-8"))
-    assert model_index["_class_name"] == "NAVAPipeline"
+    assert not model_index_path.exists()
 
 
 def test_download_script_model_index_uses_legacy_config_when_only_root_yaml_exists(tmp_path: Path) -> None:
@@ -1130,5 +1465,4 @@ def test_download_script_verify_only_accepts_legacy_root_config(
 
     module.main()
 
-    model_index = json.loads((tmp_path / "model_index.json").read_text(encoding="utf-8"))
-    assert model_index["config"] == "nava.yaml"
+    assert not (tmp_path / "model_index.json").exists()

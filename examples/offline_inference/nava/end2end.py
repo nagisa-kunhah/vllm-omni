@@ -7,12 +7,13 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+if TYPE_CHECKING:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +69,8 @@ def _build_prompt(args: argparse.Namespace) -> str | dict[str, Any]:
 
 
 def _build_sampling_params(args: argparse.Namespace) -> OmniDiffusionSamplingParams:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
     return OmniDiffusionSamplingParams(
         height=args.height,
         width=args.width,

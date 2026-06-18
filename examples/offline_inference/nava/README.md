@@ -5,7 +5,7 @@ This example runs `NAVAPipeline`, the vLLM-Omni bridge for Baidu NAVA text/image
 NAVA is a custom upstream project, not a standard Diffusers pipeline. The first vLLM-Omni integration expects:
 
 - A local NAVA weight directory containing `NAVA.safetensors` or `NAVA_fp8.safetensors`.
-- `configs/nava.yaml` from the upstream NAVA release. A legacy root-level `nava.yaml` is accepted for existing local assemblies.
+- `nava.yaml` from the current Hugging Face release, or `configs/nava.yaml` from an upstream source checkout.
 - Upstream NAVA Python code installed so `import nava_src` works.
 - Wan2.2 video VAE files and LTX audio VAE files in the same layout as the upstream release.
 - ReDimNet in the torch hub cache when using reference timbre control.
@@ -65,6 +65,10 @@ python examples/offline_inference/nava/download_nava.py \
 If you pass `--torch-home /data/torch-cache`, export the same `TORCH_HOME` before running offline inference or online serving.
 
 ## Text To Audio-Video
+
+`--frames` follows upstream NAVA's temporal latent unit. The default `37`
+matches upstream examples and usually decodes to about `(37 - 1) * 4 + 1`
+output video frames.
 
 ```bash
 python examples/offline_inference/nava/end2end.py \

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -43,7 +44,7 @@ class NAVAConfig:
     audio_latent_ch: int = 128
     video_latent_ch: int = 48
     lambda_ddpm: float = 1.0
-    patch_size: int = 16
+    latent_spatial_stride: int = 16
     log_height: int = 704
     log_width: int = 1280
     frames: int = 37
@@ -70,10 +71,6 @@ class NAVAConfig:
             return cls()
 
         data = dict(raw)
-        model_block = data.get("model")
-        if isinstance(model_block, dict) and "audio_vae_ckpt_dir" not in data:
-            data["audio_vae_ckpt_dir"] = model_block.get("audio_vae_ckpt_dir", cls.audio_vae_ckpt_dir)
-
         data_block = data.get("data")
         if isinstance(data_block, dict):
             if "audio_tokens_per_sec" not in data:
@@ -84,6 +81,14 @@ class NAVAConfig:
         for old_key, new_key in NAVA_CONFIG_ALIAS_MAP.items():
             if old_key in data and new_key not in data:
                 data[new_key] = data[old_key]
+
+        model_block = data.get("model")
+        if isinstance(model_block, dict) and "audio_vae_ckpt_dir" not in data:
+            data["audio_vae_ckpt_dir"] = model_block.get("audio_vae_ckpt_dir", cls.audio_vae_ckpt_dir)
+
+        # Upstream NAVA config uses ``patch_size`` for the transformer patch.
+        # Keep local latent shape math tied to the total VAE/downsample stride.
+        data.pop("patch_size", None)
 
         valid_keys = cls.__dataclass_fields__.keys()
         kwargs = {key: value for key, value in data.items() if key in valid_keys}
@@ -96,18 +101,18 @@ class NAVAConfig:
     def video_latent_hw(self, height: int | None = None, width: int | None = None) -> tuple[int, int]:
         resolved_height = int(height or self.log_height)
         resolved_width = int(width or self.log_width)
-        if resolved_height % self.patch_size != 0 or resolved_width % self.patch_size != 0:
+        if resolved_height % self.latent_spatial_stride != 0 or resolved_width % self.latent_spatial_stride != 0:
             raise ValueError(
                 "NAVA height and width must be divisible by "
-                f"{self.patch_size}: got height={resolved_height}, width={resolved_width}."
+                f"{self.latent_spatial_stride}: got height={resolved_height}, width={resolved_width}."
             )
-        return resolved_height // self.patch_size, resolved_width // self.patch_size
+        return resolved_height // self.latent_spatial_stride, resolved_width // self.latent_spatial_stride
 
     def audio_latent_length(self, frames: int | None = None, fps: int | None = None) -> int:
         resolved_frames = int(frames or self.frames)
         resolved_fps = int(fps or self.fps)
         video_duration = ((resolved_frames - 1) * 4 + 1) / resolved_fps
-        return max(1, int(video_duration * self.audio_tokens_per_sec))
+        return max(1, math.ceil(video_duration * self.audio_tokens_per_sec))
 
 
 @dataclass(frozen=True)
