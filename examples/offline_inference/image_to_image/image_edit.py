@@ -507,7 +507,6 @@ def main():
         cache_config=cache_config,
         parallel_config=parallel_config,
         enable_cpu_offload=args.enable_cpu_offload,
-        pin_cpu_memory=not args.disable_pin_cpu_memory,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
         init_timeout=args.init_timeout,
