@@ -306,21 +306,26 @@ _OMNI_MODELS = {
         "modeling_moss_tts_codec",
         "MossTTSCodecDecoder",
     ),
+    ## MOSS-TTS Local Transformer v1.5
+    "MossTTSLocalModel": (
+        "moss_tts_local",
+        "modeling_moss_tts_local",
+        "MossTTSLocalForGeneration",
+    ),
+    "MossTTSLocalNativeModel": (
+        "moss_tts_local",
+        "modeling_moss_tts_local_v2",
+        "MossTTSLocalNativeModel",
+    ),
+    "MossTTSLocalVocoder": (
+        "moss_tts_local",
+        "modeling_moss_tts_local_vocoder",
+        "MossTTSLocalVocoder",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
-    ),
-    ## IndexTTS2
-    "IndexTTS2TalkerForConditionalGeneration": (
-        "indextts2",
-        "indextts2_talker",
-        "IndexTTS2TalkerForConditionalGeneration",
-    ),
-    "IndexTTS2S2MelDecoder": (
-        "indextts2",
-        "indextts2_s2mel_decoder",
-        "IndexTTS2S2MelDecoder",
     ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (
@@ -359,11 +364,6 @@ _OMNI_MODELS = {
         "minicpmo_4_5",
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
-    ),
-    "AuraQwen3VLForConditionalGeneration": (
-        "aura_omni",
-        "qwen3_vl",
-        "AuraQwen3VLForConditionalGeneration",
     ),
 }
 
