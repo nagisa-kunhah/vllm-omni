@@ -65,6 +65,25 @@ def _flatten_codes_tensor(codes_t_nq: torch.Tensor) -> torch.Tensor:
     return codes_t_nq.to(torch.long).transpose(0, 1).contiguous().reshape(-1).cpu()
 
 
+def _meta_step_for_req(meta: Mapping[str, Any], req_id: str) -> int:
+    step = meta.get("step", -1)
+    req_ids = meta.get("req_id")
+    if isinstance(step, torch.Tensor):
+        step = step.detach().cpu().reshape(-1).tolist()
+    if isinstance(req_ids, torch.Tensor):
+        req_ids = req_ids.detach().cpu().reshape(-1).tolist()
+    if isinstance(step, (list, tuple)):
+        if isinstance(req_ids, (list, tuple)):
+            for idx, rid in enumerate(req_ids):
+                if str(rid) == req_id and idx < len(step):
+                    return int(step[idx])
+        return -1
+    try:
+        return int(step)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _get_stage_output(stage_outputs: Any, source: Any) -> Any:
     if isinstance(stage_outputs, dict):
         if source in stage_outputs:
@@ -152,7 +171,7 @@ def talker2vocoder_async_chunk(
     multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> OmniPayloadStruct | None:
+) -> OmniPayloadStruct | list[OmniPayloadStruct] | None:
     req_id = str(getattr(request, "external_req_id", None) or getattr(request, "request_id", id(request)))
     if not hasattr(transfer_manager, "_moss_tts_local_state"):
         transfer_manager._moss_tts_local_state = {}
@@ -164,7 +183,7 @@ def talker2vocoder_async_chunk(
         snapshot = codes_dict.get("audio")
         if isinstance(snapshot, torch.Tensor) and snapshot.numel() > 0:
             meta = multimodal_output.get("meta", {}) or {}
-            step = int(meta.get("step", -1)) if isinstance(meta, dict) else -1
+            step = _meta_step_for_req(meta, req_id) if isinstance(meta, Mapping) else -1
             if step >= 0 and step <= req_state.get("last_step", -1):
                 pass
             else:
@@ -210,28 +229,48 @@ def talker2vocoder_async_chunk(
     if not is_finished and pending_frames < threshold:
         return None
 
-    # Only materialize (concat) when we're actually emitting
+    # Only materialize (concat) when we're actually emitting.
     pending_list = req_state["pending"]
     acc = torch.cat(pending_list, dim=0) if len(pending_list) > 1 else pending_list[0]
-    emit_frames = pending_frames if is_finished else threshold
+
+    def make_payload(chunk_t_nq: torch.Tensor, *, finished: bool) -> OmniPayloadStruct:
+        flat = _flatten_codes_tensor(chunk_t_nq)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=flat),
+            meta=MetaStruct(
+                left_context_size=0,
+                finished=torch.tensor(bool(finished), dtype=torch.bool),
+                codec_streaming=True,
+                req_id=[req_id],
+            ),
+            request_id=req_id,
+        )
+
+    if is_finished:
+        payloads: list[OmniPayloadStruct] = []
+        cursor = 0
+        local_emitted = emitted_frames
+        while cursor < pending_frames:
+            local_threshold = (
+                initial_chunk_frames
+                if local_emitted == 0 and initial_chunk_frames > 0
+                else chunk_frames
+            )
+            emit_frames = min(local_threshold, pending_frames - cursor)
+            chunk = acc[cursor:cursor + emit_frames]
+            cursor += emit_frames
+            local_emitted += emit_frames
+            payloads.append(make_payload(chunk, finished=cursor >= pending_frames))
+        state.pop(req_id, None)
+        return payloads
+
+    emit_frames = threshold
     chunk = acc[:emit_frames]
     remaining = acc[emit_frames:] if emit_frames < pending_frames else None
     req_state["emitted_frames"] = emitted_frames + emit_frames
     req_state["pending"] = [remaining] if remaining is not None and remaining.numel() > 0 else []
     req_state["pending_frames"] = int(remaining.shape[0]) if remaining is not None and remaining.numel() > 0 else 0
-    if is_finished:
-        state.pop(req_id, None)
-    flat = _flatten_codes_tensor(chunk)
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=flat),
-        meta=MetaStruct(
-            left_context_size=0,
-            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
-            codec_streaming=True,
-            req_id=[req_id],
-        ),
-        request_id=req_id,
-    )
+    return make_payload(chunk, finished=False)
 
 
 __all__ = ["talker2vocoder", "vocoder_token_only", "talker2vocoder_async_chunk"]
