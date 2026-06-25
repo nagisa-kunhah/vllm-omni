@@ -244,7 +244,6 @@ def _rope_params(max_seq_len, dim, theta=10000, freqs_scaling=1.0):
 def _rope_apply_joint(x, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, vid_seq_len):
     x_vid = x[:, :vid_seq_len, :, :]
     x_audio = x[:, vid_seq_len:, :, :]
-    # print(x_vid.shape, x_audio.shape, 88888)
     x_video_rope = _rope_apply_3d(x_vid, grid_sizes_vid, freqs_vid)
     x_audio_rope = _rope_apply_1d(x_audio, grid_sizes_audio, freqs_audio)
     x_rope = torch.cat([x_video_rope, x_audio_rope], dim=1)
@@ -404,7 +403,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
         q, k, v = self._qkv_fn(x) if not is_audio else self._qkv_fn_audio(x)
 
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard head")
             q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
             k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
             v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
@@ -417,7 +415,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
             window_size=self.window_size,
         )
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard sequence")
             x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
         # output
         x = x.flatten(2)
@@ -462,7 +459,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
             pos = torch.arange(L).unsqueeze(0).expand(B, L)
 
             if use_joint_attention:
-                # print("joint attention apply")
                 # Mark valid video/audio tokens before compacting padded positions.
                 is_vid_valid = (pos < max_seq_len_vid) & (pos < seq_lens_vid.unsqueeze(1))
                 is_aud_valid = (pos >= max_seq_len_vid) & ((pos - max_seq_len_vid) < seq_lens_audio.unsqueeze(1))
@@ -473,7 +469,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x_vid.device)  # shape: [B, L]
 
                 if self.use_sp:
-                    # print(f"[DEBUG SP] Doing all to all to shard head")
                     q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
                     k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
                     v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
@@ -523,7 +518,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 )
                 x = torch.cat([x_vid, x_audio], dim=1)
             if self.use_sp:
-                # print(f"[DEBUG SP] Doing all to all to shard sequence")
                 x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
             # output
             x = x.flatten(2)
@@ -587,7 +581,6 @@ class WanSelfAttention(nn.Module):
         """
         q, k, v = self._qkv_fn(x)
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard head")
             q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
             k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
             v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
@@ -600,7 +593,6 @@ class WanSelfAttention(nn.Module):
             window_size=self.window_size,
         )
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard sequence")
             x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
         # output
         x = x.flatten(2)
@@ -636,12 +628,10 @@ class WanSelfAttention(nn.Module):
             pos = torch.arange(L).unsqueeze(0).expand(B, L)
             q, k, v = self._qkv_fn(x)
             if self.use_sp:
-                # print(f"[DEBUG SP] Doing all to all to shard head")
                 q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
                 k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
                 v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
             if use_joint_attention:
-                # print("joint attention apply")
                 is_vid_valid = (pos < max_seq_len_vid) & (pos < seq_lens_vid.unsqueeze(1))
                 is_aud_valid = (pos >= max_seq_len_vid) & ((pos - max_seq_len_vid) < seq_lens_audio.unsqueeze(1))
 
@@ -702,7 +692,6 @@ class WanSelfAttention(nn.Module):
                 )
                 x = torch.cat([x_vid, x_audio], dim=1)
             if self.use_sp:
-                # print(f"[DEBUG SP] Doing all to all to shard sequence")
                 x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
             # output
             x = x.flatten(2)
@@ -838,7 +827,6 @@ class WanI2VCrossAttention(WanSelfAttention):
         q, k, v, k_img, v_img = self._qkv_fn(x, context)
 
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard head")
             q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
             k = torch.chunk(k, self.sp_size, dim=2)[self.sp_rank]
             v = torch.chunk(v, self.sp_size, dim=2)[self.sp_rank]
@@ -851,7 +839,6 @@ class WanI2VCrossAttention(WanSelfAttention):
         # compute attention
         x = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
         if self.use_sp:
-            # print(f"[DEBUG SP] Doing all to all to shard sequence")
             x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
 
         # output
@@ -1144,7 +1131,6 @@ class WanAttentionBlock(nn.Module):
         """
         if not self.split_av_qk_norm_modulation:
             if max_seq_len_vid > 0 and max_seq_len_audio > 0:
-                # print(e_vid.shape, e_audio.shape, 9999)
                 e = torch.cat([e_vid, e_audio], dim=1)
             elif max_seq_len_vid > 0:
                 e = e_vid
@@ -1614,7 +1600,6 @@ class WanAVModel(nn.Module):
                 _first_images_seq_len = grid_sizes[:, 1:].prod(-1)
                 for i in range(t.size(0)):
                     t[i, : _first_images_seq_len[i]] = 0
-                # print(f"zeroing out first {_first_images_seq_len} from t: {t.shape}, {t}")
             else:
                 t = t.unsqueeze(1).expand(t.size(0), seq_len)
         with amp.autocast("cuda", dtype=torch.bfloat16):
