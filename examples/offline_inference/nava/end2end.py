@@ -53,9 +53,9 @@ def _build_sampling_params(args: argparse.Namespace) -> OmniDiffusionSamplingPar
 
 def main() -> None:
     args = parse_args()
-    omni = Omni(model=args.model, model_class_name="NAVAPipeline")
-    outputs = omni.generate(prompts=[_build_prompt(args)], sampling_params=_build_sampling_params(args))
-    output = outputs[0].request_output
+    omni = Omni(model=args.model, model_class_name="NAVAPipeline", enforce_eager=True)
+    outputs = omni.generate([_build_prompt(args)], _build_sampling_params(args))
+    output = outputs[0]
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {

@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from inspect import signature
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 from torch import nn
 from vllm.logger import init_logger
@@ -25,7 +26,9 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.nava.audio_vae import NAVAAudioVAE
 from vllm_omni.diffusion.models.nava.config import (
+    DEFAULT_NAVA_AUDIO_NEGATIVE_PROMPT,
     DEFAULT_NAVA_MODEL_INDEX,
+    DEFAULT_NAVA_VIDEO_NEGATIVE_PROMPT,
     NAVA_CONFIG_ALIAS_MAP,
     NAVAConfig,
     NAVARequestContext,
@@ -36,6 +39,7 @@ from vllm_omni.diffusion.models.nava.config import (
 from vllm_omni.diffusion.models.nava.nava_transformer import NAVATransformer
 from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
+from vllm_omni.diffusion.models.nava.text_encoder import NAVAWanTextEncoder as _NAVATextEncoder
 from vllm_omni.diffusion.models.nava.utils import as_bool, image_to_tensor, move_to_device, resolve_num_frames
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -88,28 +92,6 @@ class NAVAPipeline(
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
     _resident_modules: ClassVar[list[str]] = []
 
-    EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "align_3d_cfg",
-            "audio_align_guidance_scale",
-            "audio_guidance_scale",
-            "frames",
-            "fps",
-            "height",
-            "negative_prompt",
-            "num_frames",
-            "num_inference_steps",
-            "num_steps",
-            "seed",
-            "spk_wavs",
-            "timbre_align_guidance_scale",
-            "timbre_cfg",
-            "video_align_guidance_scale",
-            "video_guidance_scale",
-            "width",
-        }
-    )
-
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
         del prefix
@@ -120,15 +102,22 @@ class NAVAPipeline(
         self.fps = self.nava_config.fps
         self.scheduler = NAVAFlowMatchScheduler(shift=5.0)
         self.scheduler_audio = NAVAFlowMatchScheduler(shift=5.0)
+        init_seed = self._custom_pipeline_arg("nava_init_seed")
+        if init_seed is not None:
+            self._set_seed(int(init_seed))
+        self._rng_state_after_init: dict[str, Any] | None = None
         self._validate_runtime_features()
         self._init_native_components()
+        if as_bool(self._custom_pipeline_arg("nava_restore_init_cuda_rng_before_sample", False)):
+            self._rng_state_after_init = self._capture_rng_state()
         self._init_weight_sources()
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.transformer.load_weights(weights)
+        loaded = self.transformer.load_weights(weights)
+        return {f"transformer.{name}" for name in loaded}
 
     def forward(self, request: OmniDiffusionRequest, **kwargs: Any) -> DiffusionOutput:
         del kwargs
@@ -140,7 +129,7 @@ class NAVAPipeline(
             speaker_positions = None
         else:
             text_embeds, speaker_positions = self._encode_text_with_speaker_positions(ctx.prompt)
-        negative_text_embeds = self._encode_text(ctx.negative_prompt)
+        negative_video_text_embeds, negative_audio_text_embeds = self._encode_negative_texts(ctx, text_embeds)
         image_embeds = self._encode_image(ctx)
         speaker_embeds = self._encode_speakers(ctx)
         if speaker_embeds is not None and not speaker_positions:
@@ -157,7 +146,8 @@ class NAVAPipeline(
             video_latents=latents["video"],
             audio_latents=latents["audio"],
             text_embeds=text_embeds,
-            negative_text_embeds=negative_text_embeds,
+            negative_video_text_embeds=negative_video_text_embeds,
+            negative_audio_text_embeds=negative_audio_text_embeds,
             image_embeds=image_embeds,
             speaker_embeds=speaker_embeds,
             speaker_positions=speaker_positions,
@@ -194,21 +184,18 @@ class NAVAPipeline(
             )
 
     def _init_native_components(self) -> None:
-        overrides = self.od_config.custom_pipeline_args or {}
-        if overrides:
-            self.text_encoder = overrides.get("text_encoder") or _MissingNAVAComponent("text_encoder")
-            self.video_vae = overrides.get("video_vae") or _MissingNAVAComponent("video_vae")
-            self.audio_vae = overrides.get("audio_vae") or _MissingNAVAComponent("audio_vae")
-            self.speaker_encoder = overrides.get("speaker_encoder") or _MissingNAVAComponent("speaker_encoder")
-            self.transformer = overrides.get("transformer") or _MissingNAVAComponent("transformer")
-        else:
-            model_root = self._require_local_model_root()
-            self.text_encoder = _NAVATextEncoder(model_root, self.nava_config, self.device)
-            self.video_vae = NAVAVideoVAE(model_root, self.nava_config, self.device)
-            self.audio_vae = NAVAAudioVAE(model_root, self.nava_config)
-            self.speaker_encoder = NAVASpeakerEncoder(model_root, self.nava_config)
-            self.transformer = NAVATransformer(self.nava_config)
-        self.model = self.transformer
+        model_root = self._require_local_model_root()
+        text_compile = as_bool(self._custom_pipeline_arg("nava_text_encoder_compile", True))
+        self.text_encoder = _NAVATextEncoder(
+            model_root,
+            self.nava_config,
+            self.device,
+            compile_model=text_compile,
+        )
+        self.video_vae = NAVAVideoVAE(model_root, self.nava_config, self.device)
+        self.audio_vae = NAVAAudioVAE(model_root, self.nava_config)
+        self.speaker_encoder = NAVASpeakerEncoder(model_root, self.nava_config)
+        self.transformer = NAVATransformer(self.nava_config)
         self.vae = self.video_vae
         self.to(self.device)
 
@@ -230,7 +217,7 @@ class NAVAPipeline(
                 model_or_path=model,
                 subfolder=None,
                 revision=self.od_config.revision,
-                prefix="",
+                prefix="transformer.",
                 fall_back_to_pt=False,
                 allow_patterns_overrides=[self.nava_config.ckpt_name],
             )
@@ -238,6 +225,8 @@ class NAVAPipeline(
 
     def _load_nava_config(self, od_config: OmniDiffusionConfig) -> NAVAConfig:
         config_data: dict[str, Any] = dict(DEFAULT_NAVA_MODEL_INDEX)
+        explicit = dict(od_config.model_config or {})
+        explicit_config_name = explicit.get("config_name", explicit.get("config"))
         if od_config.model and os.path.isdir(str(od_config.model)):
             index_path = os.path.join(str(od_config.model), "model_index.json")
             if os.path.exists(index_path):
@@ -245,7 +234,7 @@ class NAVAPipeline(
                     index_data = json.load(f)
                 if isinstance(index_data, dict):
                     config_data.update(index_data)
-            config_name = str(config_data.get("config") or DEFAULT_NAVA_MODEL_INDEX["config"])
+            config_name = str(explicit_config_name or config_data.get("config") or DEFAULT_NAVA_MODEL_INDEX["config"])
             config_path = os.path.join(str(od_config.model), config_name)
             if not os.path.exists(config_path) and config_name == "configs/nava.yaml":
                 legacy_path = os.path.join(str(od_config.model), "nava.yaml")
@@ -261,12 +250,15 @@ class NAVAPipeline(
                 if isinstance(joint_config, dict):
                     config_data.setdefault("model", {})["joint_config_data"] = joint_config
 
-        explicit = dict(od_config.model_config or {})
         for old_key, new_key in NAVA_CONFIG_ALIAS_MAP.items():
             if old_key in explicit:
                 explicit[new_key] = explicit[old_key]
+        explicit_keys = set(explicit)
         config_data.update(explicit)
-        config_data.update(od_config.additional_config or {})
+        additional = dict(od_config.additional_config or {})
+        explicit_keys.update(additional)
+        config_data.update(additional)
+        config_data["_explicit_keys"] = explicit_keys
         return NAVAConfig.from_dict(config_data)
 
     def _parse_request(self, request: OmniDiffusionRequest) -> NAVARequestContext:
@@ -282,12 +274,12 @@ class NAVAPipeline(
         speaker_condition = self._parse_speaker_condition(prompt, multi_modal_data, extra)
         image = multi_modal_data.get("image")
 
-        frames = self.nava_config.normalize_output_frames(
-            resolve_num_frames(sp.num_frames, extra, self.nava_config.frames)
-        )
+        frames = max(1, int(resolve_num_frames(sp.num_frames, extra, self.nava_config.frames)))
         return NAVARequestContext(
             prompt=prompt,
             negative_prompt=str(extra.get("negative_prompt", self.nava_config.negative_prompt)),
+            audio_negative_prompt=str(extra.get("audio_negative_prompt", self.nava_config.audio_negative_prompt)),
+            video_negative_prompt=str(extra.get("video_negative_prompt", self.nava_config.video_negative_prompt)),
             image=image,
             speaker_condition=speaker_condition,
             height=int(sp.height or extra.get("height") or self.nava_config.log_height),
@@ -314,6 +306,7 @@ class NAVAPipeline(
             ),
             align_3d_cfg=as_bool(extra.get("align_3d_cfg", self.nava_config.align_3d_cfg)),
             timbre_cfg=self._resolve_timbre_cfg(extra, speaker_condition),
+            negative_prompt_mode=as_bool(extra.get("negative_prompt_mode", self.nava_config.negative_prompt_mode)),
         )
 
     def _parse_speaker_condition(
@@ -346,16 +339,44 @@ class NAVAPipeline(
     def _encode_text(self, prompt: str) -> torch.Tensor:
         return self._run_text_encoder(prompt, return_speaker_positions=False)[0]
 
+    def _encode_texts(self, prompts: list[str]) -> torch.Tensor:
+        return self._run_text_encoder(prompts, return_speaker_positions=False)[0]
+
     def _encode_text_with_speaker_positions(self, prompt: str) -> tuple[torch.Tensor, list[list[int]] | None]:
         return self._run_text_encoder(prompt, return_speaker_positions=True)
 
+    def _encode_negative_texts(
+        self,
+        ctx: NAVARequestContext,
+        positive_text_embeds: torch.Tensor | list[torch.Tensor],
+    ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]]:
+        if not ctx.negative_prompt_mode:
+            if isinstance(positive_text_embeds, list):
+                zeros = [torch.zeros_like(item) for item in positive_text_embeds]
+                return [zeros[0]], [zeros[0]]
+            zeros = torch.zeros_like(positive_text_embeds)
+            return zeros, zeros
+
+        if ctx.negative_prompt:
+            negative_prompts = [ctx.negative_prompt, ctx.negative_prompt]
+        else:
+            negative_prompts = [
+                ctx.video_negative_prompt or DEFAULT_NAVA_VIDEO_NEGATIVE_PROMPT,
+                ctx.audio_negative_prompt or DEFAULT_NAVA_AUDIO_NEGATIVE_PROMPT,
+            ]
+        embeds = self._encode_texts(negative_prompts)
+        if isinstance(embeds, list):
+            return [embeds[0]], [embeds[1]]
+        return embeds[0:1], embeds[1:2]
+
     def _run_text_encoder(
         self,
-        prompt: str,
+        prompt: str | list[str],
         *,
         return_speaker_positions: bool,
-    ) -> tuple[torch.Tensor, list[list[int]] | None]:
-        caption = inject_speaker_sentinel(prompt)
+    ) -> tuple[torch.Tensor | list[torch.Tensor], list[list[int]] | None]:
+        captions = [prompt] if isinstance(prompt, str) else list(prompt)
+        captions = [inject_speaker_sentinel(item) for item in captions]
         encoder = self.text_encoder
         if hasattr(encoder, "encode"):
             # Text embedding: [batch, text_tokens, text_dim], shared by video
@@ -363,7 +384,7 @@ class NAVAPipeline(
             kwargs: dict[str, Any] = {}
             if "return_speaker_positions" in signature(encoder.encode).parameters:
                 kwargs["return_speaker_positions"] = return_speaker_positions
-            result = encoder.encode([caption], device=self.device, dtype=self.nava_config.target_dtype, **kwargs)
+            result = encoder.encode(captions, device=self.device, dtype=self.nava_config.target_dtype, **kwargs)
             if isinstance(result, tuple):
                 return result
             return result, None
@@ -377,7 +398,8 @@ class NAVAPipeline(
             raise TypeError("NAVA video_vae must expose encode_first_frame(image).")
         # Image embedding: first-frame pixels become a conditioning latent for
         # the video denoising branch.
-        return self.video_vae.encode_first_frame(image)
+        image_embeds = self.video_vae.encode_first_frame(image)
+        return image_embeds
 
     def _encode_speakers(self, ctx: NAVARequestContext) -> torch.Tensor | None:
         if ctx.speaker_condition is None:
@@ -386,27 +408,36 @@ class NAVAPipeline(
             raise TypeError("NAVA speaker_encoder must expose encode(wavs, device, dtype).")
         # Speaker embedding: reference WAVs are ordered to match <S>...<E>
         # spans and only condition the timbre branch.
-        return self.speaker_encoder.encode(
+        speaker_embeds = self.speaker_encoder.encode(
             ctx.speaker_condition.wavs,
             device=self.device,
-            dtype=self.nava_config.target_dtype,
+            dtype=torch.float32,
         )
+        return speaker_embeds
 
-    def _prepare_latents(self, ctx: NAVARequestContext, generator: torch.Generator) -> dict[str, torch.Tensor]:
+    def _custom_pipeline_arg(self, key: str, default: Any = None) -> Any:
+        return (self.od_config.custom_pipeline_args or {}).get(key, default)
+
+    def _prepare_latents(
+        self,
+        ctx: NAVARequestContext,
+        generator: torch.Generator | None,
+    ) -> dict[str, torch.Tensor]:
         latent_h, latent_w = self.nava_config.video_latent_hw(ctx.height, ctx.width)
-        latent_frames = self.nava_config.video_latent_frames(ctx.frames)
-        video_tokens = latent_frames * latent_h * latent_w
-        audio_tokens = self.nava_config.audio_latent_length(ctx.frames, ctx.fps)
+        video_tokens = ctx.frames * latent_h * latent_w
+        audio_tokens = self.nava_config.audio_latent_length(ctx.frames)
         # Video/audio latent initialization fixes the generated duration and
-        # resolution before denoising starts.
-        return {
+        # resolution before denoising starts. Upstream initializes and keeps
+        # sampling latents in float32; the transformer casts internally where
+        # BF16 math is expected.
+        latents = {
             "video": torch.randn(
                 1,
                 video_tokens,
                 self.nava_config.video_latent_ch,
                 generator=generator,
                 device=self.device,
-                dtype=self.nava_config.target_dtype,
+                dtype=torch.float32,
             ),
             "audio": torch.randn(
                 1,
@@ -414,9 +445,10 @@ class NAVAPipeline(
                 self.nava_config.audio_latent_ch,
                 generator=generator,
                 device=self.device,
-                dtype=self.nava_config.target_dtype,
+                dtype=torch.float32,
             ),
         }
+        return latents
 
     def _denoise(
         self,
@@ -425,11 +457,16 @@ class NAVAPipeline(
         video_latents: torch.Tensor,
         audio_latents: torch.Tensor,
         text_embeds: torch.Tensor,
-        negative_text_embeds: torch.Tensor | None,
+        negative_video_text_embeds: torch.Tensor | None,
+        negative_audio_text_embeds: torch.Tensor | None,
         image_embeds: torch.Tensor | None,
         speaker_embeds: torch.Tensor | None,
         speaker_positions: list[list[int]] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if video_latents.ndim == 3 and video_latents.shape[0] == 1:
+            video_latents = video_latents[0]
+        if audio_latents.ndim == 3 and audio_latents.shape[0] == 1:
+            audio_latents = audio_latents[0]
         timesteps = self.scheduler.set_timesteps(ctx.num_steps, device=self.device)
         self.scheduler_audio.set_timesteps(ctx.num_steps, device=self.device)
         video_grid = self._video_grid(ctx)
@@ -447,16 +484,18 @@ class NAVAPipeline(
                 step_index=step_index,
             )
             negative = None
-            if negative_text_embeds is not None:
+            if negative_video_text_embeds is not None and negative_audio_text_embeds is not None:
                 negative = self.transformer(
                     video_latents=video_latents,
                     audio_latents=audio_latents,
                     timestep=timestep_tensor,
-                    text_embeds=negative_text_embeds,
+                    text_embeds=negative_video_text_embeds,
+                    audio_text_embeds=negative_audio_text_embeds,
                     image_embeds=image_embeds,
                     speaker_embeds=None,
                     speaker_positions=None,
                     video_grid=video_grid,
+                    slg_layer=11,
                     step_index=step_index,
                 )
             align = None
@@ -468,7 +507,7 @@ class NAVAPipeline(
                     text_embeds=text_embeds,
                     image_embeds=image_embeds,
                     speaker_embeds=speaker_embeds,
-                    speaker_positions=speaker_positions,
+                    speaker_positions=None,
                     masking_modality=True,
                     video_grid=video_grid,
                     step_index=step_index,
@@ -495,33 +534,11 @@ class NAVAPipeline(
             audio_latents = self.scheduler_audio.step(
                 noise["audio"].to(torch.float32), timestep, audio_latents.to(torch.float32)
             )
-            video_latents = video_latents.to(self.nava_config.target_dtype)
-            video_latents = self._apply_first_frame_condition(video_latents, image_embeds, video_grid)
-            audio_latents = audio_latents.to(self.nava_config.target_dtype)
         return video_latents, audio_latents
 
     def _video_grid(self, ctx: NAVARequestContext) -> tuple[int, int, int]:
         latent_h, latent_w = self.nava_config.video_latent_hw(ctx.height, ctx.width)
-        return self.nava_config.video_latent_frames(ctx.frames), latent_h, latent_w
-
-    def _apply_first_frame_condition(
-        self,
-        video_latents: torch.Tensor,
-        image_embeds: torch.Tensor | None,
-        video_grid: tuple[int, int, int],
-    ) -> torch.Tensor:
-        if image_embeds is None:
-            return video_latents
-        _, latent_h, latent_w = video_grid
-        first_frame_tokens = latent_h * latent_w
-        if image_embeds.shape[1] != first_frame_tokens:
-            raise ValueError(
-                "NAVA image latent token count does not match video first-frame grid: "
-                f"expected {first_frame_tokens}, got {image_embeds.shape[1]}."
-            )
-        video_latents = video_latents.clone()
-        video_latents[:, :first_frame_tokens] = image_embeds.to(device=video_latents.device, dtype=video_latents.dtype)
-        return video_latents
+        return ctx.frames, latent_h, latent_w
 
     def _combine_guidance(
         self,
@@ -561,20 +578,54 @@ class NAVAPipeline(
         if not hasattr(self.video_vae, "decode"):
             raise TypeError("NAVA video_vae must expose decode(video_latents, height, width, frames).")
         # Video decode maps denoised video tokens back to [B, C, T, H, W].
-        return self.video_vae.decode(video_latents, height=ctx.height, width=ctx.width, frames=ctx.frames)
+        output_frames = self.nava_config.video_output_frames(ctx.frames)
+        if video_latents.ndim == 2:
+            video_latents = video_latents.unsqueeze(0)
+        return self.video_vae.decode(video_latents, height=ctx.height, width=ctx.width, frames=output_frames)
 
     def _decode_audio(self, audio_latents: torch.Tensor) -> torch.Tensor:
         if not hasattr(self.audio_vae, "decode"):
             raise TypeError("NAVA audio_vae must expose decode(audio_latents).")
         # Audio decode maps denoised audio tokens to waveform samples.
+        if audio_latents.ndim == 2:
+            audio_latents = audio_latents.unsqueeze(0)
         return self.audio_vae.decode(audio_latents)
 
-    def _make_generator(self, seed: int) -> torch.Generator:
-        random.seed(seed)
-        torch.manual_seed(seed)
+    def _make_generator(self, seed: int) -> torch.Generator | None:
+        if self._rng_state_after_init is not None:
+            self._restore_rng_state(self._rng_state_after_init)
+            return None
+        if as_bool(self._custom_pipeline_arg("skip_request_seed", False)):
+            return None
+        self._set_seed(seed)
         generator = torch.Generator(device=self.device)
         generator.manual_seed(seed)
         return generator
+
+    def _set_seed(self, seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _capture_rng_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state(self.device)
+        return state
+
+    def _restore_rng_state(self, state: dict[str, Any]) -> None:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        cuda_state = state.get("torch_cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(cuda_state, self.device)
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
@@ -587,104 +638,6 @@ def _load_yaml(path: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"NAVA config must be a mapping: {path}")
     return data
-
-
-class _MissingNAVAComponent(nn.Module):
-    def __init__(self, name: str) -> None:
-        super().__init__()
-        self.name = name
-
-    def encode(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        del args, kwargs
-        raise NotImplementedError(f"NAVA component {self.name!r} is not initialized.")
-
-
-class _NAVATextEncoder(nn.Module):
-    def __init__(self, model_root: str, config: NAVAConfig, device: torch.device) -> None:
-        super().__init__()
-        from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
-
-        self.config = config
-        self.device = device
-        wan_root = os.path.join(model_root, config.wan_dir)
-        tokenizer_path = os.path.join(wan_root, "google", "umt5-xxl")
-        checkpoint_path = os.path.join(wan_root, "models_t5_umt5-xxl-enc-bf16.pth")
-        if not os.path.isdir(tokenizer_path):
-            raise FileNotFoundError(f"NAVA text tokenizer directory not found: {tokenizer_path}")
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"NAVA text encoder checkpoint not found: {checkpoint_path}")
-
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
-        umt5_config = UMT5Config(
-            vocab_size=256384,
-            d_model=config.text_embed_dim,
-            d_kv=64,
-            d_ff=10240,
-            num_heads=64,
-            num_layers=24,
-            relative_attention_num_buckets=32,
-            relative_attention_max_distance=128,
-            dense_act_fn="gelu_new",
-            is_gated_act=True,
-            is_encoder_decoder=False,
-        )
-        self.model = UMT5EncoderModel(umt5_config)
-        state_dict = _convert_wan_t5_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
-        self.model.load_state_dict(state_dict, assign=True)
-        self.model = self.model.to(device=device, dtype=config.target_dtype).eval()
-        self.model.requires_grad_(False)
-
-    @torch.inference_mode()
-    def encode(
-        self,
-        texts: list[str],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        return_speaker_positions: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[list[int]]]:
-        inputs = self.tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.config.text_len,
-            return_tensors="pt",
-        )
-        speaker_positions = self._speaker_positions(inputs["input_ids"]) if return_speaker_positions else None
-        inputs = {key: value.to(device) for key, value in inputs.items()}
-        outputs = self.model(**inputs)
-        embeds = outputs.last_hidden_state.to(dtype=dtype)
-        if return_speaker_positions:
-            return embeds, speaker_positions
-        return embeds
-
-    def _speaker_positions(self, input_ids: torch.Tensor) -> list[list[int]]:
-        token_id = self.tokenizer.convert_tokens_to_ids("<extra_id_2>")
-        if token_id is None or token_id < 0:
-            raise ValueError("NAVA tokenizer does not expose <extra_id_2> for speaker binding.")
-        return [[int(pos) for pos in (row == token_id).nonzero(as_tuple=True)[0].tolist()] for row in input_ids]
-
-
-def _convert_wan_t5_state_dict(wan_sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    hf_sd: dict[str, torch.Tensor] = {
-        "shared.weight": wan_sd["token_embedding.weight"],
-        "encoder.embed_tokens.weight": wan_sd["token_embedding.weight"],
-        "encoder.final_layer_norm.weight": wan_sd["norm.weight"],
-    }
-    for i in range(24):
-        src = f"blocks.{i}"
-        dst = f"encoder.block.{i}"
-        for proj in ("q", "k", "v", "o"):
-            hf_sd[f"{dst}.layer.0.SelfAttention.{proj}.weight"] = wan_sd[f"{src}.attn.{proj}.weight"]
-        hf_sd[f"{dst}.layer.0.SelfAttention.relative_attention_bias.weight"] = wan_sd[
-            f"{src}.pos_embedding.embedding.weight"
-        ]
-        hf_sd[f"{dst}.layer.0.layer_norm.weight"] = wan_sd[f"{src}.norm1.weight"]
-        hf_sd[f"{dst}.layer.1.DenseReluDense.wi_0.weight"] = wan_sd[f"{src}.ffn.gate.0.weight"]
-        hf_sd[f"{dst}.layer.1.DenseReluDense.wi_1.weight"] = wan_sd[f"{src}.ffn.fc1.weight"]
-        hf_sd[f"{dst}.layer.1.DenseReluDense.wo.weight"] = wan_sd[f"{src}.ffn.fc2.weight"]
-        hf_sd[f"{dst}.layer.1.layer_norm.weight"] = wan_sd[f"{src}.norm2.weight"]
-    return hf_sd
 
 
 def _resolve_output_fps(sampling_params, default: int) -> int | float:
@@ -701,6 +654,7 @@ def _normalize_video_output(video: Any, output_type: str) -> Any:
     video = video.detach().cpu()
     if output_type == "pt":
         return video
+    video = video.float()
     if video.ndim == 5 and video.shape[1] in (1, 3):
         return [sample.permute(1, 0, 2, 3).contiguous().numpy() for sample in video]
     return video.numpy()

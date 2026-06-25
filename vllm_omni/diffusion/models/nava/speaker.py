@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torchaudio
 from torch import nn
 
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
@@ -42,21 +43,30 @@ class NAVASpeakerEncoder(nn.Module):
             "train_type": "ft_mix",
             "dataset": "vb2+vox2+cnc",
         }
-        hubconf = os.path.join(self.speaker_dir, "hubconf.py")
-        if not os.path.exists(hubconf):
+        speaker_dir = self._resolve_speaker_dir()
+        if speaker_dir is None:
             raise FileNotFoundError(
                 "NAVA speaker timbre conditioning requires a local ReDimNet speaker encoder under "
-                f"{self.speaker_dir}. Prepare the speaker directory before using spk_wavs."
+                f"{self.speaker_dir} or TORCH_HOME/hub. Prepare the speaker assets before using spk_wavs."
             )
-        model = torch.hub.load(self.speaker_dir, "ReDimNet", source="local", **kwargs)
+        model = torch.hub.load(speaker_dir, "ReDimNet", source="local", **kwargs)
         self._model = model.eval().to(device)
         return self._model
 
-    def _load_waveform(self, wav: Any, device: torch.device) -> torch.Tensor:
-        import torchaudio
+    def _resolve_speaker_dir(self) -> str | None:
+        if os.path.exists(os.path.join(self.speaker_dir, "hubconf.py")):
+            return self.speaker_dir
+        torch_home = os.environ.get("TORCH_HOME")
+        hub_root = os.path.join(torch_home, "hub") if torch_home else torch.hub.get_dir()
+        for dirname in ("IDRnD_ReDimNet_main", "IDRnD_ReDimNet_master"):
+            candidate = os.path.join(hub_root, dirname)
+            if os.path.exists(os.path.join(candidate, "hubconf.py")):
+                return candidate
+        return None
 
+    def _load_waveform(self, wav: Any, device: torch.device) -> torch.Tensor:
         if isinstance(wav, (str, os.PathLike)):
-            waveform, sample_rate = torchaudio.load(os.fspath(wav))
+            waveform, sample_rate = self._load_waveform_file(os.fspath(wav))
         elif isinstance(wav, tuple) and len(wav) == 2:
             sample_rate, waveform = wav
             waveform = torch.as_tensor(waveform)
@@ -70,7 +80,7 @@ class NAVASpeakerEncoder(nn.Module):
         if waveform.ndim != 2:
             raise ValueError(f"NAVA speaker reference must be waveform [C,T] or [T], got {tuple(waveform.shape)}.")
         if int(sample_rate) != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, orig_freq=int(sample_rate), new_freq=self.sample_rate)
+            waveform = self._resample(waveform, orig_freq=int(sample_rate), new_freq=self.sample_rate)
         waveform = waveform.mean(dim=0, keepdim=True)
         max_samples = int(30.0 * self.sample_rate)
         if waveform.shape[-1] > max_samples:
@@ -80,3 +90,16 @@ class NAVASpeakerEncoder(nn.Module):
         if waveform.shape[-1] < self.sample_rate:
             waveform = F.pad(waveform, (0, self.sample_rate - waveform.shape[-1]))
         return waveform.to(device)
+
+    def _load_waveform_file(self, path: str) -> tuple[torch.Tensor, int]:
+        try:
+            import soundfile as sf
+
+            waveform, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+            return torch.from_numpy(waveform.T.copy()), int(sample_rate)
+        except Exception:
+            return torchaudio.load(path)
+
+    @staticmethod
+    def _resample(waveform: torch.Tensor, *, orig_freq: int, new_freq: int) -> torch.Tensor:
+        return torchaudio.functional.resample(waveform, orig_freq=orig_freq, new_freq=new_freq)
