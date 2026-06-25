@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Native vLLM-Omni adapter for the NAVA MMDiT backbone.
+
+Most backbone components below are ported from upstream NAVA:
+https://github.com/ernie-research/NAVA/blob/main/nava_src/models/nava/modules/model_mm.py
+
+The local changes remove upstream Diffusers mixins and NAVA-specific distributed
+helpers, keep module names close to the checkpoint layout, and add the
+``NAVATransformer`` wrapper/load path used by vLLM-Omni.
+"""
+
 import math
 import warnings
 from collections.abc import Iterable
@@ -453,14 +463,14 @@ class WanDoubleStreamSelfAttention(nn.Module):
 
             if use_joint_attention:
                 # print("joint attention apply")
-                # 判断是否是视频/音频的有效 token
+                # Mark valid video/audio tokens before compacting padded positions.
                 is_vid_valid = (pos < max_seq_len_vid) & (pos < seq_lens_vid.unsqueeze(1))
                 is_aud_valid = (pos >= max_seq_len_vid) & ((pos - max_seq_len_vid) < seq_lens_audio.unsqueeze(1))
 
-                # 联合有效掩码
+                # Joint validity mask used to move real tokens before padding.
                 is_valid = is_vid_valid | is_aud_valid
                 sort_keys = (~is_valid).int()
-                gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x_vid.device)  # 形状: [B, L]
+                gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x_vid.device)  # shape: [B, L]
 
                 if self.use_sp:
                     # print(f"[DEBUG SP] Doing all to all to shard head")
@@ -471,7 +481,7 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 q_rope = _rope_apply_joint(q, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
                 k_rope = _rope_apply_joint(k, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
 
-                # 把索引扩展到 4D [B, L, H, D]，匹配 QKV 的形状
+                # Expand indices to 4D [B, L, H, D] to match QKV tensors.
                 gather_indices_expanded = (
                     gather_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, q_rope.size(2), q_rope.size(3))
                 )
@@ -492,7 +502,7 @@ class WanDoubleStreamSelfAttention(nn.Module):
                     scatter_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, x_shifted.size(2), x_shifted.size(3))
                 )
 
-                # 把算完的结果完美填回原位
+                # Scatter attention results back to the original padded layout.
                 x = torch.gather(x_shifted, dim=1, index=scatter_indices_expanded)
             else:
                 x_vid = _nava_attention(
@@ -635,15 +645,15 @@ class WanSelfAttention(nn.Module):
                 is_vid_valid = (pos < max_seq_len_vid) & (pos < seq_lens_vid.unsqueeze(1))
                 is_aud_valid = (pos >= max_seq_len_vid) & ((pos - max_seq_len_vid) < seq_lens_audio.unsqueeze(1))
 
-                # 联合有效掩码
+                # Joint validity mask used to move real tokens before padding.
                 is_valid = is_vid_valid | is_aud_valid
                 sort_keys = (~is_valid).int()
-                gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x.device)  # 形状: [B, L]
+                gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x.device)  # shape: [B, L]
 
                 q_rope = _rope_apply_joint(q, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
                 k_rope = _rope_apply_joint(k, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
 
-                # 把索引扩展到 4D [B, L, H, D]，匹配 QKV 的形状
+                # Expand indices to 4D [B, L, H, D] to match QKV tensors.
                 gather_indices_expanded = (
                     gather_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, q_rope.size(2), q_rope.size(3))
                 )
@@ -665,7 +675,7 @@ class WanSelfAttention(nn.Module):
                     scatter_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, x_shifted.size(2), x_shifted.size(3))
                 )
 
-                # 把算完的结果完美填回原位
+                # Scatter attention results back to the original padded layout.
                 x = torch.gather(x_shifted, dim=1, index=scatter_indices_expanded)
             else:
                 q_vid, k_vid, v_vid = q[:, :max_seq_len_vid, :], k[:, :max_seq_len_vid, :], v[:, :max_seq_len_vid, :]
@@ -881,38 +891,38 @@ class WanDoubleStreamAttentionBlock(nn.Module):
         additional_emb_length=None,
         no_split_norm_ffn=False,
     ):
-        """初始化跨模态注意力模块"""
+        """Initialize the dual-stream cross-modal attention block."""
         super().__init__()
-        # 基础参数
-        self.dim = dim  # 输入维度
-        self.ffn_dim = ffn_dim  # FFN中间层维度
-        self.num_heads = num_heads  # 注意力头数
-        self.window_size = window_size  # 注意力窗口大小(-1表示无窗口)
-        self.qk_norm = qk_norm  # 是否对QK做归一化
-        self.cross_attn_norm = cross_attn_norm  # 是否对交叉注意力做归一化
-        self.eps = eps  # 归一化的小常数
-        self.no_split_norm_ffn = no_split_norm_ffn  # 是否不分离norm/ffn
+        # Basic parameters.
+        self.dim = dim  # input dimension
+        self.ffn_dim = ffn_dim  # hidden dimension of the FFN
+        self.num_heads = num_heads  # number of attention heads
+        self.window_size = window_size  # attention window size; -1 means global attention
+        self.qk_norm = qk_norm  # whether to normalize Q/K
+        self.cross_attn_norm = cross_attn_norm  # whether to normalize before cross-attention
+        self.eps = eps  # normalization epsilon
+        self.no_split_norm_ffn = no_split_norm_ffn  # whether to share norm/FFN across audio and video
 
-        # 网络层定义
-        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
+        # Network layers.
+        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-self-attention normalization
         if not no_split_norm_ffn:
-            self.norm1_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
-        self.self_attn = WanDoubleStreamSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # 自注意力层
+            self.norm1_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-self-attention normalization
+        self.self_attn = WanDoubleStreamSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # self-attention
         self.norm3 = (
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        )  # 交叉注意力前归一化(可选)
+        )  # optional pre-cross-attention normalization
         if not no_split_norm_ffn:
             self.norm3_audio = (
                 WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-            )  # 交叉注意力前归一化(可选)
+            )  # optional pre-cross-attention normalization
 
-        # 根据类型初始化不同的交叉注意力层
+        # Initialize the cross-attention variant for the selected conditioning type.
         if cross_attn_type == "i2v_cross_attn":
             assert False, "Not support i2v_cross_attn for mmdit mode"
             assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
             self.cross_attn = WanI2VCrossAttention(
                 dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length
-            )  # 图像到视频交叉注意力
+            )  # image-to-video cross-attention
         else:
             assert additional_emb_length is None, "additional_emb_length should be None for t2v_cross_attn"
             self.cross_attn = WanT2VDoubleStreamCrossAttention(
@@ -921,22 +931,22 @@ class WanDoubleStreamAttentionBlock(nn.Module):
                 (-1, -1),
                 qk_norm,
                 eps,
-            )  # 文本到视频交叉注意力
+            )  # text-to-video cross-attention
 
-        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
+        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-FFN normalization
         if not no_split_norm_ffn:
-            self.norm2_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
-        self.ffn = nn.Sequential(  # 前馈网络
+            self.norm2_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-FFN normalization
+        self.ffn = nn.Sequential(  # feed-forward network
             nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
         )
         if not no_split_norm_ffn:
-            self.ffn_audio = nn.Sequential(  # 前馈网络
+            self.ffn_audio = nn.Sequential(  # feed-forward network
                 nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
             )
 
-        # 调制参数
-        self.modulation = ModulationAdd(dim, 6)  # 6通道的调制加法层
-        self.modulation_audio = ModulationAdd(dim, 6)  # 6通道的调制加法层
+        # Modulation parameters.
+        self.modulation = ModulationAdd(dim, 6)  # six-channel modulation layer
+        self.modulation_audio = ModulationAdd(dim, 6)  # six-channel modulation layer
 
     def forward(
         self,
@@ -1061,31 +1071,31 @@ class WanAttentionBlock(nn.Module):
         additional_emb_length=None,
         split_av_qk_norm_modulation=False,
     ):
-        """初始化跨模态注意力模块"""
+        """Initialize the single-stream cross-modal attention block."""
         super().__init__()
-        # 基础参数
-        self.dim = dim  # 输入维度
-        self.ffn_dim = ffn_dim  # FFN中间层维度
-        self.num_heads = num_heads  # 注意力头数
-        self.window_size = window_size  # 注意力窗口大小(-1表示无窗口)
-        self.qk_norm = qk_norm  # 是否对QK做归一化
-        self.cross_attn_norm = cross_attn_norm  # 是否对交叉注意力做归一化
-        self.eps = eps  # 归一化的小常数
+        # Basic parameters.
+        self.dim = dim  # input dimension
+        self.ffn_dim = ffn_dim  # hidden dimension of the FFN
+        self.num_heads = num_heads  # number of attention heads
+        self.window_size = window_size  # attention window size; -1 means global attention
+        self.qk_norm = qk_norm  # whether to normalize Q/K
+        self.cross_attn_norm = cross_attn_norm  # whether to normalize before cross-attention
+        self.eps = eps  # normalization epsilon
         self.split_av_qk_norm_modulation = split_av_qk_norm_modulation
 
-        # 网络层定义
-        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # 自注意力层
+        # Network layers.
+        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-self-attention normalization
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # self-attention
         self.norm3 = (
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        )  # 交叉注意力前归一化(可选)
+        )  # optional pre-cross-attention normalization
 
-        # 根据类型初始化不同的交叉注意力层
+        # Initialize the cross-attention variant for the selected conditioning type.
         if cross_attn_type == "i2v_cross_attn":
             assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
             self.cross_attn = WanI2VCrossAttention(
                 dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length
-            )  # 图像到视频交叉注意力
+            )  # image-to-video cross-attention
         else:
             assert additional_emb_length is None, "additional_emb_length should be None for t2v_cross_attn"
             self.cross_attn = WanT2VCrossAttention(
@@ -1094,15 +1104,15 @@ class WanAttentionBlock(nn.Module):
                 (-1, -1),
                 qk_norm,
                 eps,
-            )  # 文本到视频交叉注意力
+            )  # text-to-video cross-attention
 
-        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
-        self.ffn = nn.Sequential(  # 前馈网络
+        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-FFN normalization
+        self.ffn = nn.Sequential(  # feed-forward network
             nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
         )
 
-        # 调制参数
-        self.modulation = ModulationAdd(dim, 6)  # 6通道的调制加法层
+        # Modulation parameters.
+        self.modulation = ModulationAdd(dim, 6)  # six-channel modulation layer
         if split_av_qk_norm_modulation:
             self.modulation_audio = ModulationAdd(dim, 6)
 
@@ -1271,7 +1281,7 @@ class SpkToken(nn.Module):
         fake_pos = spk_emb.float().pow(2).sum(dim=-1) <= self.eps  # [B] bool
         spk_embeds = self.out_norm(self.net(spk_emb))  # [B,dim]
         null = self.null_token.expand(B, -1)  # [B,dim]
-        m = (~fake_pos).to(spk_embeds.dtype).view(B, 1)  # 有效speaker=1，无=0
+        m = (~fake_pos).to(spk_embeds.dtype).view(B, 1)  # valid speaker=1, null speaker=0
         spk_embeds = null * (1 - m) + spk_embeds * m
         return spk_embeds
 
@@ -1645,7 +1655,7 @@ class WanAVModel(nn.Module):
 
             if spk_pos is not None:
                 indices = [b * L + pos for b, pos_list in enumerate(spk_pos) for pos in pos_list]
-                if indices:  # 确保有 spk token
+                if indices:  # ensure at least one speaker token exists
                     indices = torch.tensor(indices, device=context.device)
                     if spk_embeds.shape[0] != len(indices):
                         logger.warning(
