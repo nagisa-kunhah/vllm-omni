@@ -142,6 +142,7 @@ class MossTTSLocalNativeModel(nn.Module):
         )
         self.local_text_lm_head = nn.Linear(self.hidden_size, 2, bias=False)
         self._batch_state: list[dict[str, Any]] | None = None
+        self._audio_embedding_indices = torch.arange(self.n_vq, dtype=torch.long)
 
         # Full-frame CUDA graph: captures the entire _decode_frame_eager as one graph
         self._frame_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -212,12 +213,12 @@ class MossTTSLocalNativeModel(nn.Module):
         codes = audio_codes.to(device=text_ids.device, dtype=torch.long)
         if codes.dim() == 1:
             codes = codes.unsqueeze(0)
-        for idx, emb in enumerate(self.audio_embeddings):
-            col = codes[:, idx].clamp(0, self.audio_vocab_size)
-            valid = col.ne(self.audio_pad_code)
-            safe_col = col.masked_fill(~valid, 0)
-            embeds = embeds + emb(safe_col) * valid.unsqueeze(-1)
-        return embeds
+        valid = codes.ne(self.audio_pad_code)
+        safe_codes = codes.clamp(0, self.audio_vocab_size).masked_fill(~valid, 0)
+        weights = torch.stack([emb.weight for emb in self.audio_embeddings], dim=0)
+        codebook_idx = self._audio_embedding_indices.to(device=text_ids.device)
+        audio_embeds = weights[codebook_idx.unsqueeze(0), safe_codes]
+        return embeds + (audio_embeds * valid.unsqueeze(-1)).sum(dim=1)
 
     def preprocess(
         self,
@@ -404,7 +405,11 @@ class MossTTSLocalNativeModel(nn.Module):
         first_params = params[0][:6] if params else (1.0, 1.0, 50, 1.0, 0.95, 50)
         homogeneous = all(item[:6] == first_params and item[6] is None for item in params)
 
-        if homogeneous:
+        greedy = homogeneous and float(first_params[0]) <= 0 and float(first_params[3]) <= 0
+        if greedy:
+            text_temp, text_top_p, text_top_k, audio_temp, audio_top_p, audio_top_k = first_params
+            stop_choices = torch.argmax(text_logits, dim=-1)
+        elif homogeneous:
             text_temp, text_top_p, text_top_k, audio_temp, audio_top_p, audio_top_k = first_params
             stop_choices = self._sample_with_params(
                 text_logits,
@@ -428,7 +433,9 @@ class MossTTSLocalNativeModel(nn.Module):
         for channel in range(self.n_vq):
             head_weight = self.audio_embeddings[channel].weight[: self.audio_vocab_size]
             logits = F.linear(current, head_weight).float()
-            if homogeneous:
+            if greedy:
+                codes = torch.argmax(logits, dim=-1)
+            elif homogeneous:
                 codes = self._sample_with_params(
                     logits,
                     temperature=audio_temp,
@@ -483,7 +490,11 @@ class MossTTSLocalNativeModel(nn.Module):
         if len(params) != B:
             params.extend([self._frame_params({}) for _ in range(B - len(params))])
         first_params = params[0][:6] if params else (1.0, 1.0, 50, 1.0, 0.95, 50)
-        graphable = all(item[:6] == first_params and item[6] is None for item in params)
+        graphable = (
+            float(first_params[0]) <= 0
+            and float(first_params[3]) <= 0
+            and all(item[:6] == first_params and item[6] is None for item in params)
+        )
         if not graphable:
             return self._decode_frame_eager(hidden_batch, infos)
 
@@ -679,13 +690,30 @@ class MossTTSLocalNativeModel(nn.Module):
                     profile_local_ms += elapsed
                     self._profile_stats["n_decode"] += 1
                     self._profile_stats["batch_sizes"].append(len(decode_items))
-                stop_list = stop_choices.detach().cpu().tolist()
                 batch_min_frames = int(os.environ.get("MOSS_TTS_LOCAL_BATCH_MIN_FRAMES", "80") or 80)
+                step_nums = torch.tensor(
+                    [int((info_dicts[i].get("audio_state", {}) or {}).get("step", 0)) for i, _ in decode_items],
+                    dtype=torch.long,
+                    device=stop_choices.device,
+                )
+                min_frames_t = torch.tensor(
+                    [max(int((info_dicts[i].get("audio_state", {}) or {}).get("min_new_frames", 3)), batch_min_frames) for i, _ in decode_items],
+                    dtype=torch.long,
+                    device=stop_choices.device,
+                )
+                max_frames_t = torch.tensor(
+                    [int((info_dicts[i].get("audio_state", {}) or {}).get("max_new_frames", 150)) for i, _ in decode_items],
+                    dtype=torch.long,
+                    device=stop_choices.device,
+                )
+                should_stop_tensor = ((stop_choices == 1) & (step_nums >= min_frames_t)) | (step_nums >= max_frames_t)
+                should_stop_list = should_stop_tensor.detach().cpu().tolist()
                 if _debug_state_enabled():
                     logger.info(
-                        "[moss-local-state] decode batched reqs=%s stops=%s",
+                        "[moss-local-state] decode batched reqs=%s stops=%s should_stop=%s",
                         [_request_label(info_dicts[i]) for i, _ in decode_items],
-                        stop_list,
+                        stop_choices.detach().cpu().tolist(),
+                        should_stop_list,
                     )
                 for bi, (i, _) in enumerate(decode_items):
                     info = info_dicts[i]
@@ -697,10 +725,9 @@ class MossTTSLocalNativeModel(nn.Module):
                         continue
                     new_codes = all_codes[bi]
                     debug_hash = _update_debug_code_hash(state, new_codes) if _debug_state_enabled() else 0
-                    step_num = int(state.get("step", 0))
-                    min_frames = max(int(state.get("min_new_frames", 3)), batch_min_frames)
-                    max_frames = int(state.get("max_new_frames", 150))
-                    should_stop = (stop_list[bi] == 1 and step_num >= min_frames) or step_num >= max_frames
+                    step_num = int(step_nums[bi].item())
+                    max_frames = int(max_frames_t[bi].item())
+                    should_stop = bool(should_stop_list[bi])
                     if should_stop:
                         state["is_stopping"] = True
                         state["next_text"] = self.audio_end_token_id
