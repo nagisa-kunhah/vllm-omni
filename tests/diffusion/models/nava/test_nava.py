@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from torch import nn
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output, supports_multimodal_input
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -26,6 +27,7 @@ from vllm_omni.diffusion.models.nava.config import NAVAConfig, inject_speaker_se
 from vllm_omni.diffusion.models.nava.nava_transformer import (
     NAVATransformer,
     WanSelfAttention,
+    _nava_attention,
     _rope_apply_1d,
     _rope_apply_3d,
     _rope_apply_3d_to_1d,
@@ -118,6 +120,22 @@ class FakeTransformer(nn.Module):
 
     def load_weights(self, weights):
         return {name.removeprefix("transformer.") for name, _ in weights}
+
+
+class FakeAttention:
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata]] = []
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        assert attn_metadata is not None
+        self.calls.append((q, k, v, attn_metadata))
+        return q + 1
 
 
 def _make_pipeline(
@@ -360,10 +378,38 @@ def test_config_normalizes_output_frames_to_vae_stride() -> None:
     assert cfg.video_output_frames(3) == 9
 
 
-def test_transformer_self_attention_uses_shared_attention_layer() -> None:
+def test_transformer_self_attention_owns_shared_attention_layer() -> None:
     attention = WanSelfAttention(dim=8, num_heads=2)
 
     assert attention.attn.__class__.__name__ == "Attention"
+
+
+def test_nava_attention_calls_shared_attention_with_length_metadata() -> None:
+    fake_attn = FakeAttention()
+    q = torch.randn(2, 3, 2, 4)
+    k = torch.randn(2, 5, 2, 4)
+    v = torch.randn(2, 5, 2, 4)
+    key_lens = torch.tensor([5, 3], dtype=torch.long)
+
+    output = _nava_attention(fake_attn, q, k, v, k_lens=key_lens)
+
+    assert torch.equal(output, q + 1)
+    assert len(fake_attn.calls) == 1
+    called_q, called_k, called_v, metadata = fake_attn.calls[0]
+    assert called_q is q
+    assert called_k is k
+    assert called_v is v
+    assert metadata.query_lens is None
+    assert metadata.key_lens is key_lens
+
+
+def test_nava_attention_rejects_sliding_window_shared_path() -> None:
+    q = torch.randn(1, 3, 2, 4)
+    k = torch.randn(1, 3, 2, 4)
+    v = torch.randn(1, 3, 2, 4)
+
+    with pytest.raises(NotImplementedError, match="sliding-window attention"):
+        _nava_attention(FakeAttention(), q, k, v, window_size=(2, 2))
 
 
 def test_speech_span_parser_extracts_ordered_spans() -> None:
@@ -1018,7 +1064,7 @@ def test_transformer_marks_first_frame_clean_for_image_conditioning() -> None:
 
 
 def _rope_apply_1d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    n, c = x.size(2), x.size(3) // 2
+    n = x.size(2)
     c_rope = freqs.shape[1]
     output = []
     for i, (length,) in enumerate(grid_sizes.tolist()):
@@ -1055,7 +1101,7 @@ def _rope_apply_3d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: t
 
 
 def _rope_apply_3d_to_1d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    n, c = x.size(2), x.size(3) // 2
+    n = x.size(2)
     c_rope = freqs.shape[1]
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):

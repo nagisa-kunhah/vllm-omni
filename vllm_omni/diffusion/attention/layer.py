@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.utils.lengths import _metadata_has_lengths
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -271,6 +272,8 @@ class Attention(nn.Module):
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:
+            if _metadata_has_lengths(attn_metadata):
+                raise NotImplementedError("Ring attention does not support query_lens or key_lens metadata yet.")
             out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)

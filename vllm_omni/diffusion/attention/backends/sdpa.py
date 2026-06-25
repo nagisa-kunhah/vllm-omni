@@ -11,6 +11,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.utils.lengths import (
+    _check_no_attn_mask_with_lengths,
+    _lengths_to_key_mask,
+    _metadata_has_lengths,
+    _zero_invalid_queries,
+)
 
 logger = init_logger(__name__)
 
@@ -100,8 +106,18 @@ class SDPAImpl(AttentionImpl):
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
         attention_mask = None
+        query_lens = None
         if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+            _check_no_attn_mask_with_lengths(attn_metadata)
+            if _metadata_has_lengths(attn_metadata):
+                attention_mask, query_lens = _lengths_to_key_mask(
+                    query,
+                    key,
+                    attn_metadata.query_lens,
+                    attn_metadata.key_lens,
+                )
+            else:
+                attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         output = torch.nn.functional.scaled_dot_product_attention(
@@ -115,6 +131,8 @@ class SDPAImpl(AttentionImpl):
             enable_gqa=self.requires_gqa,
         )
         out = output.permute(0, 2, 1, 3)
+        if query_lens is not None:
+            out = _zero_invalid_queries(out, query_lens)
         return out
 
     def forward_cuda(
