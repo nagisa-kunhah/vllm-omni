@@ -115,9 +115,9 @@ def _map_audio_vae_key(key: str) -> str | None:
         return "encoder." + key.removeprefix("audio_vae.encoder.")
     if key.startswith("audio_vae.decoder."):
         return "decoder." + key.removeprefix("audio_vae.decoder.")
-    if key == "audio_vae.per_channel_statistics.mean":
+    if key in {"audio_vae.per_channel_statistics.mean", "audio_vae.per_channel_statistics.mean-of-means"}:
         return "latents_mean"
-    if key == "audio_vae.per_channel_statistics.std":
+    if key in {"audio_vae.per_channel_statistics.std", "audio_vae.per_channel_statistics.std-of-means"}:
         return "latents_std"
     if key.startswith(("encoder.", "decoder.")) or key in {"latents_mean", "latents_std"}:
         return key
@@ -137,6 +137,7 @@ def _map_single_vocoder_key(key: str) -> str:
     replacements = (
         ("conv_pre.", "conv_in."),
         ("conv_post.", "conv_out."),
+        ("act_post.", "act_out."),
         ("ups.", "upsamplers."),
         ("resblocks.", "resnets."),
         ("downsample.lowpass.", "downsample."),

@@ -2,24 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import warnings
 from collections.abc import Iterable
 
 import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
-from vllm_omni.diffusion.models.audiox.audiox_transformer import (
-    AudioXMMChannelLastConv1d as ChannelLastConv1d,
-)
-from vllm_omni.diffusion.models.audiox.audiox_transformer import (
-    AudioXMMConvFeedForward as ConvMLP,
-)
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 
 logger = init_logger(__name__)
@@ -39,6 +33,40 @@ def _get_sequence_parallel_state() -> bool:
     return False
 
 
+def _create_custom_forward(module: nn.Module):
+    def custom_forward(*inputs, **kwargs):
+        return module(*inputs, **kwargs)
+
+    return custom_forward
+
+
+def _gradient_checkpoint_forward(
+    model: nn.Module,
+    use_gradient_checkpointing: bool,
+    use_gradient_checkpointing_offload: bool,
+    *args,
+    **kwargs,
+):
+    if use_gradient_checkpointing_offload:
+        with torch.autograd.graph.save_on_cpu():
+            model_output = torch.utils.checkpoint.checkpoint(
+                _create_custom_forward(model),
+                *args,
+                **kwargs,
+                use_reentrant=False,
+            )
+    elif use_gradient_checkpointing:
+        model_output = torch.utils.checkpoint.checkpoint(
+            _create_custom_forward(model),
+            *args,
+            **kwargs,
+            use_reentrant=False,
+        )
+    else:
+        model_output = model(*args, **kwargs)
+    return model_output
+
+
 class _NCCLInfo:
     sp_size = 1
     rank_within_group = 0
@@ -47,22 +75,136 @@ class _NCCLInfo:
 nccl_info = _NCCLInfo()
 
 
+class ChannelLastConv1d(nn.Conv1d):
+    """NAVA-local channel-last Conv1d wrapper used by upstream audio patch embedding."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 1)
+        x = super().forward(x)
+        x = x.permute(0, 2, 1)
+        return x
+
+
+class ConvMLP(nn.Module):
+    """NAVA-local ConvMLP matching upstream model_mm.py."""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int = 256,
+        kernel_size: int = 3,
+        padding: int = 1,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = ChannelLastConv1d(dim, hidden_dim, bias=False, kernel_size=kernel_size, padding=padding)
+        self.w2 = ChannelLastConv1d(hidden_dim, dim, bias=False, kernel_size=kernel_size, padding=padding)
+        self.w3 = ChannelLastConv1d(dim, hidden_dim, bias=False, kernel_size=kernel_size, padding=padding)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class WanRMSNorm(nn.Module):
+    """NAVA/Wan query-key RMSNorm with upstream BF16 arithmetic semantics."""
+
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._norm(x.bfloat16()).type_as(x) * self.weight.bfloat16()
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
+class WanLayerNorm(nn.LayerNorm):
+    """NAVA/Wan LayerNorm with upstream BF16 arithmetic semantics."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False) -> None:
+        super().__init__(dim, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x.bfloat16()).type_as(x)
+
+
 def _nava_attention(
     attn: Attention,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    q_lens: torch.Tensor | None = None,
     k_lens: torch.Tensor | None = None,
     window_size: tuple[int, int] | list[int] | None = None,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    q_scale: float | torch.Tensor | None = None,
+    causal: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    if window_size not in (None, (-1, -1), [-1, -1]):
-        raise NotImplementedError("NAVA local-window attention is not enabled in the native adapter yet.")
-    attn_metadata = None
-    if k_lens is not None:
-        max_k = k.shape[1]
-        arange = torch.arange(max_k, device=k.device).unsqueeze(0)
-        attn_metadata = AttentionMetadata(attn_mask=arange < k_lens.to(k.device).unsqueeze(1))
-    return attn(q, k, v, attn_metadata)
+    if window_size is None:
+        window_size = (-1, -1)
+    if isinstance(window_size, list):
+        window_size = tuple(window_size)
+    half_dtypes = (torch.float16, torch.bfloat16)
+    assert dtype in half_dtypes
+    out_dtype = q.dtype
+    batch, query_len, key_len = q.size(0), q.size(1), k.size(1)
+
+    if q_lens is None:
+        q_lens = torch.full((batch,), query_len, dtype=torch.int32, device=q.device)
+    else:
+        q_lens = q_lens.to(device=q.device, dtype=torch.int32)
+    if k_lens is None:
+        k_lens = torch.full((batch,), key_len, dtype=torch.int32, device=k.device)
+    else:
+        k_lens = k_lens.to(device=k.device, dtype=torch.int32)
+
+    if window_size != (-1, -1):
+        warnings.warn("Sliding-window attention is ignored by the scaled_dot_product_attention fallback.")
+    q_sdpa = q if q.dtype in half_dtypes else q.to(dtype)
+    q_sdpa = q_sdpa.to(v.dtype)
+    k_sdpa = k if k.dtype in half_dtypes else k.to(dtype)
+    k_sdpa = k_sdpa.to(v.dtype)
+    v_sdpa = v if v.dtype in half_dtypes else v.to(dtype)
+    if q_scale is not None:
+        q_sdpa = q_sdpa * q_scale
+
+    chunks = []
+    for index in range(batch):
+        cur_query_len = int(q_lens[index].item())
+        cur_key_len = int(k_lens[index].item())
+        query_item = q_sdpa[index : index + 1, :cur_query_len].transpose(1, 2)
+        key_item = k_sdpa[index : index + 1, :cur_key_len].transpose(1, 2)
+        value_item = v_sdpa[index : index + 1, :cur_key_len].transpose(1, 2)
+        if query_item.size(1) != key_item.size(1):
+            if query_item.size(1) % key_item.size(1) != 0:
+                raise ValueError(
+                    "NAVA attention requires query heads to be divisible by key heads: "
+                    f"got {query_item.size(1)} and {key_item.size(1)}."
+                )
+            repeat = query_item.size(1) // key_item.size(1)
+            key_item = key_item.repeat_interleave(repeat, dim=1)
+            value_item = value_item.repeat_interleave(repeat, dim=1)
+        output = F.scaled_dot_product_attention(
+            query_item,
+            key_item,
+            value_item,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=causal,
+            scale=softmax_scale,
+        ).transpose(1, 2)
+        if cur_query_len < query_len:
+            output = F.pad(output, (0, 0, 0, 0, 0, query_len - cur_query_len))
+        chunks.append(output)
+    return torch.cat(chunks, dim=0).to(out_dtype)
 
 
 def _sinusoidal_embedding_1d(dim, position):
@@ -105,21 +247,15 @@ def _rope_apply_1d(x, grid_sizes, freqs):
     c_rope = freqs.shape[1]  # number of complex dims to rotate
     assert c_rope <= c, "RoPE dimensions cannot exceed half of hidden size"
 
-    # loop over samples
     output = []
     for i, (length,) in enumerate(grid_sizes.tolist()):
         seq_len = length
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))  # [l n d//2]
-        x_i_rope = x_i[:, :, :c_rope] * freqs[:seq_len, None, :]  # [L, N, c_rope]
-        x_i_passthrough = x_i[:, :, c_rope:]  # untouched dims
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        x_i_rope = x_i[:, :, :c_rope] * freqs[:seq_len, None, :]
+        x_i_passthrough = x_i[:, :, c_rope:]
         x_i = torch.cat([x_i_rope, x_i_passthrough], dim=2)
-
-        # apply rotary embedding
         x_i = torch.view_as_real(x_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
         output.append(x_i)
     return torch.stack(output).bfloat16()
 
@@ -131,12 +267,10 @@ def _rope_apply_3d(x, grid_sizes, freqs):
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
@@ -147,11 +281,8 @@ def _rope_apply_3d(x, grid_sizes, freqs):
             dim=-1,
         ).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
         output.append(x_i)
     return torch.stack(output).bfloat16()
 
@@ -162,12 +293,10 @@ def _rope_apply_3d_to_1d(x, grid_sizes, freqs):
     c_rope = freqs.shape[1]  # number of complex dims to rotate
     assert c_rope <= c, "RoPE dimensions cannot exceed half of hidden size"
 
-    # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
@@ -176,11 +305,11 @@ def _rope_apply_3d_to_1d(x, grid_sizes, freqs):
             dim=-1,
         ).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i_rope = x_i[:, :, :c_rope] * freqs_i
+        x_i_passthrough = x_i[:, :, c_rope:]
+        x_i = torch.cat([x_i_rope, x_i_passthrough], dim=2)
+        x_i = torch.view_as_real(x_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
         output.append(x_i)
     return torch.stack(output).bfloat16()
 
@@ -211,15 +340,15 @@ class WanDoubleStreamSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         # optional sequence parallelism
         self.q_audio = nn.Linear(dim, dim)
         self.k_audio = nn.Linear(dim, dim)
         self.v_audio = nn.Linear(dim, dim)
         self.o_audio = nn.Linear(dim, dim)
-        self.norm_q_audio = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k_audio = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q_audio = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k_audio = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
             num_heads=num_heads,
             head_size=self.head_dim,
@@ -409,8 +538,8 @@ class WanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
             num_heads=num_heads,
             head_size=self.head_dim,
@@ -672,7 +801,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
         # self.alpha = nn.Parameter(torch.zeros((1, )))
-        self.norm_k_img = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.additional_emb_length = additional_emb_length
 
     def _qkv_fn(self, x, context):
@@ -765,16 +894,16 @@ class WanDoubleStreamAttentionBlock(nn.Module):
         self.no_split_norm_ffn = no_split_norm_ffn  # 是否不分离norm/ffn
 
         # 网络层定义
-        self.norm1 = LayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
+        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
         if not no_split_norm_ffn:
-            self.norm1_audio = LayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
+            self.norm1_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
         self.self_attn = WanDoubleStreamSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # 自注意力层
         self.norm3 = (
-            LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+            WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         )  # 交叉注意力前归一化(可选)
         if not no_split_norm_ffn:
             self.norm3_audio = (
-                LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+                WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
             )  # 交叉注意力前归一化(可选)
 
         # 根据类型初始化不同的交叉注意力层
@@ -794,9 +923,9 @@ class WanDoubleStreamAttentionBlock(nn.Module):
                 eps,
             )  # 文本到视频交叉注意力
 
-        self.norm2 = LayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
+        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
         if not no_split_norm_ffn:
-            self.norm2_audio = LayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
+            self.norm2_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
         self.ffn = nn.Sequential(  # 前馈网络
             nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
         )
@@ -945,10 +1074,10 @@ class WanAttentionBlock(nn.Module):
         self.split_av_qk_norm_modulation = split_av_qk_norm_modulation
 
         # 网络层定义
-        self.norm1 = LayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
+        self.norm1 = WanLayerNorm(dim, eps, elementwise_affine=False)  # 自注意力前归一化
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # 自注意力层
         self.norm3 = (
-            LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+            WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         )  # 交叉注意力前归一化(可选)
 
         # 根据类型初始化不同的交叉注意力层
@@ -967,7 +1096,7 @@ class WanAttentionBlock(nn.Module):
                 eps,
             )  # 文本到视频交叉注意力
 
-        self.norm2 = LayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
+        self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # FFN前归一化
         self.ffn = nn.Sequential(  # 前馈网络
             nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
         )
@@ -1083,7 +1212,7 @@ class Head(nn.Module):
 
         # layers
         out_dim = math.prod(patch_size) * out_dim
-        self.norm = LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm = WanLayerNorm(dim, eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
@@ -1178,6 +1307,9 @@ class WanAVModel(nn.Module):
         window_size=(-1, -1),
         qk_norm=True,
         cross_attn_norm=True,
+        gradient_checkpointing=False,
+        gradient_checkpointing_offload=False,
+        gradient_checkpoint_every_n=1,
         temporal_rope_scaling_factor=1.0,
         eps=1e-6,
         add_spk_emb=False,
@@ -1364,6 +1496,9 @@ class WanAVModel(nn.Module):
 
         # initialize weights
         self._init_weights()
+        self.gradient_checkpointing = gradient_checkpointing
+        self.gradient_checkpointing_offload = gradient_checkpointing_offload
+        self.gradient_checkpoint_every_n = gradient_checkpoint_every_n
 
     def _merge_kwargs(self, vid_kwargs, audio_kwargs):
         """
@@ -1578,6 +1713,7 @@ class WanAVModel(nn.Module):
         y=None,
         spk_embed=None,
         spk_pos=None,
+        slg_layer=False,
         masking_modality=False,
         first_frame_is_clean=False,
         **kwargs,
@@ -1658,13 +1794,37 @@ class WanAVModel(nn.Module):
         elif x_audio is not None:
             x = x_audio
 
-        for block in self.double_blocks:
-            x = block(x=x, **kwargs)
+        for i, block in enumerate(self.double_blocks):
+            x = _gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing=(
+                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
+                ),
+                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
+                x=x,
+                **kwargs,
+            )
 
-        for block in self.single_blocks:
-            x = block(x=x, **kwargs)
-        for block in self.double_final_blocks:
-            x = block(x=x, **kwargs)
+        for i, block in enumerate(self.single_blocks):
+            x = _gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing=(
+                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
+                ),
+                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
+                x=x,
+                **kwargs,
+            )
+        for i, block in enumerate(self.double_final_blocks):
+            x = _gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing=(
+                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
+                ),
+                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
+                x=x,
+                **kwargs,
+            )
         if vid is not None:
             x_vid = x[:, : kwargs["max_seq_len_vid"]]
         if audio is not None:
@@ -1769,33 +1929,38 @@ class NAVATransformer(nn.Module):
         audio_latents: torch.Tensor,
         timestep: torch.Tensor,
         text_embeds: torch.Tensor,
+        audio_text_embeds: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
         speaker_embeds: torch.Tensor | None = None,
         speaker_positions: list[list[int]] | None = None,
         video_grid: tuple[int, int, int] | None = None,
         masking_modality: bool = False,
+        slg_layer: int | bool = False,
         **_: object,
     ) -> dict[str, torch.Tensor]:
-        batch_size = video_latents.shape[0]
+        video_was_batched = video_latents.ndim == 3
+        audio_was_batched = audio_latents.ndim == 3
+        batch_size = video_latents.shape[0] if video_was_batched else 1
         if batch_size != 1:
             raise ValueError("NAVATransformer currently expects one request per forward call.")
         if video_grid is None:
             latent_h, latent_w = self.config.video_latent_hw()
-            latent_frames = video_latents.shape[1] // (latent_h * latent_w)
+            latent_frames = video_latents.shape[-2] // (latent_h * latent_w)
         else:
             latent_frames, latent_h, latent_w = [int(value) for value in video_grid]
         expected_video_tokens = latent_frames * latent_h * latent_w
-        if video_latents.shape[1] != expected_video_tokens:
+        video_token_count = video_latents.shape[-2]
+        if video_token_count != expected_video_tokens:
             raise ValueError(
                 "NAVA video latent token count does not match video_grid: "
-                f"expected {expected_video_tokens}, got {video_latents.shape[1]}."
+                f"expected {expected_video_tokens}, got {video_token_count}."
             )
         t_h_w_list = torch.tensor(
             [(latent_frames, latent_h, latent_w)],
             dtype=torch.long,
             device=video_latents.device,
         )
-        audio_len_list = torch.tensor([[audio_latents.shape[1]]], dtype=torch.long, device=audio_latents.device)
+        audio_len_list = torch.tensor([[audio_latents.shape[-2]]], dtype=torch.long, device=audio_latents.device)
         first_frames = None
         if image_embeds is not None:
             expected_first_frame_tokens = latent_h * latent_w
@@ -1803,29 +1968,35 @@ class NAVATransformer(nn.Module):
                 raise ValueError(
                     "NAVA image latent token count does not match video_grid first frame: "
                     f"expected {expected_first_frame_tokens}, got {image_embeds.shape[1]}."
-                )
+            )
             # Image conditioning: replace the first latent video frame with
             # the encoded input image before denoising.
             first_frames = [image_embeds[0].reshape(1, latent_h, latent_w, self.video_latent_ch)]
+        latents_vid = video_latents[0] if video_was_batched else video_latents
+        latents_audio = audio_latents[0] if audio_was_batched else audio_latents
         video_pred, audio_pred = self.predict_eps(
             vid_context=[text_embeds[0]],
-            audio_context=[text_embeds[0]],
-            latents_vid=video_latents[0],
-            latents_audio=audio_latents[0],
+            audio_context=[(audio_text_embeds if audio_text_embeds is not None else text_embeds)[0]],
+            latents_vid=latents_vid,
+            latents_audio=latents_audio,
             timesteps=timestep.to(video_latents.device),
             spk_embs=speaker_embeds,
             spk_pos=speaker_positions,
             t_h_w_list=t_h_w_list,
             audio_len_list=audio_len_list,
             masking_modality=masking_modality,
+            slg_layer=slg_layer,
             is_i2v=image_embeds is not None,
             first_frames=first_frames,
         )
+        video_out = video_pred.unsqueeze(0) if video_was_batched else video_pred
+        audio_out = audio_pred.unsqueeze(0) if audio_was_batched else audio_pred
         return {
-            "video": video_pred.unsqueeze(0),
-            "audio": audio_pred.unsqueeze(0),
+            "video": video_out,
+            "audio": audio_out,
         }
 
+    @torch.no_grad()
     def predict_eps(
         self,
         *,
@@ -1840,8 +2011,49 @@ class NAVATransformer(nn.Module):
         audio_len_list: torch.Tensor | None = None,
         masking_modality: bool = False,
         is_i2v: bool = False,
+        slg_layer: int | bool = False,
         first_frames: list[torch.Tensor] | None = None,
         **_: object,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        device = None
+        if latents_vid is not None:
+            device = latents_vid.device
+        elif latents_audio is not None:
+            device = latents_audio.device
+        autocast_enabled = device is not None and device.type == "cuda"
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+            return self._predict_eps_impl(
+                vid_context=vid_context,
+                audio_context=audio_context,
+                latents_vid=latents_vid,
+                latents_audio=latents_audio,
+                timesteps=timesteps,
+                spk_embs=spk_embs,
+                spk_pos=spk_pos,
+                t_h_w_list=t_h_w_list,
+                audio_len_list=audio_len_list,
+                masking_modality=masking_modality,
+                is_i2v=is_i2v,
+                slg_layer=slg_layer,
+                first_frames=first_frames,
+            )
+
+    def _predict_eps_impl(
+        self,
+        *,
+        vid_context: list[torch.Tensor] | None,
+        audio_context: list[torch.Tensor] | None,
+        latents_vid: torch.Tensor | None,
+        latents_audio: torch.Tensor | None,
+        timesteps: torch.Tensor,
+        spk_embs: torch.Tensor | None = None,
+        spk_pos: list[list[int]] | None = None,
+        t_h_w_list: torch.Tensor | None = None,
+        audio_len_list: torch.Tensor | None = None,
+        masking_modality: bool = False,
+        is_i2v: bool = False,
+        slg_layer: int | bool = False,
+        first_frames: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         has_video = latents_vid is not None
         has_audio = latents_audio is not None
@@ -1900,6 +2112,7 @@ class NAVATransformer(nn.Module):
             spk_embed=spk_embs,
             spk_pos=spk_pos,
             masking_modality=masking_modality,
+            slg_layer=slg_layer,
             first_frame_is_clean=is_i2v and first_frames is not None,
         )
 
@@ -1932,7 +2145,10 @@ class NAVATransformer(nn.Module):
             if not name.startswith("backbone.") and f"backbone.{name}" in params:
                 name = f"backbone.{name}"
             if name in params:
-                default_weight_loader(params[name], tensor)
+                if ".norm3." in name or ".norm3_audio." in name:
+                    params[name].data = tensor.to(device=params[name].device)
+                else:
+                    default_weight_loader(params[name], tensor)
                 loaded.add(name)
             else:
                 unmatched.append(name)

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -22,8 +23,15 @@ from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.nava import audio_vae as nava_audio_vae
 from vllm_omni.diffusion.models.nava.audio_vae import NAVAAudioVAE
 from vllm_omni.diffusion.models.nava.config import NAVAConfig, inject_speaker_sentinel, parse_speech_spans
-from vllm_omni.diffusion.models.nava.nava_transformer import NAVATransformer, WanSelfAttention
-from vllm_omni.diffusion.models.nava.pipeline_nava import NAVAPipeline, get_nava_post_process_func
+from vllm_omni.diffusion.models.nava.nava_transformer import (
+    NAVATransformer,
+    WanSelfAttention,
+    _rope_apply_1d,
+    _rope_apply_3d,
+    _rope_apply_3d_to_1d,
+)
+from vllm_omni.diffusion.models.nava.pipeline_nava import NAVAPipeline, _NAVATextEncoder, get_nava_post_process_func
+from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _DIFFUSION_POST_PROCESS_FUNCS, _NO_CACHE_ACCELERATION
@@ -109,10 +117,14 @@ class FakeTransformer(nn.Module):
         }
 
     def load_weights(self, weights):
-        return {name for name, _ in weights}
+        return {name.removeprefix("transformer.") for name, _ in weights}
 
 
-def _make_pipeline(tmp_path: Path, **custom_components: Any) -> NAVAPipeline:
+def _make_pipeline(
+    tmp_path: Path,
+    custom_pipeline_args_extra: dict[str, Any] | None = None,
+    **custom_components: Any,
+) -> NAVAPipeline:
     model_config = {
         "height": 16,
         "width": 16,
@@ -124,19 +136,39 @@ def _make_pipeline(tmp_path: Path, **custom_components: Any) -> NAVAPipeline:
         "speaker_embed_dim": 3,
         "audio_tokens_per_sec": 4.0,
     }
+    text_encoder = custom_components.get("text_encoder", FakeTextEncoder())
+    video_vae = custom_components.get("video_vae", FakeVideoVAE())
+    audio_vae = custom_components.get("audio_vae", FakeAudioVAE())
+    speaker_encoder = custom_components.get("speaker_encoder", FakeSpeakerEncoder())
+    transformer = custom_components.get("transformer", FakeTransformer())
     od_config = OmniDiffusionConfig(
         model=str(tmp_path),
         model_class_name="NAVAPipeline",
         model_config=model_config,
-        custom_pipeline_args={
-            "text_encoder": custom_components.get("text_encoder", FakeTextEncoder()),
-            "video_vae": custom_components.get("video_vae", FakeVideoVAE()),
-            "audio_vae": custom_components.get("audio_vae", FakeAudioVAE()),
-            "speaker_encoder": custom_components.get("speaker_encoder", FakeSpeakerEncoder()),
-            "transformer": custom_components.get("transformer", FakeTransformer()),
-        },
+        custom_pipeline_args=custom_pipeline_args_extra or {},
     )
-    return NAVAPipeline(od_config=od_config)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
+            lambda *args, **kwargs: text_encoder,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
+            lambda *args, **kwargs: video_vae,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
+            lambda *args, **kwargs: audio_vae,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
+            lambda *args, **kwargs: speaker_encoder,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
+            lambda *args, **kwargs: transformer,
+        )
+        return NAVAPipeline(od_config=od_config)
 
 
 def _make_request(prompt: Any, **sampling_kwargs: Any) -> OmniDiffusionRequest:
@@ -171,12 +203,147 @@ def _write_minimal_model_dir(path: Path) -> None:
     (speaker_dir / "hubconf.py").write_text("def ReDimNet(**kwargs):\n    return None\n", encoding="utf-8")
 
 
+def test_custom_pipeline_args_without_component_keys_do_not_inject_missing_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_minimal_model_dir(tmp_path)
+
+    text_encoder = FakeTextEncoder()
+    video_vae = FakeVideoVAE()
+    audio_vae = FakeAudioVAE()
+    speaker_encoder = FakeSpeakerEncoder()
+    transformer = FakeTransformer()
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
+        lambda *args, **kwargs: text_encoder,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
+        lambda *args, **kwargs: video_vae,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
+        lambda *args, **kwargs: audio_vae,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
+        lambda *args, **kwargs: speaker_encoder,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
+        lambda *args, **kwargs: transformer,
+    )
+
+    pipeline = NAVAPipeline(
+        od_config=OmniDiffusionConfig(
+            model=str(tmp_path),
+            model_class_name="NAVAPipeline",
+            custom_pipeline_args={"nava_weight_dtype": "bf16"},
+        )
+    )
+
+    assert pipeline.text_encoder is text_encoder
+    assert pipeline.video_vae is video_vae
+    assert pipeline.audio_vae is audio_vae
+    assert pipeline.speaker_encoder is speaker_encoder
+    assert pipeline.transformer is transformer
+
+
+def test_default_text_encoder_compile_matches_upstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_minimal_model_dir(tmp_path)
+    captured: list[bool] = []
+
+    def make_text_encoder(*args: Any, **kwargs: Any) -> FakeTextEncoder:
+        captured.append(bool(kwargs["compile_model"]))
+        return FakeTextEncoder()
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder", make_text_encoder)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE", lambda *args, **kwargs: FakeVideoVAE())
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE", lambda *args, **kwargs: FakeAudioVAE())
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
+        lambda *args, **kwargs: FakeSpeakerEncoder(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
+        lambda *args, **kwargs: FakeTransformer(),
+    )
+
+    NAVAPipeline(od_config=OmniDiffusionConfig(model=str(tmp_path), model_class_name="NAVAPipeline"))
+    NAVAPipeline(
+        od_config=OmniDiffusionConfig(
+            model=str(tmp_path),
+            model_class_name="NAVAPipeline",
+            custom_pipeline_args={"nava_text_encoder_compile": False},
+        )
+    )
+
+    assert captured == [True, False]
+
+
 def test_config_accepts_model_index_aliases() -> None:
     cfg = NAVAConfig.from_dict({"nava_ckpt": "custom.safetensors", "height": 16, "width": 32})
 
     assert cfg.ckpt_name == "custom.safetensors"
     assert cfg.log_height == 16
     assert cfg.log_width == 32
+
+
+def test_config_model_index_audio_vae_dir_wins_over_stale_yaml_model_block() -> None:
+    cfg = NAVAConfig.from_dict(
+        {
+            "audio_vae_dir": "params",
+            "model": {"audio_vae_ckpt_dir": "./huggingface_upload/params"},
+        }
+    )
+
+    assert cfg.audio_vae_ckpt_dir == "params"
+
+
+def test_config_joint_config_overrides_stale_yaml_architecture() -> None:
+    cfg = NAVAConfig.from_dict(
+        {
+            "patch_size": 2,
+            "hidden_size": 128,
+            "model": {
+                "joint_config_data": {
+                    "patch_size": [1, 2, 2],
+                    "dim": 3072,
+                    "vid_in_dim": 48,
+                    "audio_in_dim": 128,
+                }
+            },
+        }
+    )
+
+    assert cfg.patch_size == (1, 2, 2)
+    assert cfg.hidden_size == 3072
+    assert cfg.video_latent_ch == 48
+    assert cfg.audio_latent_ch == 128
+
+
+def test_config_explicit_keys_override_joint_config() -> None:
+    cfg = NAVAConfig.from_dict(
+        {
+            "_explicit_keys": {"patch_size", "hidden_size"},
+            "patch_size": [1, 1, 1],
+            "hidden_size": 256,
+            "model": {
+                "joint_config_data": {
+                    "patch_size": [1, 2, 2],
+                    "dim": 3072,
+                }
+            },
+        }
+    )
+
+    assert cfg.patch_size == (1, 1, 1)
+    assert cfg.hidden_size == 256
 
 
 def test_config_rejects_unaligned_video_resolution() -> None:
@@ -218,11 +385,66 @@ def test_parse_text_only_request(tmp_path: Path) -> None:
     assert ctx.frames == 5
 
 
-def test_parse_request_normalizes_unaligned_output_frames(tmp_path: Path) -> None:
+def test_pipeline_weight_source_and_loaded_names_are_transformer_scoped(tmp_path: Path) -> None:
+    pipeline = _make_pipeline(tmp_path)
+
+    assert [source.prefix for source in pipeline.weights_sources] == ["transformer."]
+    loaded = pipeline.load_weights([("transformer.backbone.weight", torch.ones(1))])
+
+    assert loaded == {"transformer.backbone.weight"}
+
+
+def test_pipeline_loads_explicit_config_file_before_building_nava_config(tmp_path: Path) -> None:
+    runtime_config = tmp_path / "runtime.yaml"
+    runtime_config.write_text(
+        """
+model_type: NAVA
+data:
+  video_fps: 8
+  audio_tokens_per_sec: 25
+model:
+  audio_vae_ckpt_dir: params
+""",
+        encoding="utf-8",
+    )
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="NAVAPipeline",
+        model_config={"config": str(runtime_config)},
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
+            lambda *args, **kwargs: FakeTextEncoder(),
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
+            lambda *args, **kwargs: FakeVideoVAE(),
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
+            lambda *args, **kwargs: FakeAudioVAE(),
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
+            lambda *args, **kwargs: FakeSpeakerEncoder(),
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
+            lambda *args, **kwargs: FakeTransformer(),
+        )
+        pipeline = NAVAPipeline(od_config=od_config)
+
+    assert pipeline.nava_config.fps == 8
+    assert pipeline.nava_config.audio_latent_length(frames=5) == 54
+
+
+def test_parse_request_preserves_upstream_latent_frames(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
     ctx = pipeline._parse_request(_make_request("plain prompt", num_frames=10))
 
-    assert ctx.frames == 9
+    assert ctx.frames == 10
 
 
 def test_parse_image_condition_request(tmp_path: Path) -> None:
@@ -274,6 +496,50 @@ def test_text_embedding_returns_speaker_marker_positions(tmp_path: Path) -> None
     assert speaker_positions == [[1]]
 
 
+def test_text_encoder_is_not_wrapped_in_pipeline_autocast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_autocast(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("NAVA text encoder must run without pipeline autocast")
+
+    text_encoder = FakeTextEncoder()
+    pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
+    monkeypatch.setattr(torch, "autocast", fail_autocast)
+
+    embeds = pipeline._encode_text("plain prompt")
+
+    assert embeds.shape == (1, 2, 4)
+    assert text_encoder.calls == [["plain prompt"]]
+
+
+@pytest.mark.parametrize(
+    ("eos_token", "unk_token", "expected_pad_token", "expected_pad_token_id"),
+    [
+        ("</s>", "<unk>", "</s>", None),
+        (None, "<unk>", "<unk>", None),
+        (None, None, None, 0),
+    ],
+)
+def test_text_encoder_padding_token_matches_upstream_fallback(
+    eos_token: str | None,
+    unk_token: str | None,
+    expected_pad_token: str | None,
+    expected_pad_token_id: int | None,
+) -> None:
+    tokenizer = SimpleNamespace(
+        pad_token=None,
+        eos_token=eos_token,
+        unk_token=unk_token,
+        pad_token_id=None,
+    )
+
+    _NAVATextEncoder._ensure_tokenizer_padding(tokenizer)
+
+    assert tokenizer.pad_token == expected_pad_token
+    assert tokenizer.pad_token_id == expected_pad_token_id
+
+
 def test_image_embedding_uses_video_vae(tmp_path: Path) -> None:
     video_vae = FakeVideoVAE()
     pipeline = _make_pipeline(tmp_path, video_vae=video_vae)
@@ -309,14 +575,58 @@ def test_default_speaker_encoder_requires_local_redimnet(tmp_path: Path) -> None
         speaker_encoder.encode(["speaker.wav"], device=torch.device("cpu"), dtype=torch.float32)
 
 
+def test_speaker_encoder_loads_wav_file_without_torchcodec(tmp_path: Path) -> None:
+    sf = pytest.importorskip("soundfile")
+    wav_path = tmp_path / "speaker.wav"
+    sf.write(wav_path, torch.zeros(8000).numpy(), 8000)
+    speaker_encoder = NAVASpeakerEncoder(str(tmp_path), NAVAConfig(audio_sample_rate=16000))
+
+    waveform = speaker_encoder._load_waveform(wav_path, torch.device("cpu"))
+
+    assert waveform.shape == (1, 16000)
+    assert waveform.dtype == torch.float32
+
+
+def test_speaker_encoder_uses_torch_home_redimnet_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    torch_home = tmp_path / "torch"
+    redimnet_dir = torch_home / "hub" / "IDRnD_ReDimNet_main"
+    redimnet_dir.mkdir(parents=True)
+    (redimnet_dir / "hubconf.py").write_text("placeholder", encoding="utf-8")
+    monkeypatch.setenv("TORCH_HOME", str(torch_home))
+
+    loaded: list[str] = []
+
+    class TinySpeaker(nn.Module):
+        def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+            return torch.ones(192, device=waveform.device)
+
+    def fake_load(path: str, model: str, source: str, **kwargs: Any) -> nn.Module:
+        del model, source, kwargs
+        loaded.append(path)
+        return TinySpeaker()
+
+    monkeypatch.setattr(torch.hub, "load", fake_load)
+    speaker_encoder = NAVASpeakerEncoder(str(tmp_path), NAVAConfig())
+
+    embedding = speaker_encoder.encode([torch.zeros(16000)], device=torch.device("cpu"), dtype=torch.float32)
+
+    assert loaded == [str(redimnet_dir)]
+    assert embedding.shape == (1, 192)
+
+
 def test_prepare_latents_uses_video_audio_shapes(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
     ctx = pipeline._parse_request(_make_request("plain prompt", seed=3))
 
     latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
 
-    assert latents["video"].shape == (1, 2, 3)
-    assert latents["audio"].shape == (1, 1, 4)
+    assert latents["video"].shape == (1, 5, 3)
+    assert latents["audio"].shape == (1, 3, 4)
+    assert latents["video"].dtype == torch.float32
+    assert latents["audio"].dtype == torch.float32
 
 
 def test_prepare_latents_uses_latent_video_frames(tmp_path: Path) -> None:
@@ -325,18 +635,45 @@ def test_prepare_latents_uses_latent_video_frames(tmp_path: Path) -> None:
 
     latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
 
-    assert latents["video"].shape == (1, 3, 3)
+    assert latents["video"].shape == (1, 9, 3)
 
 
-def test_apply_first_frame_condition_keeps_image_latent_tokens(tmp_path: Path) -> None:
+def test_prepare_latents_audio_length_uses_model_fps_not_output_fps(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
-    video_latents = torch.zeros(1, 3, 3)
-    image_embeds = torch.ones(1, 1, 3) * 7
+    ctx = pipeline._parse_request(_make_request("plain prompt", frame_rate=8, seed=3))
 
-    conditioned = pipeline._apply_first_frame_condition(video_latents, image_embeds, (3, 1, 1))
+    latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
 
-    assert torch.equal(conditioned[:, :1], image_embeds)
-    assert torch.equal(conditioned[:, 1:], torch.zeros(1, 2, 3))
+    assert ctx.fps == 8
+    assert latents["audio"].shape == (1, 3, 4)
+
+
+def test_scheduler_uses_upstream_unipc_timestep_grid() -> None:
+    scheduler = NAVAFlowMatchScheduler(shift=5.0)
+
+    timesteps = scheduler.set_timesteps(1, device=torch.device("cpu"))
+
+    assert timesteps.dtype == torch.int64
+    assert timesteps.tolist() == [999]
+
+
+def test_rng_restore_mode_uses_captured_global_rng_instead_of_request_generator(tmp_path: Path) -> None:
+    pipeline = _make_pipeline(
+        tmp_path,
+        custom_pipeline_args_extra={
+            "nava_init_seed": 47,
+            "nava_restore_init_cuda_rng_before_sample": True,
+        },
+    )
+
+    assert pipeline._rng_state_after_init is not None
+    assert pipeline._make_generator(seed=999) is None
+
+
+def test_skip_request_seed_uses_global_rng_without_generator(tmp_path: Path) -> None:
+    pipeline = _make_pipeline(tmp_path, custom_pipeline_args_extra={"skip_request_seed": True})
+
+    assert pipeline._make_generator(seed=999) is None
 
 
 def test_decode_video_passes_output_frames_with_latent_tokens(tmp_path: Path) -> None:
@@ -344,10 +681,10 @@ def test_decode_video_passes_output_frames_with_latent_tokens(tmp_path: Path) ->
     pipeline = _make_pipeline(tmp_path, video_vae=video_vae)
     ctx = pipeline._parse_request(_make_request("plain prompt", num_frames=9))
 
-    video = pipeline._decode_video(torch.zeros(1, 3, 3), ctx)
+    video = pipeline._decode_video(torch.zeros(1, 9, 3), ctx)
 
-    assert video.shape == (1, 3, 9, 16, 16)
-    assert video_vae.decode_calls == [{"height": 16, "width": 16, "frames": 9, "shape": torch.Size([1, 3, 3])}]
+    assert video.shape == (1, 3, 33, 16, 16)
+    assert video_vae.decode_calls == [{"height": 16, "width": 16, "frames": 33, "shape": torch.Size([1, 9, 3])}]
 
 
 def test_video_vae_decode_reshapes_latent_frames_and_trims_output() -> None:
@@ -495,14 +832,66 @@ def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
     output = pipeline.forward(_make_request("plain prompt", seed=1)).output
 
     assert isinstance(output, dict)
-    assert output["video"].shape == (1, 3, 5, 16, 16)
-    assert output["audio"].shape == (1, 1)
+    assert output["video"].shape == (1, 3, 17, 16, 16)
+    assert output["audio"].shape == (1, 3)
     assert output["audio_sample_rate"] == 16000
     assert output["fps"] == 24
     assert len(transformer.calls) == 6
-    assert {call["video_grid"] for call in transformer.calls} == {(2, 1, 1)}
+    assert {call["video_grid"] for call in transformer.calls} == {(5, 1, 1)}
     assert len(audio_vae.decode_shapes) == 1
-    assert text_encoder.calls == [["plain prompt"], [""]]
+    assert text_encoder.calls == [
+        ["plain prompt"],
+        [NAVAConfig.video_negative_prompt, NAVAConfig.audio_negative_prompt],
+    ]
+    negative_calls = [call for call in transformer.calls if call["speaker_embeds"] is None and "audio_text_embeds" in call]
+    assert negative_calls
+    assert all(call["audio_text_embeds"] is not call["text_embeds"] for call in negative_calls)
+    assert all(call["slg_layer"] == 11 for call in negative_calls)
+
+
+def test_negative_prompt_mode_false_uses_zero_unconditioned_embedding(tmp_path: Path) -> None:
+    text_encoder = FakeTextEncoder()
+    positive = torch.ones(1, 2, 4)
+    pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
+    ctx = pipeline._parse_request(_make_request("plain prompt", extra_args={"negative_prompt_mode": False}))
+
+    video_neg, audio_neg = pipeline._encode_negative_texts(ctx, positive)
+
+    assert torch.equal(video_neg, torch.zeros_like(positive))
+    assert torch.equal(audio_neg, torch.zeros_like(positive))
+    assert text_encoder.calls == []
+
+
+def test_negative_prompt_mode_false_handles_trimmed_text_embedding_lists(tmp_path: Path) -> None:
+    pipeline = _make_pipeline(tmp_path)
+    ctx = pipeline._parse_request(_make_request("plain prompt", extra_args={"negative_prompt_mode": False}))
+    positive = [torch.ones(3, 4)]
+
+    video_neg, audio_neg = pipeline._encode_negative_texts(ctx, positive)
+
+    assert isinstance(video_neg, list)
+    assert isinstance(audio_neg, list)
+    assert torch.equal(video_neg[0], torch.zeros(3, 4))
+    assert torch.equal(audio_neg[0], torch.zeros(3, 4))
+
+
+def test_request_level_negative_prompts_override_defaults(tmp_path: Path) -> None:
+    text_encoder = FakeTextEncoder()
+    positive = torch.ones(1, 2, 4)
+    pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
+    ctx = pipeline._parse_request(
+        _make_request(
+            "plain prompt",
+            extra_args={
+                "video_negative_prompt": "bad video",
+                "audio_negative_prompt": "bad audio",
+            },
+        )
+    )
+
+    pipeline._encode_negative_texts(ctx, positive)
+
+    assert text_encoder.calls == [["bad video", "bad audio"]]
 
 
 def test_forward_passes_speaker_positions_to_transformer(tmp_path: Path) -> None:
@@ -531,6 +920,16 @@ def test_postprocess_returns_video_audio_metadata() -> None:
     assert output["audio"] is audio
     assert output["audio_sample_rate"] == 24000
     assert output["fps"] == 12
+
+
+def test_postprocess_converts_bfloat16_video_to_numpy_float32() -> None:
+    postprocess = get_nava_post_process_func(SimpleNamespace())
+    video = torch.zeros(1, 3, 2, 4, 4, dtype=torch.bfloat16)
+
+    output = postprocess({"video": video}, output_type="np")
+
+    assert len(output["video"]) == 1
+    assert output["video"][0].dtype == np.float32
 
 
 def test_nava_registered_as_diffusion_pipeline() -> None:
@@ -616,6 +1015,79 @@ def test_transformer_marks_first_frame_clean_for_image_conditioning() -> None:
     )
 
     assert transformer.backbone.calls[0]["first_frame_is_clean"]
+
+
+def _rope_apply_1d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    n, c = x.size(2), x.size(3) // 2
+    c_rope = freqs.shape[1]
+    output = []
+    for i, (length,) in enumerate(grid_sizes.tolist()):
+        seq_len = length
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        x_i_rope = x_i[:, :, :c_rope] * freqs[:seq_len, None, :]
+        x_i_passthrough = x_i[:, :, c_rope:]
+        x_i = torch.cat([x_i_rope, x_i_passthrough], dim=2)
+        x_i = torch.view_as_real(x_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).bfloat16()
+
+
+def _rope_apply_3d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    n, c = x.size(2), x.size(3) // 2
+    split_freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        freqs_i = torch.cat(
+            [
+                split_freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                split_freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                split_freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).bfloat16()
+
+
+def _rope_apply_3d_to_1d_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    n, c = x.size(2), x.size(3) // 2
+    c_rope = freqs.shape[1]
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        freqs_i = freqs[:f].view(f, 1, 1, -1).expand(f, h, w, -1).reshape(seq_len, 1, -1)
+        x_i_rope = x_i[:, :, :c_rope] * freqs_i
+        x_i_passthrough = x_i[:, :, c_rope:]
+        x_i = torch.cat([x_i_rope, x_i_passthrough], dim=2)
+        x_i = torch.view_as_real(x_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).bfloat16()
+
+
+def test_rope_apply_chunked_matches_reference() -> None:
+    torch.manual_seed(0)
+    x_video = torch.randn(2, 17, 2, 12, dtype=torch.bfloat16)
+    grid_video = torch.tensor([[2, 2, 3], [1, 3, 4]])
+    freqs_video = torch.polar(torch.ones(8, 6, dtype=torch.float64), torch.randn(8, 6, dtype=torch.float64))
+
+    assert torch.equal(_rope_apply_3d(x_video, grid_video, freqs_video), _rope_apply_3d_reference(x_video, grid_video, freqs_video))
+
+    x_audio = torch.randn(2, 11, 2, 12, dtype=torch.bfloat16)
+    grid_audio = torch.tensor([[7], [9]])
+    freqs_audio = torch.polar(torch.ones(12, 4, dtype=torch.float64), torch.randn(12, 4, dtype=torch.float64))
+
+    assert torch.equal(_rope_apply_1d(x_audio, grid_audio, freqs_audio), _rope_apply_1d_reference(x_audio, grid_audio, freqs_audio))
+    assert torch.equal(
+        _rope_apply_3d_to_1d(x_video, grid_video, freqs_audio),
+        _rope_apply_3d_to_1d_reference(x_video, grid_video, freqs_audio),
+    )
 
 
 @pytest.mark.parametrize(
