@@ -18,7 +18,6 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -27,62 +26,6 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 
 logger = init_logger(__name__)
-
-
-def _all_gather_sequence_parallel(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    del x, dim
-    raise NotImplementedError("NAVA sequence parallelism is not enabled in the native adapter yet.")
-
-
-def _all_to_all_4d_sequence_parallel(x: torch.Tensor, scatter_dim: int, gather_dim: int) -> torch.Tensor:
-    del x, scatter_dim, gather_dim
-    raise NotImplementedError("NAVA sequence parallelism is not enabled in the native adapter yet.")
-
-
-def _get_sequence_parallel_state() -> bool:
-    return False
-
-
-def _create_custom_forward(module: nn.Module):
-    def custom_forward(*inputs, **kwargs):
-        return module(*inputs, **kwargs)
-
-    return custom_forward
-
-
-def _gradient_checkpoint_forward(
-    model: nn.Module,
-    use_gradient_checkpointing: bool,
-    use_gradient_checkpointing_offload: bool,
-    *args,
-    **kwargs,
-):
-    if use_gradient_checkpointing_offload:
-        with torch.autograd.graph.save_on_cpu():
-            model_output = torch.utils.checkpoint.checkpoint(
-                _create_custom_forward(model),
-                *args,
-                **kwargs,
-                use_reentrant=False,
-            )
-    elif use_gradient_checkpointing:
-        model_output = torch.utils.checkpoint.checkpoint(
-            _create_custom_forward(model),
-            *args,
-            **kwargs,
-            use_reentrant=False,
-        )
-    else:
-        model_output = model(*args, **kwargs)
-    return model_output
-
-
-class _NCCLInfo:
-    sp_size = 1
-    rank_within_group = 0
-
-
-nccl_info = _NCCLInfo()
 
 
 class ChannelLastConv1d(nn.Conv1d):
@@ -308,7 +251,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        # optional sequence parallelism
         self.q_audio = nn.Linear(dim, dim)
         self.k_audio = nn.Linear(dim, dim)
         self.v_audio = nn.Linear(dim, dim)
@@ -323,14 +265,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
             role="self",
             qkv_layout="BSND",
         )
-        # self.world_size = get_world_size()
-        self.use_sp = _get_sequence_parallel_state()
-        if self.use_sp:
-            self.sp_size = nccl_info.sp_size
-            self.sp_rank = nccl_info.rank_within_group
-            assert self.num_heads % self.sp_size == 0, (
-                f"Num heads {self.num_heads} must be divisible by sp_size {self.sp_size}"
-            )
 
     # query, key, value function
     def _qkv_fn(self, x):
@@ -359,10 +293,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
         """
         q, k, v = self._qkv_fn(x) if not is_audio else self._qkv_fn_audio(x)
 
-        if self.use_sp:
-            q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
-            k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
-            v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
         x = _nava_attention(
             self.attn,
             q=_rope_apply(q, grid_sizes, freqs),
@@ -371,8 +301,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
             k_lens=seq_lens,
             window_size=self.window_size,
         )
-        if self.use_sp:
-            x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
         # output
         x = x.flatten(2)
         x = self.o(x) if not is_audio else self.o_audio(x)
@@ -425,11 +353,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 sort_keys = (~is_valid).int()
                 gather_indices = torch.argsort(sort_keys, dim=1, stable=True).to(x_vid.device)  # shape: [B, L]
 
-                if self.use_sp:
-                    q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
-                    k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
-                    v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
-
                 q_rope = _rope_apply_joint(q, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
                 k_rope = _rope_apply_joint(k, grid_sizes_vid, grid_sizes_audio, freqs_vid, freqs_audio, max_seq_len_vid)
 
@@ -474,8 +397,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                     window_size=self.window_size,
                 )
                 x = torch.cat([x_vid, x_audio], dim=1)
-            if self.use_sp:
-                x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
             # output
             x = x.flatten(2)
             x_vid = self.o(x[:, :max_seq_len_vid, :])
@@ -509,15 +430,6 @@ class WanSelfAttention(nn.Module):
             role="self",
             qkv_layout="BSND",
         )
-        # optional sequence parallelism
-        # self.world_size = get_world_size()
-        self.use_sp = _get_sequence_parallel_state()
-        if self.use_sp:
-            self.sp_size = nccl_info.sp_size
-            self.sp_rank = nccl_info.rank_within_group
-            assert self.num_heads % self.sp_size == 0, (
-                f"Num heads {self.num_heads} must be divisible by sp_size {self.sp_size}"
-            )
 
     # query, key, value function
     def _qkv_fn(self, x):
@@ -537,10 +449,6 @@ class WanSelfAttention(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         q, k, v = self._qkv_fn(x)
-        if self.use_sp:
-            q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
-            k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
-            v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
         x = _nava_attention(
             self.attn,
             q=_rope_apply(q, grid_sizes, freqs),
@@ -549,8 +457,6 @@ class WanSelfAttention(nn.Module):
             k_lens=seq_lens,
             window_size=self.window_size,
         )
-        if self.use_sp:
-            x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -584,10 +490,6 @@ class WanSelfAttention(nn.Module):
             B, L = x.shape[0], x.shape[1]
             pos = torch.arange(L).unsqueeze(0).expand(B, L)
             q, k, v = self._qkv_fn(x)
-            if self.use_sp:
-                q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
-                k = _all_to_all_4d_sequence_parallel(k, scatter_dim=2, gather_dim=1)
-                v = _all_to_all_4d_sequence_parallel(v, scatter_dim=2, gather_dim=1)  # [B, L, H/P, C/H]
             if use_joint_attention:
                 is_vid_valid = (pos < max_seq_len_vid) & (pos < seq_lens_vid.unsqueeze(1))
                 is_aud_valid = (pos >= max_seq_len_vid) & ((pos - max_seq_len_vid) < seq_lens_audio.unsqueeze(1))
@@ -648,8 +550,6 @@ class WanSelfAttention(nn.Module):
                     window_size=self.window_size,
                 )
                 x = torch.cat([x_vid, x_audio], dim=1)
-            if self.use_sp:
-                x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
             # output
             x = x.flatten(2)
             x = self.o(x)
@@ -783,20 +683,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         """
         q, k, v, k_img, v_img = self._qkv_fn(x, context)
 
-        if self.use_sp:
-            q = _all_to_all_4d_sequence_parallel(q, scatter_dim=2, gather_dim=1)
-            k = torch.chunk(k, self.sp_size, dim=2)[self.sp_rank]
-            v = torch.chunk(v, self.sp_size, dim=2)[self.sp_rank]
-            k_img = torch.chunk(k_img, self.sp_size, dim=2)[self.sp_rank]
-            v_img = torch.chunk(v_img, self.sp_size, dim=2)[self.sp_rank]
-
-        # [B, L, H/P, C/H]
-        # k_img: [B, L, H, C/H]
         img_x = _nava_attention(self.attn, q, k_img, v_img, k_lens=None)
         # compute attention
         x = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
-        if self.use_sp:
-            x = _all_to_all_4d_sequence_parallel(x, scatter_dim=1, gather_dim=2)  # [B, L/P, H, C/H]
 
         # output
         x = x.flatten(2)
@@ -1260,9 +1149,6 @@ class WanAVModel(nn.Module):
         window_size=(-1, -1),
         qk_norm=True,
         cross_attn_norm=True,
-        gradient_checkpointing=False,
-        gradient_checkpointing_offload=False,
-        gradient_checkpoint_every_n=1,
         temporal_rope_scaling_factor=1.0,
         eps=1e-6,
         add_spk_emb=False,
@@ -1365,13 +1251,6 @@ class WanAVModel(nn.Module):
 
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
-        self.use_sp = _get_sequence_parallel_state()  # seq parallel
-        if self.use_sp:
-            self.sp_size = nccl_info.sp_size
-            self.sp_rank = nccl_info.rank_within_group
-            assert self.num_heads % self.sp_size == 0, (
-                f"Num heads {self.num_heads} must be divisible by sp_size {self.sp_size}"
-            )
         # blocks
         ## so i2v and tt2a share the same cross attention while t2v and t2a share the same cross attention
         cross_attn_type = "t2v_cross_attn" if model_type in ["t2v", "t2a", "ti2v"] else "i2v_cross_attn"
@@ -1449,9 +1328,6 @@ class WanAVModel(nn.Module):
 
         # initialize weights
         self._init_weights()
-        self.gradient_checkpointing = gradient_checkpointing
-        self.gradient_checkpointing_offload = gradient_checkpointing_offload
-        self.gradient_checkpoint_every_n = gradient_checkpoint_every_n
 
     def _merge_kwargs(self, vid_kwargs, audio_kwargs):
         """
@@ -1519,7 +1395,6 @@ class WanAVModel(nn.Module):
         spk_pos=None,
         is_audio_type=False,
     ):
-
         # params
         ## need to change!
         device = next(self.patch_embedding.parameters()).device
@@ -1565,25 +1440,6 @@ class WanAVModel(nn.Module):
             e = self.time_embedding(_sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len)).bfloat16())
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))  # [1, 26784, 6, 3072] - B, seq_len, 6, dim
             assert e.dtype == torch.bfloat16 and e0.dtype == torch.bfloat16
-
-        if self.use_sp:
-            current_len = x.shape[1]
-            # we will pad up to the next multiple of sp_size: eg. [157] -> [160]
-            pad_size = (-current_len) % self.sp_size
-
-            if pad_size > 0:
-                padding = torch.zeros(x.shape[0], pad_size, x.shape[2], device=x.device, dtype=x.dtype)
-                x = torch.cat([x, padding], dim=1)
-                e_padding = torch.zeros(e.shape[0], pad_size, e.shape[2], device=e.device, dtype=e.dtype)
-                e = torch.cat([e, e_padding], dim=1)
-                e0_padding = torch.zeros(
-                    e0.shape[0], pad_size, e0.shape[2], e0.shape[3], device=e0.device, dtype=e0.dtype
-                )
-                e0 = torch.cat([e0, e0_padding], dim=1)
-
-            x = torch.chunk(x, self.sp_size, dim=1)[self.sp_rank]
-            e = torch.chunk(e, self.sp_size, dim=1)[self.sp_rank]
-            e0 = torch.chunk(e0, self.sp_size, dim=1)[self.sp_rank]
 
         # context
         context_lens = None
@@ -1637,8 +1493,6 @@ class WanAVModel(nn.Module):
             x = self.head(x, e)
         else:
             x = self.head_audio(x, e)
-        if self.use_sp:
-            x = _all_gather_sequence_parallel(x, dim=1)
         # unpatchify
         if is_audio:
             ## grid_sizes is [B 1] where 1 is L,
@@ -1733,12 +1587,6 @@ class WanAVModel(nn.Module):
         )
         kwargs["masking_modality"] = masking_modality
 
-        # Under SP, x_vid/x_audio are already chunked to L/P length by prepare_transformer_block_kwargs.
-        # Adjust max_seq_len_vid/audio to match the actual chunked lengths so blocks split correctly.
-        if self.use_sp:
-            kwargs["max_seq_len_vid"] = x_vid.shape[1] if x_vid is not None else 0
-            kwargs["max_seq_len_audio"] = x_audio.shape[1] if x_audio is not None else 0
-
         if x_vid is not None and x_audio is not None:
             x = torch.cat([x_vid, x_audio], dim=1)
         elif x_vid is not None:
@@ -1746,37 +1594,13 @@ class WanAVModel(nn.Module):
         elif x_audio is not None:
             x = x_audio
 
-        for i, block in enumerate(self.double_blocks):
-            x = _gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing=(
-                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
-                ),
-                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
-                x=x,
-                **kwargs,
-            )
+        for block in self.double_blocks:
+            x = block(x=x, **kwargs)
 
-        for i, block in enumerate(self.single_blocks):
-            x = _gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing=(
-                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
-                ),
-                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
-                x=x,
-                **kwargs,
-            )
-        for i, block in enumerate(self.double_final_blocks):
-            x = _gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing=(
-                    self.gradient_checkpointing and i % self.gradient_checkpoint_every_n == 0
-                ),
-                use_gradient_checkpointing_offload=self.gradient_checkpointing_offload,
-                x=x,
-                **kwargs,
-            )
+        for block in self.single_blocks:
+            x = block(x=x, **kwargs)
+        for block in self.double_final_blocks:
+            x = block(x=x, **kwargs)
         if vid is not None:
             x_vid = x[:, : kwargs["max_seq_len_vid"]]
         if audio is not None:
@@ -1920,7 +1744,7 @@ class NAVATransformer(nn.Module):
                 raise ValueError(
                     "NAVA image latent token count does not match video_grid first frame: "
                     f"expected {expected_first_frame_tokens}, got {image_embeds.shape[1]}."
-            )
+                )
             # Image conditioning: replace the first latent video frame with
             # the encoded input image before denoising.
             first_frames = [image_embeds[0].reshape(1, latent_h, latent_w, self.video_latent_ch)]
