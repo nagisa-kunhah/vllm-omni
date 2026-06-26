@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,10 @@ def image_to_tensor(image: Any, height: int, width: int) -> torch.Tensor:
         if len(image) != 1:
             raise ValueError("NAVA image conditioning accepts exactly one first-frame image.")
         image = image[0]
+
+    if isinstance(image, (str, os.PathLike)):
+        with Image.open(image) as loaded:
+            image = loaded.convert("RGB")
 
     if isinstance(image, Image.Image):
         image = resize_center_crop(image.convert("RGB"), height, width)

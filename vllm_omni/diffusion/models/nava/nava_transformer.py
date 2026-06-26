@@ -159,7 +159,19 @@ def _nava_attention(
         window_size = tuple(window_size)
     if window_size != (-1, -1):
         raise NotImplementedError("NAVA sliding-window attention is not supported by the shared attention path yet.")
-    return attn(q, k, v, AttentionMetadata(query_lens=q_lens, key_lens=k_lens))
+    return attn(
+        q,
+        k,
+        v,
+        AttentionMetadata(
+            query_lens=q_lens,
+            key_lens=k_lens,
+            extra={
+                "sliced_sdpa_by_lengths": True,
+                "sliced_sdpa_fallback_dtype": torch.bfloat16,
+            },
+        ),
+    )
 
 
 def _sinusoidal_embedding_1d(dim, position):

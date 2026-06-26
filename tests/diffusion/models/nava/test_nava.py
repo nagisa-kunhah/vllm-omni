@@ -16,8 +16,11 @@ import pytest
 import torch
 from PIL import Image
 from torch import nn
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output, supports_multimodal_input
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -35,6 +38,7 @@ from vllm_omni.diffusion.models.nava.nava_transformer import (
 from vllm_omni.diffusion.models.nava.pipeline_nava import NAVAPipeline, _NAVATextEncoder, get_nava_post_process_func
 from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
+from vllm_omni.diffusion.models.nava.utils import image_to_tensor
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _DIFFUSION_POST_PROCESS_FUNCS, _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -69,6 +73,17 @@ class FakeTextEncoderWithSpeakerPositions(FakeTextEncoder):
         if return_speaker_positions:
             return embeds, [[1] for _ in texts]
         return embeds
+
+
+class DeviceIgnoringTextEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[list[str]] = []
+
+    def encode(self, texts: list[str], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        del device
+        self.calls.append(texts)
+        return torch.ones(len(texts), 2, 4, dtype=dtype)
 
 
 class FakeVideoVAE(nn.Module):
@@ -300,8 +315,15 @@ def test_default_text_encoder_compile_matches_upstream(
             custom_pipeline_args={"nava_text_encoder_compile": False},
         )
     )
+    NAVAPipeline(
+        od_config=OmniDiffusionConfig(
+            model=str(tmp_path),
+            model_class_name="NAVAPipeline",
+            custom_pipeline_args={"disable_text_encoder_compile": True},
+        )
+    )
 
-    assert captured == [True, False]
+    assert captured == [True, False, False]
 
 
 def test_config_accepts_model_index_aliases() -> None:
@@ -379,13 +401,17 @@ def test_config_normalizes_output_frames_to_vae_stride() -> None:
 
 
 def test_transformer_self_attention_owns_shared_attention_layer() -> None:
-    attention = WanSelfAttention(dim=8, num_heads=2)
+    od_config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="TORCH_SDPA")
+
+    with set_current_diffusion_config(od_config):
+        attention = WanSelfAttention(dim=8, num_heads=2)
 
     assert attention.attn.__class__.__name__ == "Attention"
 
 
-def test_nava_attention_calls_shared_attention_with_length_metadata() -> None:
+def test_nava_attention_calls_shared_attention_with_sliced_sdpa_hint() -> None:
     fake_attn = FakeAttention()
+    torch.manual_seed(123)
     q = torch.randn(2, 3, 2, 4)
     k = torch.randn(2, 5, 2, 4)
     v = torch.randn(2, 5, 2, 4)
@@ -401,6 +427,44 @@ def test_nava_attention_calls_shared_attention_with_length_metadata() -> None:
     assert called_v is v
     assert metadata.query_lens is None
     assert metadata.key_lens is key_lens
+    assert metadata.extra == {
+        "sliced_sdpa_by_lengths": True,
+        "sliced_sdpa_fallback_dtype": torch.bfloat16,
+    }
+
+
+def test_sdpa_sliced_lengths_match_upstream_fallback() -> None:
+    torch.manual_seed(123)
+    q = torch.randn(2, 3, 2, 4)
+    k = torch.randn(2, 5, 2, 4)
+    v = torch.randn(2, 5, 2, 4)
+    key_lens = torch.tensor([5, 3], dtype=torch.long)
+    metadata = AttentionMetadata(
+        key_lens=key_lens,
+        extra={
+            "sliced_sdpa_by_lengths": True,
+            "sliced_sdpa_fallback_dtype": torch.bfloat16,
+        },
+    )
+
+    output = SDPAImpl(num_heads=2, head_size=4, softmax_scale=None).forward(q, k, v, metadata)
+
+    expected = []
+    q_ref = q.to(torch.bfloat16)
+    k_ref = k.to(torch.bfloat16)
+    v_ref = v.to(torch.bfloat16)
+    for index, key_len in enumerate(key_lens.tolist()):
+        chunk = torch.nn.functional.scaled_dot_product_attention(
+            q_ref[index : index + 1].transpose(1, 2),
+            k_ref[index : index + 1, :key_len].transpose(1, 2),
+            v_ref[index : index + 1, :key_len].transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+        expected.append(chunk)
+    expected = torch.cat(expected, dim=0).to(q.dtype)
+
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_nava_attention_rejects_sliding_window_shared_path() -> None:
@@ -551,12 +615,41 @@ def test_text_encoder_is_not_wrapped_in_pipeline_autocast(
 
     text_encoder = FakeTextEncoder()
     pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
+    pipeline.device = torch.device("cpu")
     monkeypatch.setattr(torch, "autocast", fail_autocast)
 
     embeds = pipeline._encode_text("plain prompt")
 
     assert embeds.shape == (1, 2, 4)
     assert text_encoder.calls == [["plain prompt"]]
+
+
+def test_text_encoder_uses_cuda_autocast_for_bfloat16(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeAutocast:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            calls.append({"args": args, "kwargs": kwargs})
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+    text_encoder = DeviceIgnoringTextEncoder()
+    pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
+    pipeline.device = torch.device("cuda")
+    monkeypatch.setattr(torch, "autocast", FakeAutocast)
+
+    embeds = pipeline._encode_text("plain prompt")
+
+    assert embeds.shape == (1, 2, 4)
+    assert text_encoder.calls == [["plain prompt"]]
+    assert calls == [{"args": (), "kwargs": {"device_type": "cuda", "dtype": torch.bfloat16}}]
 
 
 @pytest.mark.parametrize(
@@ -978,8 +1071,24 @@ def test_postprocess_converts_bfloat16_video_to_numpy_float32() -> None:
     assert output["video"][0].dtype == np.float32
 
 
+def test_image_to_tensor_accepts_path_input(tmp_path: Path) -> None:
+    image_path = tmp_path / "first_frame.png"
+    Image.new("RGB", (8, 6), color=(255, 128, 0)).save(image_path)
+
+    tensor = image_to_tensor(image_path, height=4, width=4)
+
+    assert tensor.shape == (1, 3, 4, 4)
+    assert tensor.dtype == torch.float32
+    assert tensor.min() >= -1.0
+    assert tensor.max() <= 1.0
+
+
 def test_nava_registered_as_diffusion_pipeline() -> None:
     assert _DIFFUSION_MODELS["NAVAPipeline"] == ("nava", "pipeline_nava", "NAVAPipeline")
+
+
+def test_nava_pipeline_is_exported_for_qualname_resolution() -> None:
+    assert resolve_obj_by_qualname("vllm_omni.diffusion.models.nava.NAVAPipeline") is NAVAPipeline
 
 
 def test_nava_postprocess_registered() -> None:

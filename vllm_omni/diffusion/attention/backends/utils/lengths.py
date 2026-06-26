@@ -70,3 +70,56 @@ def _zero_invalid_queries(output: torch.Tensor, query_lens: torch.Tensor) -> tor
     query_positions = torch.arange(query_len, device=output.device).unsqueeze(0)
     query_mask = query_positions < query_lens.to(device=output.device).unsqueeze(1)
     return output * query_mask[:, :, None, None].to(dtype=output.dtype)
+
+
+def _sliced_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: torch.Tensor | None,
+    key_lens: torch.Tensor | None,
+    *,
+    causal: bool,
+    softmax_scale: float | None,
+    fallback_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if fallback_dtype is not None:
+        half_dtypes = (torch.float16, torch.bfloat16)
+        value = value if value.dtype in half_dtypes else value.to(fallback_dtype)
+        query = (query if query.dtype in half_dtypes else query.to(fallback_dtype)).to(value.dtype)
+        key = (key if key.dtype in half_dtypes else key.to(fallback_dtype)).to(value.dtype)
+
+    batch, query_len = query.shape[:2]
+    key_len = key.shape[1]
+    normalized_query_lens = _normalize_lengths(query_lens, batch, query_len, query.device)
+    normalized_key_lens = _normalize_lengths(key_lens, batch, key_len, key.device)
+
+    outputs: list[torch.Tensor] = []
+    for index in range(batch):
+        cur_query_len = int(normalized_query_lens[index].item())
+        cur_key_len = int(normalized_key_lens[index].item())
+        query_item = query[index : index + 1, :cur_query_len].transpose(1, 2)
+        key_item = key[index : index + 1, :cur_key_len].transpose(1, 2)
+        value_item = value[index : index + 1, :cur_key_len].transpose(1, 2)
+        if query_item.size(1) != key_item.size(1):
+            if query_item.size(1) % key_item.size(1) != 0:
+                raise ValueError(
+                    "Attention query heads must be divisible by key heads: "
+                    f"got {query_item.size(1)} and {key_item.size(1)}."
+                )
+            repeat = query_item.size(1) // key_item.size(1)
+            key_item = key_item.repeat_interleave(repeat, dim=1)
+            value_item = value_item.repeat_interleave(repeat, dim=1)
+        output = F.scaled_dot_product_attention(
+            query_item,
+            key_item,
+            value_item,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=causal,
+            scale=softmax_scale,
+        ).transpose(1, 2)
+        if cur_query_len < query_len:
+            output = F.pad(output, (0, 0, 0, 0, 0, query_len - cur_query_len))
+        outputs.append(output)
+    return torch.cat(outputs, dim=0)
