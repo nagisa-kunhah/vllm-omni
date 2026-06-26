@@ -12,6 +12,7 @@ helpers, keep module names close to the checkpoint layout, and add the
 """
 
 import math
+import warnings
 from collections.abc import Iterable
 
 import torch
@@ -21,7 +22,6 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 
@@ -95,26 +95,69 @@ def _nava_attention(
     q_lens: torch.Tensor | None = None,
     k_lens: torch.Tensor | None = None,
     window_size: tuple[int, int] | list[int] | None = None,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    q_scale: float | torch.Tensor | None = None,
+    causal: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     if window_size is None:
         window_size = (-1, -1)
     if isinstance(window_size, list):
         window_size = tuple(window_size)
+    half_dtypes = (torch.float16, torch.bfloat16)
+    assert dtype in half_dtypes
+    out_dtype = q.dtype
+    batch, query_len, key_len = q.size(0), q.size(1), k.size(1)
+
+    if q_lens is None:
+        q_lens = torch.full((batch,), query_len, dtype=torch.int32, device=q.device)
+    else:
+        q_lens = q_lens.to(device=q.device, dtype=torch.int32)
+    if k_lens is None:
+        k_lens = torch.full((batch,), key_len, dtype=torch.int32, device=k.device)
+    else:
+        k_lens = k_lens.to(device=k.device, dtype=torch.int32)
+
     if window_size != (-1, -1):
-        raise NotImplementedError("NAVA sliding-window attention is not supported by the shared attention path yet.")
-    return attn(
-        q,
-        k,
-        v,
-        AttentionMetadata(
-            query_lens=q_lens,
-            key_lens=k_lens,
-            extra={
-                "sliced_sdpa_by_lengths": True,
-                "sliced_sdpa_fallback_dtype": torch.bfloat16,
-            },
-        ),
-    )
+        warnings.warn("Sliding-window attention is ignored by the scaled_dot_product_attention fallback.")
+    q_sdpa = q if q.dtype in half_dtypes else q.to(dtype)
+    q_sdpa = q_sdpa.to(v.dtype)
+    k_sdpa = k if k.dtype in half_dtypes else k.to(dtype)
+    k_sdpa = k_sdpa.to(v.dtype)
+    v_sdpa = v if v.dtype in half_dtypes else v.to(dtype)
+    if q_scale is not None:
+        q_sdpa = q_sdpa * q_scale
+
+    chunks = []
+    for index in range(batch):
+        cur_query_len = int(q_lens[index].item())
+        cur_key_len = int(k_lens[index].item())
+        query_item = q_sdpa[index : index + 1, :cur_query_len].transpose(1, 2)
+        key_item = k_sdpa[index : index + 1, :cur_key_len].transpose(1, 2)
+        value_item = v_sdpa[index : index + 1, :cur_key_len].transpose(1, 2)
+        if query_item.size(1) != key_item.size(1):
+            if query_item.size(1) % key_item.size(1) != 0:
+                raise ValueError(
+                    "NAVA attention requires query heads to be divisible by key heads: "
+                    f"got {query_item.size(1)} and {key_item.size(1)}."
+                )
+            repeat = query_item.size(1) // key_item.size(1)
+            key_item = key_item.repeat_interleave(repeat, dim=1)
+            value_item = value_item.repeat_interleave(repeat, dim=1)
+        output = F.scaled_dot_product_attention(
+            query_item,
+            key_item,
+            value_item,
+            attn_mask=None,
+            dropout_p=dropout_p,
+            is_causal=causal,
+            scale=softmax_scale,
+        ).transpose(1, 2)
+        if cur_query_len < query_len:
+            output = F.pad(output, (0, 0, 0, 0, 0, query_len - cur_query_len))
+        chunks.append(output)
+    return torch.cat(chunks, dim=0).to(out_dtype)
 
 
 def _sinusoidal_embedding_1d(dim, position):

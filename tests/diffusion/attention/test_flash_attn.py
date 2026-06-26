@@ -11,7 +11,6 @@ This script tests two main scenarios:
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
@@ -23,92 +22,12 @@ from vllm_omni.platforms import current_omni_platform
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
-flash_attn_varlen_func = fa.flash_attn_varlen_func  # noqa: N813
-
-
-def _length_reference_sdpa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    *,
-    key_lens: torch.Tensor,
-    query_lens: torch.Tensor | None = None,
-    softmax_scale: float,
-) -> torch.Tensor:
-    batch_size, query_len = query.shape[:2]
-    key_len = key.shape[1]
-    query_ = query.permute(0, 2, 1, 3)
-    key_ = key.permute(0, 2, 1, 3)
-    value_ = value.permute(0, 2, 1, 3)
-    if query_.shape[1] != key_.shape[1]:
-        repeat = query_.shape[1] // key_.shape[1]
-        key_ = key_.repeat_interleave(repeat, dim=1)
-        value_ = value_.repeat_interleave(repeat, dim=1)
-    key_positions = torch.arange(key_len, device=query.device).unsqueeze(0)
-    key_mask = key_positions < key_lens.to(device=query.device).unsqueeze(1)
-    attn_mask = key_mask[:, None, None, :].expand(batch_size, 1, query_len, key_len)
-    output = F.scaled_dot_product_attention(
-        query_,
-        key_,
-        value_,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=softmax_scale,
-    ).permute(0, 2, 1, 3)
-    if query_lens is not None:
-        query_positions = torch.arange(query_len, device=query.device).unsqueeze(0)
-        query_mask = query_positions < query_lens.to(device=query.device).unsqueeze(1)
-        output = output * query_mask[:, :, None, None].to(dtype=output.dtype)
-    return output
 
 
 @pytest.mark.parametrize("impl_cls", [SDPAImpl, CuDNNAttentionImpl])
 def test_none_kv_heads_means_no_gqa(impl_cls):
     impl = impl_cls(num_heads=4, head_size=8, softmax_scale=8**-0.5, causal=False, num_kv_heads=None)
     assert impl.requires_gqa is False
-
-
-def test_length_metadata_rejects_attn_mask():
-    impl = SDPAImpl(num_heads=2, num_kv_heads=2, head_size=4, softmax_scale=0.5, causal=False)
-    query = torch.randn(2, 3, 2, 4)
-    key = torch.randn(2, 4, 2, 4)
-    value = torch.randn(2, 4, 2, 4)
-
-    with pytest.raises(ValueError, match="attn_mask cannot be used together"):
-        impl.forward_cuda(query, key, value, AttentionMetadata(attn_mask=torch.ones(2, 4), key_lens=torch.ones(2)))
-
-
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
-def test_flash_length_metadata_matches_sdpa_reference():
-    if not HAS_FLASH_ATTN or flash_attn_varlen_func is None:
-        pytest.skip("FlashAttention varlen function is not available")
-
-    device = torch.device(current_omni_platform.device_type)
-    dtype = torch.bfloat16
-    torch.manual_seed(14)
-    batch_size, query_len, key_len, num_heads, head_dim = 2, 4, 6, 4, 64
-    softmax_scale = head_dim**-0.5
-    query = torch.randn(batch_size, query_len, num_heads, head_dim, device=device, dtype=dtype)
-    key = torch.randn(batch_size, key_len, num_heads, head_dim, device=device, dtype=dtype)
-    value = torch.randn(batch_size, key_len, num_heads, head_dim, device=device, dtype=dtype)
-    query_lens = torch.tensor([4, 2], dtype=torch.int32, device=device)
-    key_lens = torch.tensor([6, 3], dtype=torch.int32, device=device)
-
-    fa_impl = FlashAttentionImpl(
-        num_heads=num_heads, head_size=head_dim, softmax_scale=softmax_scale, causal=False
-    )
-    actual = fa_impl.forward_cuda(query, key, value, AttentionMetadata(query_lens=query_lens, key_lens=key_lens))
-    expected = _length_reference_sdpa(
-        query,
-        key,
-        value,
-        query_lens=query_lens,
-        key_lens=key_lens,
-        softmax_scale=softmax_scale,
-    )
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:

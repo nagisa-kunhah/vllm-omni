@@ -12,14 +12,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
-from vllm_omni.diffusion.attention.backends.utils.lengths import (
-    _check_no_attn_mask_with_lengths,
-    _lengths_to_indices_cu_max,
-    _lengths_to_key_mask,
-    _metadata_has_lengths,
-    _normalize_lengths,
-    _zero_invalid_queries,
-)
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
@@ -168,52 +160,6 @@ class FlashAttentionImpl(AttentionImpl):
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
-    def _forward_varlen_lengths(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        query_lens: torch.Tensor | None,
-        key_lens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            _index_first_axis,
-            _pad_input,
-            flash_attn_varlen_func,
-        )
-
-        if flash_attn_varlen_func is None:
-            raise ImportError(
-                "FlashAttentionBackend length metadata requires flash_attn_varlen_func. "
-                "Install a Flash Attention package with varlen support or use "
-                "DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA."
-            )
-
-        batch_size, query_len = query.shape[:2]
-        key_len = key.shape[1]
-        normalized_query_lens = _normalize_lengths(query_lens, batch_size, query_len, query.device)
-        normalized_key_lens = _normalize_lengths(key_lens, batch_size, key_len, key.device)
-        indices_q, cu_seqlens_q, max_seqlen_q = _lengths_to_indices_cu_max(normalized_query_lens, query_len)
-        indices_k, cu_seqlens_k, max_seqlen_k = _lengths_to_indices_cu_max(normalized_key_lens, key_len)
-
-        query = _index_first_axis(query, indices_q)
-        key = _index_first_axis(key, indices_k)
-        value = _index_first_axis(value, indices_k)
-
-        out = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
-        out = self._unwrap_flash_output(out)
-        return _pad_input(out, indices_q, batch_size, query_len)
-
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -236,13 +182,9 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
-        if attn_metadata is not None:
-            _check_no_attn_mask_with_lengths(attn_metadata)
 
         # Try piecewise attention
         if full_attn_spans is not None:
-            if _metadata_has_lengths(attn_metadata):
-                raise NotImplementedError("Length metadata is not supported together with piecewise attention.")
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
             attn_func = partial(
                 FlashAttentionImpl._flash_wrapper,
@@ -256,15 +198,6 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
-            )
-
-        if _metadata_has_lengths(attn_metadata):
-            return self._forward_varlen_lengths(
-                query,
-                key,
-                value,
-                attn_metadata.query_lens,
-                attn_metadata.key_lens,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -311,17 +244,6 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        if attn_metadata is not None:
-            _check_no_attn_mask_with_lengths(attn_metadata)
-
-        if _metadata_has_lengths(attn_metadata):
-            return self._forward_varlen_lengths(
-                query,
-                key,
-                value,
-                attn_metadata.query_lens,
-                attn_metadata.key_lens,
-            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -348,8 +270,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
         if kv_cache_dtype is not None:
-            if _metadata_has_lengths(attn_metadata):
-                raise NotImplementedError("NPU quantized FlashAttention does not support length metadata.")
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
@@ -390,26 +310,15 @@ class FlashAttentionImpl(AttentionImpl):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
-        query_lens = None
-        if attn_metadata is not None:
-            _check_no_attn_mask_with_lengths(attn_metadata)
-            if _metadata_has_lengths(attn_metadata):
-                attention_mask, query_lens = _lengths_to_key_mask(
-                    query,
-                    key,
-                    attn_metadata.query_lens,
-                    attn_metadata.key_lens,
-                )
 
         # NPU aclnnFlashAttentionScore requires mask shape to be one of:
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
         # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
         # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
-        if query_lens is None:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
 
         layout = self.qkv_layout or "BNSD"
-        output = attention_forward(
+        return attention_forward(
             query,
             key,
             value,
@@ -418,6 +327,3 @@ class FlashAttentionImpl(AttentionImpl):
             op_type="fused_attn_score",
             layout=layout,
         )
-        if query_lens is not None:
-            output = _zero_invalid_queries(output, query_lens)
-        return output

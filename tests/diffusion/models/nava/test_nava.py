@@ -18,8 +18,6 @@ from PIL import Image
 from torch import nn
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output, supports_multimodal_input
@@ -135,22 +133,6 @@ class FakeTransformer(nn.Module):
 
     def load_weights(self, weights):
         return {name.removeprefix("transformer.") for name, _ in weights}
-
-
-class FakeAttention:
-    def __init__(self) -> None:
-        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata]] = []
-
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        assert attn_metadata is not None
-        self.calls.append((q, k, v, attn_metadata))
-        return q + 1
 
 
 def _make_pipeline(
@@ -356,46 +338,14 @@ def test_transformer_self_attention_owns_shared_attention_layer() -> None:
     assert attention.attn.__class__.__name__ == "Attention"
 
 
-def test_nava_attention_calls_shared_attention_with_sliced_sdpa_hint() -> None:
-    fake_attn = FakeAttention()
+def test_nava_attention_uses_local_length_sliced_fallback() -> None:
     torch.manual_seed(123)
-    q = torch.randn(2, 3, 2, 4)
-    k = torch.randn(2, 5, 2, 4)
-    v = torch.randn(2, 5, 2, 4)
+    q = torch.randn(2, 3, 2, 4, dtype=torch.bfloat16)
+    k = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    v = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
     key_lens = torch.tensor([5, 3], dtype=torch.long)
 
-    output = _nava_attention(fake_attn, q, k, v, k_lens=key_lens)
-
-    assert torch.equal(output, q + 1)
-    assert len(fake_attn.calls) == 1
-    called_q, called_k, called_v, metadata = fake_attn.calls[0]
-    assert called_q is q
-    assert called_k is k
-    assert called_v is v
-    assert metadata.query_lens is None
-    assert metadata.key_lens is key_lens
-    assert metadata.extra == {
-        "sliced_sdpa_by_lengths": True,
-        "sliced_sdpa_fallback_dtype": torch.bfloat16,
-    }
-
-
-def test_sdpa_sliced_lengths_match_upstream_fallback() -> None:
-    torch.manual_seed(123)
-    q = torch.randn(2, 3, 2, 4)
-    k = torch.randn(2, 5, 2, 4)
-    v = torch.randn(2, 5, 2, 4)
-    key_lens = torch.tensor([5, 3], dtype=torch.long)
-    metadata = AttentionMetadata(
-        key_lens=key_lens,
-        extra={
-            "sliced_sdpa_by_lengths": True,
-            "sliced_sdpa_fallback_dtype": torch.bfloat16,
-        },
-    )
-
-    output = SDPAImpl(num_heads=2, head_size=4, softmax_scale=None).forward(q, k, v, metadata)
-
+    output = _nava_attention(None, q, k, v, k_lens=key_lens)
     expected = []
     q_ref = q.to(torch.bfloat16)
     k_ref = k.to(torch.bfloat16)
@@ -414,13 +364,15 @@ def test_sdpa_sliced_lengths_match_upstream_fallback() -> None:
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_nava_attention_rejects_sliding_window_shared_path() -> None:
+def test_nava_attention_warns_for_ignored_sliding_window() -> None:
     q = torch.randn(1, 3, 2, 4)
     k = torch.randn(1, 3, 2, 4)
     v = torch.randn(1, 3, 2, 4)
 
-    with pytest.raises(NotImplementedError, match="sliding-window attention"):
-        _nava_attention(FakeAttention(), q, k, v, window_size=(2, 2))
+    with pytest.warns(UserWarning, match="Sliding-window attention is ignored"):
+        output = _nava_attention(None, q, k, v, window_size=(2, 2))
+
+    assert output.shape == q.shape
 
 
 def test_pipeline_weight_source_and_loaded_names_are_transformer_scoped(tmp_path: Path) -> None:
@@ -477,7 +429,6 @@ def test_parse_request_text_image_speaker_and_errors(tmp_path: Path) -> None:
         10,
     )
     assert image_ctx.image is image
-    assert image_ctx.is_i2v
     assert speaker_ctx.speaker_condition is not None
     assert speaker_ctx.speaker_condition.wavs == ["speaker.wav"]
     assert speaker_ctx.speaker_condition.spans == ["Hello"]

@@ -11,11 +11,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.lengths import (
-    _check_no_attn_mask_with_lengths,
-    _metadata_has_lengths,
-    _sliced_scaled_dot_product_attention,
-)
 
 logger = init_logger(__name__)
 
@@ -107,22 +102,7 @@ class SDPAImpl(AttentionImpl):
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
         attention_mask = None
         if attn_metadata:
-            _check_no_attn_mask_with_lengths(attn_metadata)
-            if _metadata_has_lengths(attn_metadata):
-                if attn_metadata.extra.get("sliced_sdpa_by_lengths"):
-                    return _sliced_scaled_dot_product_attention(
-                        query,
-                        key,
-                        value,
-                        attn_metadata.query_lens,
-                        attn_metadata.key_lens,
-                        causal=self.causal,
-                        softmax_scale=self.softmax_scale,
-                        fallback_dtype=attn_metadata.extra.get("sliced_sdpa_fallback_dtype"),
-                    )
-                raise NotImplementedError("SDPA length metadata requires sliced_sdpa_by_lengths.")
-            else:
-                attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         output = torch.nn.functional.scaled_dot_product_attention(

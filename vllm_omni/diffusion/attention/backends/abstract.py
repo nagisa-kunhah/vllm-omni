@@ -54,10 +54,6 @@ class AttentionBackend(ABC):
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
-    # Per-batch effective prefix lengths for variable-length attention.
-    # None means the corresponding side is fully valid.
-    query_lens: torch.Tensor | None = None
-    key_lens: torch.Tensor | None = None
     joint_attn_mask: torch.Tensor | None = None
     # a joint mask for the joint query, key, and value, depends the joint_strategy
     joint_query: torch.Tensor | None = None
