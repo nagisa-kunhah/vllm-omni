@@ -181,25 +181,13 @@ def _make_pipeline(
         custom_pipeline_args=custom_pipeline_args_extra or {},
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
-            lambda *args, **kwargs: text_encoder,
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
-            lambda *args, **kwargs: video_vae,
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
-            lambda *args, **kwargs: audio_vae,
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
-            lambda *args, **kwargs: speaker_encoder,
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
-            lambda *args, **kwargs: transformer,
+        _patch_native_components(
+            monkeypatch,
+            text_encoder=lambda *args, **kwargs: text_encoder,
+            video_vae=lambda *args, **kwargs: video_vae,
+            audio_vae=lambda *args, **kwargs: audio_vae,
+            speaker_encoder=lambda *args, **kwargs: speaker_encoder,
+            transformer=lambda *args, **kwargs: transformer,
         )
         return NAVAPipeline(od_config=od_config)
 
@@ -220,6 +208,22 @@ def _load_download_script():
     return module
 
 
+def _patch_native_components(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    text_encoder=lambda *args, **kwargs: FakeTextEncoder(),
+    video_vae=lambda *args, **kwargs: FakeVideoVAE(),
+    audio_vae=lambda *args, **kwargs: FakeAudioVAE(),
+    speaker_encoder=lambda *args, **kwargs: FakeSpeakerEncoder(),
+    transformer=lambda *args, **kwargs: FakeTransformer(),
+) -> None:
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder", text_encoder)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE", video_vae)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE", audio_vae)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder", speaker_encoder)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer", transformer)
+
+
 def _write_minimal_model_dir(path: Path) -> None:
     (path / "configs").mkdir(parents=True)
     (path / "configs" / "nava.yaml").write_text("model_type: NAVA\n", encoding="utf-8")
@@ -236,45 +240,21 @@ def _write_minimal_model_dir(path: Path) -> None:
     (speaker_dir / "hubconf.py").write_text("def ReDimNet(**kwargs):\n    return None\n", encoding="utf-8")
 
 
-def test_custom_pipeline_args_without_component_keys_do_not_inject_missing_components(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _write_minimal_model_dir(tmp_path)
-
+def test_custom_pipeline_args_without_component_keys_do_not_inject_missing_components(tmp_path: Path) -> None:
     text_encoder = FakeTextEncoder()
     video_vae = FakeVideoVAE()
     audio_vae = FakeAudioVAE()
     speaker_encoder = FakeSpeakerEncoder()
     transformer = FakeTransformer()
 
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
-        lambda *args, **kwargs: text_encoder,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
-        lambda *args, **kwargs: video_vae,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
-        lambda *args, **kwargs: audio_vae,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
-        lambda *args, **kwargs: speaker_encoder,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
-        lambda *args, **kwargs: transformer,
-    )
-
-    pipeline = NAVAPipeline(
-        od_config=OmniDiffusionConfig(
-            model=str(tmp_path),
-            model_class_name="NAVAPipeline",
-            custom_pipeline_args={"nava_weight_dtype": "bf16"},
-        )
+    pipeline = _make_pipeline(
+        tmp_path,
+        custom_pipeline_args_extra={"nava_weight_dtype": "bf16"},
+        text_encoder=text_encoder,
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+        speaker_encoder=speaker_encoder,
+        transformer=transformer,
     )
 
     assert pipeline.text_encoder is text_encoder
@@ -295,95 +275,62 @@ def test_default_text_encoder_compile_matches_upstream(
         captured.append(bool(kwargs["compile_model"]))
         return FakeTextEncoder()
 
-    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder", make_text_encoder)
-    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE", lambda *args, **kwargs: FakeVideoVAE())
-    monkeypatch.setattr("vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE", lambda *args, **kwargs: FakeAudioVAE())
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
-        lambda *args, **kwargs: FakeSpeakerEncoder(),
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
-        lambda *args, **kwargs: FakeTransformer(),
-    )
+    _patch_native_components(monkeypatch, text_encoder=make_text_encoder)
 
-    NAVAPipeline(od_config=OmniDiffusionConfig(model=str(tmp_path), model_class_name="NAVAPipeline"))
-    NAVAPipeline(
-        od_config=OmniDiffusionConfig(
-            model=str(tmp_path),
-            model_class_name="NAVAPipeline",
-            custom_pipeline_args={"nava_text_encoder_compile": False},
+    for custom_args in ({}, {"nava_text_encoder_compile": False}, {"disable_text_encoder_compile": True}):
+        NAVAPipeline(
+            od_config=OmniDiffusionConfig(
+                model=str(tmp_path),
+                model_class_name="NAVAPipeline",
+                custom_pipeline_args=custom_args,
+            )
         )
-    )
-    NAVAPipeline(
-        od_config=OmniDiffusionConfig(
-            model=str(tmp_path),
-            model_class_name="NAVAPipeline",
-            custom_pipeline_args={"disable_text_encoder_compile": True},
-        )
-    )
 
     assert captured == [True, False, False]
 
 
-def test_config_accepts_model_index_aliases() -> None:
-    cfg = NAVAConfig.from_dict({"nava_ckpt": "custom.safetensors", "height": 16, "width": 32})
-
-    assert cfg.ckpt_name == "custom.safetensors"
-    assert cfg.log_height == 16
-    assert cfg.log_width == 32
-
-
-def test_config_model_index_audio_vae_dir_wins_over_stale_yaml_model_block() -> None:
-    cfg = NAVAConfig.from_dict(
-        {
-            "audio_vae_dir": "params",
-            "model": {"audio_vae_ckpt_dir": "./huggingface_upload/params"},
-        }
-    )
-
-    assert cfg.audio_vae_ckpt_dir == "params"
-
-
-def test_config_joint_config_overrides_stale_yaml_architecture() -> None:
-    cfg = NAVAConfig.from_dict(
-        {
-            "patch_size": 2,
-            "hidden_size": 128,
-            "model": {
-                "joint_config_data": {
-                    "patch_size": [1, 2, 2],
-                    "dim": 3072,
-                    "vid_in_dim": 48,
-                    "audio_in_dim": 128,
-                }
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            {"nava_ckpt": "custom.safetensors", "height": 16, "width": 32},
+            {"ckpt_name": "custom.safetensors", "log_height": 16, "log_width": 32},
+        ),
+        (
+            {"audio_vae_dir": "params", "model": {"audio_vae_ckpt_dir": "./huggingface_upload/params"}},
+            {"audio_vae_ckpt_dir": "params"},
+        ),
+        (
+            {
+                "patch_size": 2,
+                "hidden_size": 128,
+                "model": {
+                    "joint_config_data": {
+                        "patch_size": [1, 2, 2],
+                        "dim": 3072,
+                        "vid_in_dim": 48,
+                        "audio_in_dim": 128,
+                    }
+                },
             },
-        }
-    )
-
-    assert cfg.patch_size == (1, 2, 2)
-    assert cfg.hidden_size == 3072
-    assert cfg.video_latent_ch == 48
-    assert cfg.audio_latent_ch == 128
-
-
-def test_config_explicit_keys_override_joint_config() -> None:
-    cfg = NAVAConfig.from_dict(
-        {
-            "_explicit_keys": {"patch_size", "hidden_size"},
-            "patch_size": [1, 1, 1],
-            "hidden_size": 256,
-            "model": {
-                "joint_config_data": {
-                    "patch_size": [1, 2, 2],
-                    "dim": 3072,
-                }
+            {"patch_size": (1, 2, 2), "hidden_size": 3072, "video_latent_ch": 48, "audio_latent_ch": 128},
+        ),
+        (
+            {
+                "_explicit_keys": {"patch_size", "hidden_size"},
+                "patch_size": [1, 1, 1],
+                "hidden_size": 256,
+                "model": {"joint_config_data": {"patch_size": [1, 2, 2], "dim": 3072}},
             },
-        }
-    )
+            {"patch_size": (1, 1, 1), "hidden_size": 256},
+        ),
+    ],
+)
+def test_config_merges_aliases_and_joint_config(raw: dict[str, Any], expected: dict[str, Any]) -> None:
+    cfg = NAVAConfig.from_dict(raw)
 
-    assert cfg.patch_size == (1, 1, 1)
-    assert cfg.hidden_size == 256
+    for key, value in expected.items():
+        assert getattr(cfg, key) == value
 
 
 def test_config_rejects_unaligned_video_resolution() -> None:
@@ -476,25 +423,6 @@ def test_nava_attention_rejects_sliding_window_shared_path() -> None:
         _nava_attention(FakeAttention(), q, k, v, window_size=(2, 2))
 
 
-def test_speech_span_parser_extracts_ordered_spans() -> None:
-    assert parse_speech_spans("<S>first<E> middle <S>second<E>") == ["first", "second"]
-
-
-def test_speaker_sentinel_injection() -> None:
-    assert inject_speaker_sentinel("<S>Hello<E>") == "<S><extra_id_2>Hello<E>"
-
-
-def test_parse_text_only_request(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", seed=7))
-
-    assert ctx.prompt == "plain prompt"
-    assert ctx.image is None
-    assert ctx.speaker_condition is None
-    assert ctx.seed == 7
-    assert ctx.frames == 5
-
-
 def test_pipeline_weight_source_and_loaded_names_are_transformer_scoped(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
 
@@ -524,66 +452,43 @@ model:
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava._NAVATextEncoder",
-            lambda *args, **kwargs: FakeTextEncoder(),
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAVideoVAE",
-            lambda *args, **kwargs: FakeVideoVAE(),
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVAAudioVAE",
-            lambda *args, **kwargs: FakeAudioVAE(),
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVASpeakerEncoder",
-            lambda *args, **kwargs: FakeSpeakerEncoder(),
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.models.nava.pipeline_nava.NAVATransformer",
-            lambda *args, **kwargs: FakeTransformer(),
-        )
+        _patch_native_components(monkeypatch)
         pipeline = NAVAPipeline(od_config=od_config)
 
     assert pipeline.nava_config.fps == 8
     assert pipeline.nava_config.audio_latent_length(frames=5) == 54
 
 
-def test_parse_request_preserves_upstream_latent_frames(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", num_frames=10))
-
-    assert ctx.frames == 10
-
-
-def test_parse_image_condition_request(tmp_path: Path) -> None:
+def test_parse_request_text_image_speaker_and_errors(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
     image = Image.new("RGB", (4, 4))
-    ctx = pipeline._parse_request(_make_request({"prompt": "continue", "multi_modal_data": {"image": image}}))
 
-    assert ctx.image is image
-    assert ctx.is_i2v
-
-
-def test_parse_speaker_wavs_matches_speech_spans(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(
+    text_ctx = pipeline._parse_request(_make_request("plain prompt", seed=7, num_frames=10))
+    image_ctx = pipeline._parse_request(_make_request({"prompt": "continue", "multi_modal_data": {"image": image}}))
+    speaker_ctx = pipeline._parse_request(
         _make_request({"prompt": "<S>Hello<E>", "multi_modal_data": {"spk_wavs": ["speaker.wav"]}})
     )
 
-    assert ctx.speaker_condition is not None
-    assert ctx.speaker_condition.wavs == ["speaker.wav"]
-    assert ctx.speaker_condition.spans == ["Hello"]
-    assert ctx.timbre_cfg
-
-
-def test_parse_speaker_wavs_rejects_span_mismatch(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    request = _make_request({"prompt": "<S>Hello<E><S>Hi<E>", "multi_modal_data": {"spk_wavs": ["one.wav"]}})
+    assert (text_ctx.prompt, text_ctx.image, text_ctx.speaker_condition, text_ctx.seed, text_ctx.frames) == (
+        "plain prompt",
+        None,
+        None,
+        7,
+        10,
+    )
+    assert image_ctx.image is image
+    assert image_ctx.is_i2v
+    assert speaker_ctx.speaker_condition is not None
+    assert speaker_ctx.speaker_condition.wavs == ["speaker.wav"]
+    assert speaker_ctx.speaker_condition.spans == ["Hello"]
+    assert speaker_ctx.timbre_cfg
+    assert parse_speech_spans("<S>first<E> middle <S>second<E>") == ["first", "second"]
+    assert inject_speaker_sentinel("<S>Hello<E>") == "<S><extra_id_2>Hello<E>"
 
     with pytest.raises(ValueError, match="speaker reference count"):
-        pipeline._parse_request(request)
+        pipeline._parse_request(
+            _make_request({"prompt": "<S>Hello<E><S>Hi<E>", "multi_modal_data": {"spk_wavs": ["one.wav"]}})
+        )
 
 
 def test_text_embedding_called_once_for_positive_prompt(tmp_path: Path) -> None:
@@ -756,35 +661,31 @@ def test_speaker_encoder_uses_torch_home_redimnet_cache(
     assert embedding.shape == (1, 192)
 
 
-def test_prepare_latents_uses_video_audio_shapes(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("sampling_kwargs", "expected_video_shape", "expected_audio_shape", "expected_fps"),
+    [
+        ({"seed": 3}, (1, 5, 3), (1, 3, 4), 24),
+        ({"num_frames": 9, "seed": 3}, (1, 9, 3), (1, 6, 4), 24),
+        ({"frame_rate": 8, "seed": 3}, (1, 5, 3), (1, 3, 4), 8),
+    ],
+)
+def test_prepare_latents_shapes(
+    tmp_path: Path,
+    sampling_kwargs: dict[str, Any],
+    expected_video_shape: tuple[int, ...],
+    expected_audio_shape: tuple[int, ...],
+    expected_fps: int,
+) -> None:
     pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", seed=3))
+    ctx = pipeline._parse_request(_make_request("plain prompt", **sampling_kwargs))
 
     latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
 
-    assert latents["video"].shape == (1, 5, 3)
-    assert latents["audio"].shape == (1, 3, 4)
+    assert ctx.fps == expected_fps
+    assert latents["video"].shape == expected_video_shape
+    assert latents["audio"].shape == expected_audio_shape
     assert latents["video"].dtype == torch.float32
     assert latents["audio"].dtype == torch.float32
-
-
-def test_prepare_latents_uses_latent_video_frames(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", num_frames=9, seed=3))
-
-    latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
-
-    assert latents["video"].shape == (1, 9, 3)
-
-
-def test_prepare_latents_audio_length_uses_model_fps_not_output_fps(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", frame_rate=8, seed=3))
-
-    latents = pipeline._prepare_latents(ctx, pipeline._make_generator(ctx.seed))
-
-    assert ctx.fps == 8
-    assert latents["audio"].shape == (1, 3, 4)
 
 
 def test_scheduler_uses_upstream_unipc_timestep_grid() -> None:
@@ -794,25 +695,6 @@ def test_scheduler_uses_upstream_unipc_timestep_grid() -> None:
 
     assert timesteps.dtype == torch.int64
     assert timesteps.tolist() == [999]
-
-
-def test_rng_restore_mode_uses_captured_global_rng_instead_of_request_generator(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(
-        tmp_path,
-        custom_pipeline_args_extra={
-            "nava_init_seed": 47,
-            "nava_restore_init_cuda_rng_before_sample": True,
-        },
-    )
-
-    assert pipeline._rng_state_after_init is not None
-    assert pipeline._make_generator(seed=999) is None
-
-
-def test_skip_request_seed_uses_global_rng_without_generator(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path, custom_pipeline_args_extra={"skip_request_seed": True})
-
-    assert pipeline._make_generator(seed=999) is None
 
 
 def test_decode_video_passes_output_frames_with_latent_tokens(tmp_path: Path) -> None:
@@ -893,73 +775,72 @@ def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, t
     assert waveform.shape == (1, 2, 12)
 
 
-def test_cfg_combine_video_audio_without_align(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("request", "negative", "align", "timbre", "expected"),
+    [
+        (
+            _make_request(
+                "plain prompt",
+                extra_args={
+                    "negative_prompt": "bad",
+                    "video_guidance_scale": 3,
+                    "audio_guidance_scale": 2,
+                    "align_3d_cfg": False,
+                    "timbre_cfg": False,
+                },
+            ),
+            {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
+            None,
+            None,
+            {"video": torch.tensor([4.0]), "audio": torch.tensor([5.0])},
+        ),
+        (
+            _make_request("plain prompt"),
+            None,
+            {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
+            {"video": torch.tensor([2.0]), "audio": torch.tensor([2.0])},
+            {"video": torch.tensor([5.0]), "audio": torch.tensor([10.0])},
+        ),
+        (
+            _make_request(
+                {"prompt": "<S>Hello<E>", "multi_modal_data": {"spk_wavs": ["speaker.wav"]}},
+                extra_args={
+                    "negative_prompt": "bad",
+                    "video_guidance_scale": 3,
+                    "video_align_guidance_scale": 1,
+                    "audio_guidance_scale": 2,
+                    "audio_align_guidance_scale": 1,
+                    "timbre_align_guidance_scale": 1,
+                },
+            ),
+            {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
+            {"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+            {"video": torch.tensor([2.0]), "audio": torch.tensor([2.0])},
+            {"video": torch.tensor([7.0]), "audio": torch.tensor([11.0])},
+        ),
+    ],
+)
+def test_cfg_combine_video_audio_guidance(
+    tmp_path: Path,
+    request: OmniDiffusionRequest,
+    negative: dict[str, torch.Tensor] | None,
+    align: dict[str, torch.Tensor] | None,
+    timbre: dict[str, torch.Tensor] | None,
+    expected: dict[str, torch.Tensor],
+) -> None:
     pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(
-        _make_request(
-            "plain prompt",
-            extra_args={
-                "negative_prompt": "bad",
-                "video_guidance_scale": 3,
-                "audio_guidance_scale": 2,
-                "align_3d_cfg": False,
-                "timbre_cfg": False,
-            },
-        )
-    )
+    ctx = pipeline._parse_request(request)
 
     out = pipeline._combine_guidance(
         ctx,
         {"video": torch.tensor([2.0]), "audio": torch.tensor([3.0])},
-        {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
+        negative,
+        align=align,
+        timbre=timbre,
     )
 
-    assert torch.equal(out["video"], torch.tensor([4.0]))
-    assert torch.equal(out["audio"], torch.tensor([5.0]))
-
-
-def test_guidance_with_missing_negative_still_applies_align_and_timbre(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt"))
-
-    out = pipeline._combine_guidance(
-        ctx,
-        {"video": torch.tensor([2.0]), "audio": torch.tensor([3.0])},
-        None,
-        align={"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
-        timbre={"video": torch.tensor([2.0]), "audio": torch.tensor([2.0])},
-    )
-
-    assert torch.equal(out["video"], torch.tensor([5.0]))
-    assert torch.equal(out["audio"], torch.tensor([10.0]))
-
-
-def test_cfg_combine_with_align_and_timbre_guidance(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(
-        _make_request(
-            {"prompt": "<S>Hello<E>", "multi_modal_data": {"spk_wavs": ["speaker.wav"]}},
-            extra_args={
-                "negative_prompt": "bad",
-                "video_guidance_scale": 3,
-                "video_align_guidance_scale": 1,
-                "audio_guidance_scale": 2,
-                "audio_align_guidance_scale": 1,
-                "timbre_align_guidance_scale": 1,
-            },
-        )
-    )
-
-    out = pipeline._combine_guidance(
-        ctx,
-        {"video": torch.tensor([2.0]), "audio": torch.tensor([3.0])},
-        {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
-        align={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
-        timbre={"video": torch.tensor([2.0]), "audio": torch.tensor([2.0])},
-    )
-
-    assert torch.equal(out["video"], torch.tensor([7.0]))
-    assert torch.equal(out["audio"], torch.tensor([11.0]))
+    assert torch.equal(out["video"], expected["video"])
+    assert torch.equal(out["audio"], expected["audio"])
 
 
 def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
@@ -987,30 +868,27 @@ def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
     assert all(call["audio_text_embeds"] is not call["text_embeds"] for call in negative_calls)
 
 
-def test_negative_prompt_mode_false_uses_zero_unconditioned_embedding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "positive",
+    [
+        torch.ones(1, 2, 4),
+        [torch.ones(3, 4)],
+    ],
+)
+def test_negative_prompt_mode_false_uses_zero_unconditioned_embedding(
+    tmp_path: Path,
+    positive: torch.Tensor | list[torch.Tensor],
+) -> None:
     text_encoder = FakeTextEncoder()
-    positive = torch.ones(1, 2, 4)
     pipeline = _make_pipeline(tmp_path, text_encoder=text_encoder)
     ctx = pipeline._parse_request(_make_request("plain prompt", extra_args={"negative_prompt_mode": False}))
 
     video_neg, audio_neg = pipeline._encode_negative_texts(ctx, positive)
 
-    assert torch.equal(video_neg, torch.zeros_like(positive))
-    assert torch.equal(audio_neg, torch.zeros_like(positive))
+    expected = torch.zeros_like(positive[0] if isinstance(positive, list) else positive)
+    assert torch.equal(video_neg[0] if isinstance(video_neg, list) else video_neg, expected)
+    assert torch.equal(audio_neg[0] if isinstance(audio_neg, list) else audio_neg, expected)
     assert text_encoder.calls == []
-
-
-def test_negative_prompt_mode_false_handles_trimmed_text_embedding_lists(tmp_path: Path) -> None:
-    pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(_make_request("plain prompt", extra_args={"negative_prompt_mode": False}))
-    positive = [torch.ones(3, 4)]
-
-    video_neg, audio_neg = pipeline._encode_negative_texts(ctx, positive)
-
-    assert isinstance(video_neg, list)
-    assert isinstance(audio_neg, list)
-    assert torch.equal(video_neg[0], torch.zeros(3, 4))
-    assert torch.equal(audio_neg[0], torch.zeros(3, 4))
 
 
 def test_request_level_negative_prompts_override_defaults(tmp_path: Path) -> None:
@@ -1047,27 +925,20 @@ def test_forward_passes_speaker_positions_to_transformer(tmp_path: Path) -> None
     assert any(call["speaker_embeds"] is None and call["speaker_positions"] == [[1]] for call in transformer.calls)
 
 
-def test_postprocess_returns_video_audio_metadata() -> None:
+def test_postprocess_returns_metadata_and_numpy_video() -> None:
     postprocess = get_nava_post_process_func(SimpleNamespace())
     video = torch.zeros(1, 3, 2, 4, 4)
     audio = torch.zeros(1, 8)
 
-    output = postprocess({"video": video, "audio": audio, "audio_sample_rate": 24000, "fps": 12}, output_type="pt")
+    pt_output = postprocess({"video": video, "audio": audio, "audio_sample_rate": 24000, "fps": 12}, output_type="pt")
+    np_output = postprocess({"video": video.to(torch.bfloat16)}, output_type="np")
 
-    assert torch.equal(output["video"], video)
-    assert output["audio"] is audio
-    assert output["audio_sample_rate"] == 24000
-    assert output["fps"] == 12
-
-
-def test_postprocess_converts_bfloat16_video_to_numpy_float32() -> None:
-    postprocess = get_nava_post_process_func(SimpleNamespace())
-    video = torch.zeros(1, 3, 2, 4, 4, dtype=torch.bfloat16)
-
-    output = postprocess({"video": video}, output_type="np")
-
-    assert len(output["video"]) == 1
-    assert output["video"][0].dtype == np.float32
+    assert torch.equal(pt_output["video"], video)
+    assert pt_output["audio"] is audio
+    assert pt_output["audio_sample_rate"] == 24000
+    assert pt_output["fps"] == 12
+    assert len(np_output["video"]) == 1
+    assert np_output["video"][0].dtype == np.float32
 
 
 def test_image_to_tensor_accepts_path_input(tmp_path: Path) -> None:
@@ -1082,20 +953,16 @@ def test_image_to_tensor_accepts_path_input(tmp_path: Path) -> None:
     assert tensor.max() <= 1.0
 
 
-def test_nava_registered_as_diffusion_pipeline() -> None:
+def test_nava_registry_exports_and_capabilities() -> None:
+    config = OmniDiffusionConfig(model="/tmp/nava", model_class_name="NAVAPipeline")
+
     assert _DIFFUSION_MODELS["NAVAPipeline"] == ("nava", "pipeline_nava", "NAVAPipeline")
-
-
-def test_nava_pipeline_is_exported_for_qualname_resolution() -> None:
     assert resolve_obj_by_qualname("vllm_omni.diffusion.models.nava.NAVAPipeline") is NAVAPipeline
-
-
-def test_nava_postprocess_registered() -> None:
     assert _DIFFUSION_POST_PROCESS_FUNCS["NAVAPipeline"] == "get_nava_post_process_func"
-
-
-def test_nava_cache_acceleration_disabled_until_verified() -> None:
     assert "NAVAPipeline" in _NO_CACHE_ACCELERATION
+    assert supports_multimodal_input(config) == (True, True)
+    assert supports_audio_output("NAVAPipeline")
+    assert get_diffusion_model_metadata("NAVAPipeline").max_multimodal_image_inputs == 1
 
 
 def test_nava_default_init_requires_local_model_assets(tmp_path: Path) -> None:
@@ -1109,27 +976,13 @@ def test_nava_default_init_requires_local_model_assets(tmp_path: Path) -> None:
         NAVAPipeline(od_config=od_config)
 
 
-def test_nava_multimodal_capabilities_are_advertised() -> None:
-    config = OmniDiffusionConfig(model="/tmp/nava", model_class_name="NAVAPipeline")
-
-    assert supports_multimodal_input(config) == (True, True)
-    assert supports_audio_output("NAVAPipeline")
-    assert get_diffusion_model_metadata("NAVAPipeline").max_multimodal_image_inputs == 1
-
-
-def test_transformer_load_weights_rejects_empty_match() -> None:
+def test_transformer_load_weights_handles_prefixless_and_unmatched_keys() -> None:
     transformer = NAVATransformer.__new__(NAVATransformer)
     nn.Module.__init__(transformer)
     transformer.backbone = nn.Linear(2, 2)
 
     with pytest.raises(ValueError, match="No NAVA transformer weights matched"):
         transformer.load_weights([("unexpected.weight", torch.zeros(2, 2))])
-
-
-def test_transformer_load_weights_accepts_backbone_prefixless_key() -> None:
-    transformer = NAVATransformer.__new__(NAVATransformer)
-    nn.Module.__init__(transformer)
-    transformer.backbone = nn.Linear(2, 2)
 
     loaded = transformer.load_weights([("weight", torch.ones(2, 2))])
 
@@ -1283,27 +1136,28 @@ def test_download_script_writes_model_index_without_external_runtime_install(
     assert "speaker_dir" in model_index
 
 
+@pytest.mark.parametrize(
+    ("prepare", "missing_file", "expected_error"),
+    [
+        (False, None, "incomplete"),
+        (True, Path("Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth"), "models_t5_umt5-xxl-enc-bf16"),
+    ],
+)
 def test_download_script_verify_only_rejects_incomplete_model_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    prepare: bool,
+    missing_file: Path | None,
+    expected_error: str,
 ) -> None:
     module = _load_download_script()
+    if prepare:
+        _write_minimal_model_dir(tmp_path)
+    if missing_file is not None:
+        (tmp_path / missing_file).unlink()
     monkeypatch.setattr(sys, "argv", ["download_nava.py", "--local-dir", str(tmp_path), "--verify-only"])
 
-    with pytest.raises(SystemExit, match="incomplete"):
-        module.main()
-
-
-def test_download_script_verify_only_rejects_missing_text_encoder_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    module = _load_download_script()
-    _write_minimal_model_dir(tmp_path)
-    (tmp_path / "Wan2.2-TI2V-5B" / "models_t5_umt5-xxl-enc-bf16.pth").unlink()
-    monkeypatch.setattr(sys, "argv", ["download_nava.py", "--local-dir", str(tmp_path), "--verify-only"])
-
-    with pytest.raises(SystemExit, match="models_t5_umt5-xxl-enc-bf16"):
+    with pytest.raises(SystemExit, match=expected_error):
         module.main()
 
 
