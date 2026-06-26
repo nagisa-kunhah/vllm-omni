@@ -57,7 +57,8 @@ class CuDNNAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.requires_gqa = num_heads != num_kv_heads
+        kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.requires_gqa = num_heads != kv_heads
 
     def forward_cuda(
         self,

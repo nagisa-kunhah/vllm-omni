@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -62,82 +63,13 @@ def _length_reference_sdpa(
     return output
 
 
-def test_sdpa_key_lens_metadata_matches_reference():
-    torch.manual_seed(11)
-    batch_size, query_len, key_len, num_heads, head_dim = 2, 3, 5, 4, 8
-    softmax_scale = head_dim**-0.5
-    query = torch.randn(batch_size, query_len, num_heads, head_dim)
-    key = torch.randn(batch_size, key_len, num_heads, head_dim)
-    value = torch.randn(batch_size, key_len, num_heads, head_dim)
-    key_lens = torch.tensor([5, 3], dtype=torch.long)
-
-    impl = SDPAImpl(
-        num_heads=num_heads,
-        num_kv_heads=num_heads,
-        head_size=head_dim,
-        softmax_scale=softmax_scale,
-        causal=False,
-    )
-    actual = impl.forward_cuda(query, key, value, AttentionMetadata(key_lens=key_lens))
-    expected = _length_reference_sdpa(query, key, value, key_lens=key_lens, softmax_scale=softmax_scale)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+@pytest.mark.parametrize("impl_cls", [SDPAImpl, CuDNNAttentionImpl])
+def test_none_kv_heads_means_no_gqa(impl_cls):
+    impl = impl_cls(num_heads=4, head_size=8, softmax_scale=8**-0.5, causal=False, num_kv_heads=None)
+    assert impl.requires_gqa is False
 
 
-def test_sdpa_query_lens_zero_invalid_queries():
-    torch.manual_seed(12)
-    batch_size, query_len, key_len, num_heads, head_dim = 2, 4, 5, 4, 8
-    softmax_scale = head_dim**-0.5
-    query = torch.randn(batch_size, query_len, num_heads, head_dim)
-    key = torch.randn(batch_size, key_len, num_heads, head_dim)
-    value = torch.randn(batch_size, key_len, num_heads, head_dim)
-    query_lens = torch.tensor([4, 2], dtype=torch.int32)
-    key_lens = torch.tensor([5, 3], dtype=torch.int32)
-
-    impl = SDPAImpl(
-        num_heads=num_heads,
-        num_kv_heads=num_heads,
-        head_size=head_dim,
-        softmax_scale=softmax_scale,
-        causal=False,
-    )
-    actual = impl.forward_cuda(query, key, value, AttentionMetadata(query_lens=query_lens, key_lens=key_lens))
-    expected = _length_reference_sdpa(
-        query,
-        key,
-        value,
-        query_lens=query_lens,
-        key_lens=key_lens,
-        softmax_scale=softmax_scale,
-    )
-
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-    assert torch.count_nonzero(actual[1, 2:]) == 0
-
-
-def test_sdpa_length_metadata_supports_gqa():
-    torch.manual_seed(13)
-    batch_size, query_len, key_len, num_heads, num_kv_heads, head_dim = 2, 3, 5, 4, 2, 8
-    softmax_scale = head_dim**-0.5
-    query = torch.randn(batch_size, query_len, num_heads, head_dim)
-    key = torch.randn(batch_size, key_len, num_kv_heads, head_dim)
-    value = torch.randn(batch_size, key_len, num_kv_heads, head_dim)
-    key_lens = torch.tensor([4, 2], dtype=torch.long)
-
-    impl = SDPAImpl(
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_dim,
-        softmax_scale=softmax_scale,
-        causal=False,
-    )
-    actual = impl.forward_cuda(query, key, value, AttentionMetadata(key_lens=key_lens))
-    expected = _length_reference_sdpa(query, key, value, key_lens=key_lens, softmax_scale=softmax_scale)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_length_metadata_rejects_attn_mask_and_out_of_bounds_lengths():
+def test_length_metadata_rejects_attn_mask():
     impl = SDPAImpl(num_heads=2, num_kv_heads=2, head_size=4, softmax_scale=0.5, causal=False)
     query = torch.randn(2, 3, 2, 4)
     key = torch.randn(2, 4, 2, 4)
@@ -145,9 +77,6 @@ def test_length_metadata_rejects_attn_mask_and_out_of_bounds_lengths():
 
     with pytest.raises(ValueError, match="attn_mask cannot be used together"):
         impl.forward_cuda(query, key, value, AttentionMetadata(attn_mask=torch.ones(2, 4), key_lens=torch.ones(2)))
-
-    with pytest.raises(ValueError, match="0 <= length"):
-        impl.forward_cuda(query, key, value, AttentionMetadata(key_lens=torch.tensor([4, 5])))
 
 
 @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")

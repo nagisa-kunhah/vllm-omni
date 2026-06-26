@@ -7,6 +7,7 @@ import json
 import os
 import random
 from collections.abc import Iterable
+from contextlib import nullcontext
 from inspect import signature
 from typing import Any, ClassVar
 
@@ -186,6 +187,8 @@ class NAVAPipeline(
     def _init_native_components(self) -> None:
         model_root = self._require_local_model_root()
         text_compile = as_bool(self._custom_pipeline_arg("nava_text_encoder_compile", True))
+        if self._custom_pipeline_arg("disable_text_encoder_compile") is not None:
+            text_compile = not as_bool(self._custom_pipeline_arg("disable_text_encoder_compile"))
         self.text_encoder = _NAVATextEncoder(
             model_root,
             self.nava_config,
@@ -384,7 +387,13 @@ class NAVAPipeline(
             kwargs: dict[str, Any] = {}
             if "return_speaker_positions" in signature(encoder.encode).parameters:
                 kwargs["return_speaker_positions"] = return_speaker_positions
-            result = encoder.encode(captions, device=self.device, dtype=self.nava_config.target_dtype, **kwargs)
+            target_dtype = self.nava_config.target_dtype
+            autocast_enabled = self.device.type == "cuda" and target_dtype in (torch.bfloat16, torch.float16)
+            autocast_context = (
+                torch.autocast(device_type="cuda", dtype=target_dtype) if autocast_enabled else nullcontext()
+            )
+            with autocast_context:
+                result = encoder.encode(captions, device=self.device, dtype=target_dtype, **kwargs)
             if isinstance(result, tuple):
                 return result
             return result, None

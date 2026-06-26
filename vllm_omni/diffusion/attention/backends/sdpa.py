@@ -13,9 +13,8 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.utils.lengths import (
     _check_no_attn_mask_with_lengths,
-    _lengths_to_key_mask,
     _metadata_has_lengths,
-    _zero_invalid_queries,
+    _sliced_scaled_dot_product_attention,
 )
 
 logger = init_logger(__name__)
@@ -91,7 +90,8 @@ class SDPAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.requires_gqa = num_heads != num_kv_heads
+        kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.requires_gqa = num_heads != kv_heads
         if backend_kwargs:
             logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -106,16 +106,21 @@ class SDPAImpl(AttentionImpl):
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
         attention_mask = None
-        query_lens = None
         if attn_metadata:
             _check_no_attn_mask_with_lengths(attn_metadata)
             if _metadata_has_lengths(attn_metadata):
-                attention_mask, query_lens = _lengths_to_key_mask(
-                    query,
-                    key,
-                    attn_metadata.query_lens,
-                    attn_metadata.key_lens,
-                )
+                if attn_metadata.extra.get("sliced_sdpa_by_lengths"):
+                    return _sliced_scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_metadata.query_lens,
+                        attn_metadata.key_lens,
+                        causal=self.causal,
+                        softmax_scale=self.softmax_scale,
+                        fallback_dtype=attn_metadata.extra.get("sliced_sdpa_fallback_dtype"),
+                    )
+                raise NotImplementedError("SDPA length metadata requires sliced_sdpa_by_lengths.")
             else:
                 attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
@@ -130,10 +135,7 @@ class SDPAImpl(AttentionImpl):
             scale=self.softmax_scale,
             enable_gqa=self.requires_gqa,
         )
-        out = output.permute(0, 2, 1, 3)
-        if query_lens is not None:
-            out = _zero_invalid_queries(out, query_lens)
-        return out
+        return output.permute(0, 2, 1, 3)
 
     def forward_cuda(
         self,
