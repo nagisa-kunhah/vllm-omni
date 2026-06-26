@@ -504,7 +504,6 @@ class NAVAPipeline(
                     speaker_embeds=None,
                     speaker_positions=None,
                     video_grid=video_grid,
-                    slg_layer=11,
                     step_index=step_index,
                 )
             align = None

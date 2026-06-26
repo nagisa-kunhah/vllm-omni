@@ -985,7 +985,6 @@ def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
     negative_calls = [call for call in transformer.calls if call["speaker_embeds"] is None and "audio_text_embeds" in call]
     assert negative_calls
     assert all(call["audio_text_embeds"] is not call["text_embeds"] for call in negative_calls)
-    assert all(call["slg_layer"] == 11 for call in negative_calls)
 
 
 def test_negative_prompt_mode_false_uses_zero_unconditioned_embedding(tmp_path: Path) -> None:

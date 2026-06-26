@@ -650,57 +650,6 @@ class WanT2VDoubleStreamCrossAttention(WanDoubleStreamSelfAttention):
             return None, self._single_forward(x_audio, context, context_lens, is_audio=True)
 
 
-class WanI2VCrossAttention(WanSelfAttention):
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, additional_emb_length=None):
-        super().__init__(dim, num_heads, window_size, qk_norm, eps)
-
-        self.k_img = nn.Linear(dim, dim)
-        self.v_img = nn.Linear(dim, dim)
-        # self.alpha = nn.Parameter(torch.zeros((1, )))
-        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.additional_emb_length = additional_emb_length
-
-    def _qkv_fn(self, x, context):
-        context_img = context[:, : self.additional_emb_length]
-        context = context[:, self.additional_emb_length :]
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
-
-        return q, k, v, k_img, v_img
-
-    def forward(self, x, context, context_lens):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
-        """
-        q, k, v, k_img, v_img = self._qkv_fn(x, context)
-
-        img_x = _nava_attention(self.attn, q, k_img, v_img, k_lens=None)
-        # compute attention
-        x = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
-
-        # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
-        x = x + img_x
-        x = self.o(x)
-        return x
-
-
-WAN_CROSSATTENTION_CLASSES = {
-    "t2v_cross_attn": WanT2VCrossAttention,
-    "i2v_cross_attn": WanI2VCrossAttention,
-}
-
-
 class ModulationAdd(nn.Module):
     def __init__(self, dim, num):
         super().__init__()
@@ -713,7 +662,6 @@ class ModulationAdd(nn.Module):
 class WanDoubleStreamAttentionBlock(nn.Module):
     def __init__(
         self,
-        cross_attn_type,
         dim,
         ffn_dim,
         num_heads,
@@ -721,7 +669,6 @@ class WanDoubleStreamAttentionBlock(nn.Module):
         qk_norm=True,
         cross_attn_norm=False,
         eps=1e-6,
-        additional_emb_length=None,
         no_split_norm_ffn=False,
     ):
         """Initialize the dual-stream cross-modal attention block."""
@@ -749,22 +696,13 @@ class WanDoubleStreamAttentionBlock(nn.Module):
                 WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
             )  # optional pre-cross-attention normalization
 
-        # Initialize the cross-attention variant for the selected conditioning type.
-        if cross_attn_type == "i2v_cross_attn":
-            assert False, "Not support i2v_cross_attn for mmdit mode"
-            assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
-            self.cross_attn = WanI2VCrossAttention(
-                dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length
-            )  # image-to-video cross-attention
-        else:
-            assert additional_emb_length is None, "additional_emb_length should be None for t2v_cross_attn"
-            self.cross_attn = WanT2VDoubleStreamCrossAttention(
-                dim,
-                num_heads,
-                (-1, -1),
-                qk_norm,
-                eps,
-            )  # text-to-video cross-attention
+        self.cross_attn = WanT2VDoubleStreamCrossAttention(
+            dim,
+            num_heads,
+            (-1, -1),
+            qk_norm,
+            eps,
+        )
 
         self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-FFN normalization
         if not no_split_norm_ffn:
@@ -893,7 +831,6 @@ class WanDoubleStreamAttentionBlock(nn.Module):
 class WanAttentionBlock(nn.Module):
     def __init__(
         self,
-        cross_attn_type,
         dim,
         ffn_dim,
         num_heads,
@@ -901,7 +838,6 @@ class WanAttentionBlock(nn.Module):
         qk_norm=True,
         cross_attn_norm=False,
         eps=1e-6,
-        additional_emb_length=None,
         split_av_qk_norm_modulation=False,
     ):
         """Initialize the single-stream cross-modal attention block."""
@@ -923,21 +859,13 @@ class WanAttentionBlock(nn.Module):
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         )  # optional pre-cross-attention normalization
 
-        # Initialize the cross-attention variant for the selected conditioning type.
-        if cross_attn_type == "i2v_cross_attn":
-            assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
-            self.cross_attn = WanI2VCrossAttention(
-                dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length
-            )  # image-to-video cross-attention
-        else:
-            assert additional_emb_length is None, "additional_emb_length should be None for t2v_cross_attn"
-            self.cross_attn = WanT2VCrossAttention(
-                dim,
-                num_heads,
-                (-1, -1),
-                qk_norm,
-                eps,
-            )  # text-to-video cross-attention
+        self.cross_attn = WanT2VCrossAttention(
+            dim,
+            num_heads,
+            (-1, -1),
+            qk_norm,
+            eps,
+        )
 
         self.norm2 = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-FFN normalization
         self.ffn = nn.Sequential(  # feed-forward network
@@ -1075,23 +1003,6 @@ class Head(nn.Module):
         return x
 
 
-class MLPProj(torch.nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-
-        self.proj = torch.nn.Sequential(
-            torch.nn.LayerNorm(in_dim),
-            torch.nn.Linear(in_dim, in_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(in_dim, out_dim),
-            torch.nn.LayerNorm(out_dim),
-        )
-
-    def forward(self, image_embeds):
-        clip_extra_context_tokens = self.proj(image_embeds)
-        return clip_extra_context_tokens
-
-
 class SpkToken(nn.Module):
     def __init__(self, spk_dim=192, dim=1024, eps=1e-6):
         super().__init__()
@@ -1120,7 +1031,7 @@ class SpkToken(nn.Module):
 
 class WanAVModel(nn.Module):
     r"""
-    Wan diffusion backbone supporting both text-to-video and image-to-video, text-to-audio.
+    NAVA ti2v diffusion backbone for joint audio-video generation.
     """
 
     ignore_for_config = ["patch_size", "cross_attn_norm", "qk_norm", "text_dim", "window_size"]
@@ -1128,7 +1039,6 @@ class WanAVModel(nn.Module):
 
     def __init__(
         self,
-        model_type="t2v",
         patch_size=(1, 2, 2),
         text_len=512,
         vid_in_dim=16,
@@ -1137,8 +1047,6 @@ class WanAVModel(nn.Module):
         ffn_dim=8192,
         freq_dim=256,
         text_dim=4096,
-        additional_emb_dim=None,
-        additional_emb_length=None,
         vid_out_dim=16,
         audio_out_dim=16,
         num_heads=16,
@@ -1159,8 +1067,6 @@ class WanAVModel(nn.Module):
         Initialize the diffusion model backbone.
 
         Args:
-            model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
@@ -1193,19 +1099,6 @@ class WanAVModel(nn.Module):
 
         super().__init__()
 
-        assert model_type in ["t2v", "i2v", "t2a", "tt2a", "ti2v"], (
-            model_type
-        )  ## tt2a means text transcript + text description to audio (to support both TTS and T2A
-        self.model_type = model_type
-        is_audio_type = "a" in self.model_type
-        is_video_type = "v" in self.model_type
-        assert is_audio_type ^ is_video_type, "Either audio or video model should be specified"
-        if is_audio_type:
-            ## audio model
-            assert len(patch_size) == 1 and patch_size[0] == 1, (
-                "Audio model should only accept 1 dimensional input, and we dont do patchify"
-            )
-
         self.patch_size = patch_size
         self.text_len = text_len
         self.vid_in_dim = vid_in_dim
@@ -1233,8 +1126,6 @@ class WanAVModel(nn.Module):
         self.eps = eps
         self.temporal_rope_scaling_factor = temporal_rope_scaling_factor
         logger.debug("NAVA temporal RoPE scaling factor: %s", temporal_rope_scaling_factor)
-        self.is_audio_type = is_audio_type
-        self.is_video_type = is_video_type
         self.add_spk_emb = add_spk_emb
         self.cross_1d_rope = cross_1d_rope
 
@@ -1251,23 +1142,10 @@ class WanAVModel(nn.Module):
 
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
-        # blocks
-        ## so i2v and tt2a share the same cross attention while t2v and t2a share the same cross attention
-        cross_attn_type = "t2v_cross_attn" if model_type in ["t2v", "t2a", "ti2v"] else "i2v_cross_attn"
-
-        if cross_attn_type == "t2v_cross_attn":
-            assert additional_emb_dim is None and additional_emb_length is None, (
-                "additional_emb_length should be None for t2v and t2a model"
-            )
-        else:
-            assert additional_emb_dim is not None and additional_emb_length is not None, (
-                "additional_emb_length should be specified for i2v and tt2a model"
-            )
 
         self.double_blocks = nn.ModuleList(
             [
                 WanDoubleStreamAttentionBlock(
-                    cross_attn_type,
                     dim,
                     ffn_dim,
                     num_heads,
@@ -1275,7 +1153,6 @@ class WanAVModel(nn.Module):
                     qk_norm,
                     cross_attn_norm,
                     eps,
-                    additional_emb_length,
                     no_split_norm_ffn=no_split_norm_ffn,
                 )
                 for _ in range(num_double_layers)
@@ -1285,7 +1162,6 @@ class WanAVModel(nn.Module):
         self.single_blocks = nn.ModuleList(
             [
                 WanAttentionBlock(
-                    cross_attn_type,
                     dim,
                     ffn_dim,
                     num_heads,
@@ -1293,7 +1169,6 @@ class WanAVModel(nn.Module):
                     qk_norm,
                     cross_attn_norm,
                     eps,
-                    additional_emb_length,
                 )
                 for _ in range(num_single_layers)
             ]
@@ -1302,7 +1177,6 @@ class WanAVModel(nn.Module):
         self.double_final_blocks = nn.ModuleList(
             [
                 WanDoubleStreamAttentionBlock(
-                    cross_attn_type,
                     dim,
                     ffn_dim,
                     num_heads,
@@ -1310,7 +1184,6 @@ class WanAVModel(nn.Module):
                     qk_norm,
                     cross_attn_norm,
                     eps,
-                    additional_emb_length,
                     no_split_norm_ffn=no_split_norm_ffn,
                 )
                 for _ in range(num_double_final_layers)
@@ -1322,9 +1195,6 @@ class WanAVModel(nn.Module):
         self.head_audio = Head(dim, audio_out_dim, patch_size=[1], eps=eps)
 
         self._set_rope_params()
-
-        if model_type in ["i2v", "tt2a"]:
-            self.img_emb = MLPProj(additional_emb_dim, dim)
 
         # initialize weights
         self._init_weights()
@@ -1388,8 +1258,6 @@ class WanAVModel(nn.Module):
         t,
         context,
         seq_len,
-        clip_fea=None,
-        y=None,
         first_frame_is_clean=False,
         spk_embed=None,
         spk_pos=None,
@@ -1402,9 +1270,6 @@ class WanAVModel(nn.Module):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
             self.freqs_audio = self.freqs_audio.to(device)
-
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
         if not is_audio_type:
@@ -1462,10 +1327,6 @@ class WanAVModel(nn.Module):
                         context.view(-1, D)[indices] = spk_embeds[: len(indices)].to(context.dtype)
                     else:
                         context.view(-1, D)[indices] = spk_embeds.to(context.dtype)
-        if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
-            context = torch.concat([context_clip, context], dim=1)
-
         # arguments
         kwargs = dict(
             e=e0,
@@ -1515,11 +1376,8 @@ class WanAVModel(nn.Module):
         audio_context,
         vid_seq_len,
         audio_seq_len,
-        clip_fea=None,
-        y=None,
         spk_embed=None,
         spk_pos=None,
-        slg_layer=False,
         masking_modality=False,
         first_frame_is_clean=False,
         **kwargs,
@@ -1538,11 +1396,6 @@ class WanAVModel(nn.Module):
                 List of text embeddings each with shape [L, C]
             seq_len (`int`):
                 Maximum sequence length for positional encoding
-            clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-
         Returns:
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
@@ -1557,8 +1410,6 @@ class WanAVModel(nn.Module):
                 t=t,
                 context=vid_context,
                 seq_len=vid_seq_len,
-                clip_fea=clip_fea,
-                y=y,
                 first_frame_is_clean=first_frame_is_clean,
             )
         if audio is not None:
@@ -1567,8 +1418,6 @@ class WanAVModel(nn.Module):
                 t=t,
                 context=audio_context,
                 seq_len=audio_seq_len,
-                clip_fea=clip_fea,
-                y=y,
                 first_frame_is_clean=False,
                 spk_embed=spk_embed,
                 spk_pos=spk_pos,
@@ -1651,11 +1500,10 @@ class WanAVModel(nn.Module):
                     nn.init.zeros_(m.bias)
 
         # init embeddings
-        if self.is_video_type:
-            assert isinstance(self.patch_embedding, nn.Conv3d), (
-                f"Patch embedding for video should be a Conv3d layer, got {type(self.patch_embedding)}"
-            )
-            nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
+        assert isinstance(self.patch_embedding, nn.Conv3d), (
+            f"Patch embedding for video should be a Conv3d layer, got {type(self.patch_embedding)}"
+        )
+        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
         for m in self.text_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
@@ -1676,7 +1524,6 @@ class NAVATransformer(nn.Module):
         self.config = config
         self.patch_size = 2
         self.backbone = WanAVModel(
-            model_type="ti2v",
             patch_size=config.patch_size,
             text_len=config.text_len,
             vid_in_dim=config.video_latent_ch,
@@ -1711,7 +1558,6 @@ class NAVATransformer(nn.Module):
         speaker_positions: list[list[int]] | None = None,
         video_grid: tuple[int, int, int] | None = None,
         masking_modality: bool = False,
-        slg_layer: int | bool = False,
         **_: object,
     ) -> dict[str, torch.Tensor]:
         video_was_batched = video_latents.ndim == 3
@@ -1761,7 +1607,6 @@ class NAVATransformer(nn.Module):
             t_h_w_list=t_h_w_list,
             audio_len_list=audio_len_list,
             masking_modality=masking_modality,
-            slg_layer=slg_layer,
             is_i2v=image_embeds is not None,
             first_frames=first_frames,
         )
@@ -1787,7 +1632,6 @@ class NAVATransformer(nn.Module):
         audio_len_list: torch.Tensor | None = None,
         masking_modality: bool = False,
         is_i2v: bool = False,
-        slg_layer: int | bool = False,
         first_frames: list[torch.Tensor] | None = None,
         **_: object,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -1810,7 +1654,6 @@ class NAVATransformer(nn.Module):
                 audio_len_list=audio_len_list,
                 masking_modality=masking_modality,
                 is_i2v=is_i2v,
-                slg_layer=slg_layer,
                 first_frames=first_frames,
             )
 
@@ -1828,7 +1671,6 @@ class NAVATransformer(nn.Module):
         audio_len_list: torch.Tensor | None = None,
         masking_modality: bool = False,
         is_i2v: bool = False,
-        slg_layer: int | bool = False,
         first_frames: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         has_video = latents_vid is not None
@@ -1888,7 +1730,6 @@ class NAVATransformer(nn.Module):
             spk_embed=spk_embs,
             spk_pos=spk_pos,
             masking_modality=masking_modality,
-            slg_layer=slg_layer,
             first_frame_is_clean=is_i2v and first_frames is not None,
         )
 
