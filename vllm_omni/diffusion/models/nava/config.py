@@ -183,10 +183,6 @@ class NAVARequestContext:
     timbre_cfg: bool
     negative_prompt_mode: bool
 
-    @property
-    def is_i2v(self) -> bool:
-        return self.image is not None
-
 
 def parse_speech_spans(prompt: str) -> list[str]:
     return [match.group(1) for match in _SPEECH_SPAN_RE.finditer(prompt or "")]

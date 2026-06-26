@@ -9,10 +9,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.lengths import (
-    _check_no_attn_mask_with_lengths,
-    _metadata_has_lengths,
-)
 
 logger = init_logger(__name__)
 
@@ -144,11 +140,6 @@ class FlashInferAttentionImpl(AttentionImpl):
                 "FLASHINFER_ATTN backend requires flashinfer. "
                 "Install it or set DIFFUSION_ATTENTION_BACKEND to another backend."
             )
-        if attn_metadata is not None:
-            _check_no_attn_mask_with_lengths(attn_metadata)
-            if _metadata_has_lengths(attn_metadata):
-                logger.debug("Falling back to SDPA for length metadata.")
-                return self._sdpa_fallback(query, key, value, attn_metadata)
 
         # Try the custom_mask path; if the mask can't be packed into the
         # (qo_len, kv_len) layout FlashInfer expects, fall back to SDPA

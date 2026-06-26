@@ -176,7 +176,7 @@ class NAVAPipeline(
             "pipeline_parallel_size": pc.pipeline_parallel_size,
             "data_parallel_size": pc.data_parallel_size,
         }
-        enabled = {key: value for key, value in enabled.items() if int(value or 1) != 1}
+        enabled = {key: value for key, value in enabled.items() if int(value) != 1}
         if enabled or pc.use_hsdp or pc.enable_expert_parallel:
             raise ValueError(
                 "NAVAPipeline native parallel and sharding modes are not verified yet. "
@@ -199,7 +199,6 @@ class NAVAPipeline(
         self.audio_vae = NAVAAudioVAE(model_root, self.nava_config)
         self.speaker_encoder = NAVASpeakerEncoder(model_root, self.nava_config)
         self.transformer = NAVATransformer(self.nava_config)
-        self.vae = self.video_vae
         self.to(self.device)
 
     def _require_local_model_root(self) -> str:
