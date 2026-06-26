@@ -46,7 +46,7 @@ def image_to_tensor(image: Any, height: int, width: int) -> torch.Tensor:
             raise ValueError("NAVA image conditioning accepts exactly one first-frame image.")
         image = image[0]
 
-    if isinstance(image, (str, os.PathLike)):
+    if isinstance(image, str | os.PathLike):
         with Image.open(image) as loaded:
             image = loaded.convert("RGB")
 
@@ -72,15 +72,3 @@ def image_to_tensor(image: Any, height: int, width: int) -> torch.Tensor:
         return tensor
 
     raise TypeError(f"Unsupported NAVA image input type: {type(image)!r}")
-
-
-def move_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device)
-    if isinstance(value, list):
-        return [move_to_device(item, device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(move_to_device(item, device) for item in value)
-    if isinstance(value, dict):
-        return {key: move_to_device(item, device) for key, item in value.items()}
-    return value
