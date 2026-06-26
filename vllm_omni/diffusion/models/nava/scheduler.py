@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import torch
 
@@ -273,8 +271,3 @@ class NAVAFlowMatchScheduler:
         while sigma.ndim < original.ndim:
             sigma = sigma.unsqueeze(-1)
         return (1 - sigma) * original + sigma * noise
-
-
-def nava_audio_latent_length(frames: int, fps: float, audio_tokens_per_sec: float) -> int:
-    video_duration_s = ((int(frames) - 1) * 4 + 1) / float(fps)
-    return max(1, math.ceil(video_duration_s * audio_tokens_per_sec))
