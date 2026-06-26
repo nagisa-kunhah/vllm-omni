@@ -41,7 +41,7 @@ from vllm_omni.diffusion.models.nava.nava_transformer import NAVATransformer
 from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
 from vllm_omni.diffusion.models.nava.text_encoder import NAVAWanTextEncoder as _NAVATextEncoder
-from vllm_omni.diffusion.models.nava.utils import as_bool, image_to_tensor, move_to_device, resolve_num_frames
+from vllm_omni.diffusion.models.nava.utils import as_bool, image_to_tensor, resolve_num_frames
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -401,7 +401,7 @@ class NAVAPipeline(
     def _encode_image(self, ctx: NAVARequestContext) -> torch.Tensor | None:
         if ctx.image is None:
             return None
-        image = move_to_device(image_to_tensor(ctx.image, ctx.height, ctx.width), self.device)
+        image = image_to_tensor(ctx.image, ctx.height, ctx.width).to(self.device)
         if not hasattr(self.video_vae, "encode_first_frame"):
             raise TypeError("NAVA video_vae must expose encode_first_frame(image).")
         # Image embedding: first-frame pixels become a conditioning latent for
