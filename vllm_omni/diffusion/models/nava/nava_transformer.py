@@ -13,12 +13,14 @@ helpers, keep module names close to the checkpoint layout, and add the
 
 import math
 import warnings
+from contextlib import nullcontext
 from collections.abc import Iterable
 
 import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -26,6 +28,8 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 
 logger = init_logger(__name__)
+
+_NAVA_CUDA_SDPA_BACKENDS = [SDPBackend.CUDNN_ATTENTION]
 
 
 class ChannelLastConv1d(nn.Conv1d):
@@ -145,15 +149,18 @@ def _nava_attention(
             repeat = query_item.size(1) // key_item.size(1)
             key_item = key_item.repeat_interleave(repeat, dim=1)
             value_item = value_item.repeat_interleave(repeat, dim=1)
-        output = F.scaled_dot_product_attention(
-            query_item,
-            key_item,
-            value_item,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=causal,
-            scale=softmax_scale,
-        ).transpose(1, 2)
+        sdpa_context = sdpa_kernel(_NAVA_CUDA_SDPA_BACKENDS) if query_item.is_cuda else nullcontext()
+        with sdpa_context:
+            output = F.scaled_dot_product_attention(
+                query_item,
+                key_item,
+                value_item,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=causal,
+                scale=softmax_scale,
+            )
+        output = output.transpose(1, 2)
         if cur_query_len < query_len:
             output = F.pad(output, (0, 0, 0, 0, 0, query_len - cur_query_len))
         chunks.append(output)
