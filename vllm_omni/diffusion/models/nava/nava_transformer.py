@@ -13,8 +13,8 @@ helpers, keep module names close to the checkpoint layout, and add the
 
 import math
 import warnings
-from contextlib import nullcontext
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 import torch.amp as amp
