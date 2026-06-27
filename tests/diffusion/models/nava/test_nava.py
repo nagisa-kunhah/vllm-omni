@@ -814,7 +814,9 @@ def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
         ["plain prompt"],
         [NAVAConfig.video_negative_prompt, NAVAConfig.audio_negative_prompt],
     ]
-    negative_calls = [call for call in transformer.calls if call["speaker_embeds"] is None and "audio_text_embeds" in call]
+    negative_calls = [
+        call for call in transformer.calls if call["speaker_embeds"] is None and "audio_text_embeds" in call
+    ]
     assert negative_calls
     assert all(call["audio_text_embeds"] is not call["text_embeds"] for call in negative_calls)
 
@@ -1035,13 +1037,17 @@ def test_rope_apply_chunked_matches_reference() -> None:
     grid_video = torch.tensor([[2, 2, 3], [1, 3, 4]])
     freqs_video = torch.polar(torch.ones(8, 6, dtype=torch.float64), torch.randn(8, 6, dtype=torch.float64))
 
-    assert torch.equal(_rope_apply_3d(x_video, grid_video, freqs_video), _rope_apply_3d_reference(x_video, grid_video, freqs_video))
+    assert torch.equal(
+        _rope_apply_3d(x_video, grid_video, freqs_video), _rope_apply_3d_reference(x_video, grid_video, freqs_video)
+    )
 
     x_audio = torch.randn(2, 11, 2, 12, dtype=torch.bfloat16)
     grid_audio = torch.tensor([[7], [9]])
     freqs_audio = torch.polar(torch.ones(12, 4, dtype=torch.float64), torch.randn(12, 4, dtype=torch.float64))
 
-    assert torch.equal(_rope_apply_1d(x_audio, grid_audio, freqs_audio), _rope_apply_1d_reference(x_audio, grid_audio, freqs_audio))
+    assert torch.equal(
+        _rope_apply_1d(x_audio, grid_audio, freqs_audio), _rope_apply_1d_reference(x_audio, grid_audio, freqs_audio)
+    )
     assert torch.equal(
         _rope_apply_3d_to_1d(x_video, grid_video, freqs_audio),
         _rope_apply_3d_to_1d_reference(x_video, grid_video, freqs_audio),

@@ -386,7 +386,7 @@ class WanDoubleStreamSelfAttention(nn.Module):
             L = x_vid.shape[1] + x_audio.shape[1]
             q_vid, k_vid, v_vid = self._qkv_fn(x_vid)
             q_audio, k_audio, v_audio = self._qkv_fn_audio(x_audio)
-            # concat for joint pre-precessing
+            # concat for joint pre-processing
             q = torch.cat([q_vid, q_audio], dim=1)
             k = torch.cat([k_vid, k_audio], dim=1)
             v = torch.cat([v_vid, v_audio], dim=1)

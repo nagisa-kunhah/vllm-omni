@@ -118,9 +118,12 @@ class _T5RelativeEmbedding(nn.Module):
             rel_pos = -torch.min(rel_pos, torch.zeros_like(rel_pos))
 
         max_exact = num_buckets // 2
-        rel_pos_large = max_exact + (
-            torch.log(rel_pos.float() / max_exact) / math.log(self.max_dist / max_exact) * (num_buckets - max_exact)
-        ).long()
+        rel_pos_large = (
+            max_exact
+            + (
+                torch.log(rel_pos.float() / max_exact) / math.log(self.max_dist / max_exact) * (num_buckets - max_exact)
+            ).long()
+        )
         rel_pos_large = torch.min(rel_pos_large, torch.full_like(rel_pos_large, num_buckets - 1))
         return rel_buckets + torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
 
@@ -172,10 +175,7 @@ class _T5Encoder(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [
-                _T5SelfAttentionBlock(dim, dim_attn, dim_ffn, num_heads, num_buckets, dropout)
-                for _ in range(num_layers)
-            ]
+            [_T5SelfAttentionBlock(dim, dim_attn, dim_ffn, num_heads, num_buckets, dropout) for _ in range(num_layers)]
         )
         self.norm = _T5LayerNorm(dim)
 

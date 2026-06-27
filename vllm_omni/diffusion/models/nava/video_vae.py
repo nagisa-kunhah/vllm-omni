@@ -8,8 +8,8 @@ import os
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.models.wan2_2.wan_vae import Wan22VAE
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
+from vllm_omni.diffusion.models.wan2_2.wan_vae import Wan22VAE
 
 
 class NAVAVideoVAE(nn.Module):
