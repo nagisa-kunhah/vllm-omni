@@ -99,6 +99,16 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
+
+
+def _moss_tts_local_fullseq_enabled() -> bool:
+    truthy = ("1", "true", "yes", "on")
+    return (
+        os.environ.get("MOSS_TTS_LOCAL_FULLSEQ", "0").strip().lower() in truthy
+        or os.environ.get("MOSS_TTS_LOCAL_NATIVE", "0").strip().lower() in truthy
+    )
+
+
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -715,7 +725,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
             return "moss_tts"
         if model_stage in _MOSS_TTS_LOCAL_MODEL_STAGES:
-            return "moss_tts"
+            return "moss_tts_local" if _moss_tts_local_fullseq_enabled() else "moss_tts"
         if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
             return "higgs_audio_v2"
         if model_stage in _HIGGS_V3_TTS_MODEL_STAGES:
@@ -3579,6 +3589,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "moss_tts_nano"
         elif self._tts_model_type == "moss_tts":
             model_type = "moss_tts"
+        elif self._tts_model_type == "moss_tts_local":
+            model_type = "moss_tts_local"
         elif self._tts_model_type == "higgs_audio_v2":
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":

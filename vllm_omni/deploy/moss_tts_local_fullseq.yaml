@@ -4,6 +4,7 @@
 # still transfers payloads through the async chunk adapter, but Stage1 receives
 # one terminal codec payload per request so completed utterances can be batched
 # safely without sharing streaming codec state across requests.
+# Set MOSS_TTS_LOCAL_FULLSEQ=1 when using this config.
 async_chunk: true
 
 connectors:

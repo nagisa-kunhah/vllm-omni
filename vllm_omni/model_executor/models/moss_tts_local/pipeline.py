@@ -12,10 +12,13 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.moss_tts.pipeline import (
+    MOSS_TTS_LOCAL_PIPELINE as MOSS_TTS_LOCAL_BASE_PIPELINE,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.moss_tts_local"
 
-MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
+MOSS_TTS_LOCAL_FULLSEQ_PIPELINE = PipelineConfig(
     model_type="moss_tts_local",
     model_arch="MossTTSLocalModel",
     hf_architectures=("MossTTSLocalModel",),
@@ -78,19 +81,24 @@ MOSS_TTS_LOCAL_NATIVE_PIPELINE = PipelineConfig(
 )
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def resolve_moss_tts_local_pipeline(
     hf_config: PretrainedConfig | None = None,
 ) -> PipelineConfig:
     del hf_config
 
-    native_flag = os.environ.get("MOSS_TTS_LOCAL_NATIVE", "0").strip().lower()
-    if native_flag in ("1", "true", "yes", "on"):
+    if _env_enabled("MOSS_TTS_LOCAL_NATIVE"):
         return MOSS_TTS_LOCAL_NATIVE_PIPELINE
-    return MOSS_TTS_LOCAL_PIPELINE
+    if _env_enabled("MOSS_TTS_LOCAL_FULLSEQ"):
+        return MOSS_TTS_LOCAL_FULLSEQ_PIPELINE
+    return MOSS_TTS_LOCAL_BASE_PIPELINE
 
 
 __all__ = [
-    "MOSS_TTS_LOCAL_PIPELINE",
+    "MOSS_TTS_LOCAL_FULLSEQ_PIPELINE",
     "MOSS_TTS_LOCAL_NATIVE_PIPELINE",
     "resolve_moss_tts_local_pipeline",
 ]

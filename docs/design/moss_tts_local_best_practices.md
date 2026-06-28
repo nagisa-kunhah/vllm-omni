@@ -1,11 +1,17 @@
-# MOSS-TTS Local Serving Defaults
+# MOSS-TTS Local Full-Sequence Serving
 
-This note documents the default high-throughput path for
+This note documents the opt-in high-throughput full-sequence path for
 MOSS-TTS-Local-Transformer-v1.5 in vLLM-Omni.
 
 ## Recommended Path
 
-Use the HF-compatible Stage0 backbone path by default. It is the hand-written
+Set the full-sequence path explicitly:
+
+```bash
+MOSS_TTS_LOCAL_FULLSEQ=1
+```
+
+This uses the HF-compatible Stage0 backbone path. It is the hand-written
 Qwen3-compatible implementation under
 `vllm_omni/model_executor/models/moss_tts_local/hf_compatible_qwen3.py`.
 
@@ -15,7 +21,7 @@ The native vLLM Qwen3 path remains available for experiments by setting:
 MOSS_TTS_LOCAL_NATIVE=1
 ```
 
-The default is intentionally not native. For this TTS workload, the
+The full-sequence path is intentionally not native by default. For this TTS workload, the
 HF-compatible path keeps the Stage0 decode/output routing behavior closer to
 the reference implementation and avoids the native outer CUDA graph padding
 interactions observed during throughput testing.
@@ -101,12 +107,12 @@ Start the server with the recommended deploy config:
 export MODEL=/path/to/OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
 export PORT=18038
 
-CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
+CUDA_VISIBLE_DEVICES=0 MOSS_TTS_LOCAL_FULLSEQ=1 vllm serve "$MODEL" \
   --omni \
   --host 0.0.0.0 \
   --port "$PORT" \
   --trust-remote-code \
-  --deploy-config vllm_omni/deploy/moss_tts_local.yaml
+  --deploy-config vllm_omni/deploy/moss_tts_local_fullseq.yaml
 ```
 
 Run a warmup pass before measuring:
