@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -88,6 +90,88 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self.last_full_sequence_admission_profile: dict[str, Any] = {}
+
+    @staticmethod
+    def _parse_optional_bool(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            return bool(value.item())
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+            return None
+        return bool(value)
+
+    def _codec_streaming_default(self) -> bool | None:
+        raw = os.environ.get("MOSS_TTS_LOCAL_CODEC_STREAMING")
+        if raw is None:
+            raw = os.environ.get("MOSS_TTS_LOCAL_DEFAULT_CODEC_STREAMING")
+        parsed = self._parse_optional_bool(raw)
+        if parsed is not None:
+            return parsed
+
+        connector_cfg = getattr(self.connector, "config", None)
+        if isinstance(connector_cfg, Mapping):
+            extra = connector_cfg.get("extra", connector_cfg)
+            if isinstance(extra, Mapping) and "codec_streaming" in extra:
+                return self._parse_optional_bool(extra.get("codec_streaming"))
+        return None
+
+    def _use_full_sequence_chunk_admission(self) -> bool:
+        """Whether async-chunk transport is carrying terminal full payloads.
+
+        ``active_stream_window`` protects stateful streaming codec sessions.
+        When MOSS Local is explicitly configured to send one terminal
+        full-sequence payload per request through the async-chunk transport,
+        the active-window gate only throttles which finished payloads can be
+        polled.  Bulk registration is safe for that mode and is required to
+        form larger Stage1 vocoder batches.
+        """
+        return self.model_mode != "ar" and self._codec_streaming_default() is False
+
+    def _full_sequence_admission_coalesce_delay_s(self) -> float:
+        raw = (
+            os.environ.get("MOSS_TTS_LOCAL_STAGE1_FULLSEQ_ADMISSION_COALESCE_MS")
+            or os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_WINDOW_MS")
+            or os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_MS")
+            or os.environ.get("OMNI_CONNECTOR_COALESCE_MS")
+        )
+        if raw is None:
+            return 0.04 if self._use_full_sequence_chunk_admission() else 0.0
+        try:
+            return max(float(raw), 0.0) / 1000.0
+        except ValueError:
+            return 0.0
+
+    def _full_sequence_admission_target(self) -> int:
+        raw = (
+            os.environ.get("MOSS_TTS_LOCAL_STAGE1_FULLSEQ_ADMISSION_TARGET")
+            or os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_TARGET")
+            or os.environ.get("OMNI_CONNECTOR_COALESCE_TARGET")
+        )
+        if not raw:
+            if self._use_full_sequence_chunk_admission():
+                target = 6
+                if self.scheduler_max_num_seqs > 0:
+                    target = min(target, int(self.scheduler_max_num_seqs))
+                return target
+            return max(int(self.scheduler_max_num_seqs or 0), 0)
+        try:
+            target = max(int(raw), 0)
+        except ValueError:
+            return max(int(self.scheduler_max_num_seqs or 0), 0)
+        if self.scheduler_max_num_seqs > 0:
+            return min(target, int(self.scheduler_max_num_seqs))
+        return target
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -242,7 +326,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("codes", {}).get("audio")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
-                use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
+                use_tensor_codes = has_tensor_codes and (self.model_mode == "generation" or new_ids.ndim >= 2)
                 if use_tensor_codes:
                     request.prompt_token_ids = [0] if new_ids.numel() > 0 else []
                 elif has_tensor_codes:
@@ -256,7 +340,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
                     if key == "codes":
-                        if use_tensor_codes and isinstance(value, dict):
+                        if isinstance(value, dict):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                             merged_sub.update(value)
@@ -300,8 +384,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
-        chunk_id = self.put_req_chunk[external_req_id]
-        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
@@ -323,37 +405,43 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
-        if payload_data.meta is None:
-            payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        success, size, metadata = self.connector.put(
-            from_stage=str(stage_id),
-            to_stage=str(next_stage_id),
-            put_key=connector_put_key,
-            data=payload_data,
-        )
+        payloads = payload_data if isinstance(payload_data, list) else [payload_data]
+        for payload_index, payload in enumerate(payloads):
+            if payload.meta is None:
+                payload.meta = MetaStruct()
+            is_last_payload = payload_index == len(payloads) - 1
+            payload.meta.finished = torch.tensor(is_finished and is_last_payload, dtype=torch.bool)
+            payload.meta.is_segment_finished = torch.tensor(is_segment_finished and is_last_payload, dtype=torch.bool)
 
-        if success:
-            self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            # Sender uses struct attr access here; the receive path in
-            # `_load_one_request` / `_update_request_payload` reads dict keys.
-            # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
-            # (no target type), so the wire round-trips struct -> dict. If you
-            # change the schema, update both ends — see test_wire_round_trip.
-            finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
-            is_payload_finished = False
-            if isinstance(finished_flag, torch.Tensor):
-                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
-            elif finished_flag is not None:
-                is_payload_finished = bool(finished_flag)
+            chunk_id = self.put_req_chunk[external_req_id]
+            connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+            success, size, metadata = self.connector.put(
+                from_stage=str(stage_id),
+                to_stage=str(next_stage_id),
+                put_key=connector_put_key,
+                data=payload,
+            )
 
-            # Reclaim per-request async state only after the terminal payload
-            # has been sent successfully. This avoids cleanup->save races.
-            if is_payload_finished:
-                self.cleanup(request.request_id, external_req_id)
+            if success:
+                self.put_req_chunk[external_req_id] += 1
+                logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+                # Sender uses struct attr access here; the receive path in
+                # `_load_one_request` / `_update_request_payload` reads dict keys.
+                # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
+                # (no target type), so the wire round-trips struct -> dict. If you
+                # change the schema, update both ends — see test_wire_round_trip.
+                finished_flag = payload.meta.finished if payload.meta is not None else None
+                is_payload_finished = False
+                if isinstance(finished_flag, torch.Tensor):
+                    is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+                elif finished_flag is not None:
+                    is_payload_finished = bool(finished_flag)
+
+                # Reclaim per-request async state only after the terminal payload
+                # has been sent successfully. This avoids cleanup->save races.
+                if is_payload_finished:
+                    self.cleanup(request.request_id, external_req_id)
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
@@ -475,7 +563,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
 
-        if self._active_window <= 0:
+        if self._active_window <= 0 or self._use_full_sequence_chunk_admission():
             self._process_chunk_queue_legacy(
                 waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
             )
@@ -485,6 +573,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 RequestStatus.RUNNING,
                 self._finished_load_reqs,
             )
+            if self._use_full_sequence_chunk_admission():
+                self._coalesce_and_release_full_sequence_requests(
+                    waiting_queue,
+                    running_queue,
+                    scheduler_requests=scheduler_requests,
+                )
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
                 request.status = RequestStatus.PREEMPTED
@@ -582,6 +676,114 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
+
+    def _count_ready_full_sequence_requests(self) -> int:
+        return sum(
+            1
+            for request in (
+                list(self.waiting_for_chunk_waiting_requests) + list(self.waiting_for_chunk_running_requests)
+            )
+            if request.request_id in self._finished_load_reqs
+        )
+
+    def _coalesce_and_release_full_sequence_requests(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        *,
+        scheduler_requests: dict[str, Request] | None = None,
+    ) -> None:
+        parked_before = len(self.waiting_for_chunk_waiting_requests) + len(self.waiting_for_chunk_running_requests)
+        ready_before = self._count_ready_full_sequence_requests()
+        target = self._full_sequence_admission_target()
+        delay_s = self._full_sequence_admission_coalesce_delay_s()
+        pending_before = len(self._pending_load_reqs)
+
+        if delay_s > 0 and parked_before > 0 and (target <= 0 or ready_before < min(target, parked_before)):
+            deadline = time.perf_counter() + delay_s
+            sleep_step = min(0.0005, delay_s)
+            while True:
+                ready_now = self._count_ready_full_sequence_requests()
+                if ready_now >= parked_before or (target > 0 and ready_now >= target):
+                    break
+                if not self._pending_load_reqs:
+                    break
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                time.sleep(min(sleep_step, remaining))
+
+        if scheduler_requests is not None:
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
+            self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+
+        released_waiting = self._release_ready_full_sequence_requests(
+            waiting_queue,
+            self.waiting_for_chunk_waiting_requests,
+            RequestStatus.WAITING,
+            scheduler_requests=scheduler_requests,
+        )
+        released_running = self._release_ready_full_sequence_requests(
+            running_queue,
+            self.waiting_for_chunk_running_requests,
+            RequestStatus.RUNNING,
+            scheduler_requests=scheduler_requests,
+        )
+        released = released_waiting + released_running
+        self.last_full_sequence_admission_profile = {
+            "parked": parked_before,
+            "ready_before": ready_before,
+            "ready_after_wait": self._count_ready_full_sequence_requests(),
+            "released": released,
+            "released_waiting": released_waiting,
+            "released_running": released_running,
+            "pending_before": pending_before,
+            "pending_after": len(self._pending_load_reqs),
+            "target": target,
+            "delay_ms": delay_s * 1000.0,
+        }
+        if released and os.environ.get("MOSS_TTS_LOCAL_STAGE1_ADMISSION_PROFILE") == "1":
+            logger.info(
+                "[moss-stage1-fullseq-admission] parked=%d ready_before=%d released=%d "
+                "waiting=%d running=%d pending=%d->%d target=%d delay_ms=%.3f",
+                parked_before,
+                ready_before,
+                released,
+                released_waiting,
+                released_running,
+                pending_before,
+                len(self._pending_load_reqs),
+                target,
+                delay_s * 1000.0,
+            )
+
+    def _release_ready_full_sequence_requests(
+        self,
+        queue: Any,
+        waiting_for_chunk_list: deque[Any],
+        target_status: RequestStatus,
+        *,
+        scheduler_requests: dict[str, Request] | None = None,
+    ) -> int:
+        released = 0
+        for _ in range(len(waiting_for_chunk_list)):
+            request = waiting_for_chunk_list.popleft()
+            request_id = request.request_id
+            if scheduler_requests is not None and request_id not in scheduler_requests:
+                self.cleanup_receiver(request_id)
+                continue
+            if request_id not in self._finished_load_reqs:
+                waiting_for_chunk_list.append(request)
+                continue
+            request.status = target_status
+            self._finished_load_reqs.remove(request_id)
+            self.requests_with_ready_chunks.add(request_id)
+            if target_status == RequestStatus.WAITING:
+                queue.add_request(request)
+            else:
+                queue.append(request)
+            released += 1
+        return released
 
     def _purge_untracked_chunk_requests(
         self,

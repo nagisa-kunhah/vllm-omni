@@ -28,7 +28,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="audio",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2vocoder_async_chunk",
-            custom_process_next_stage_input_func=f"{_PROC}.talker2vocoder",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2vocoder_full_payload",
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(
@@ -59,7 +59,7 @@ MOSS_TTS_LOCAL_NATIVE_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="audio",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2vocoder_async_chunk",
-            custom_process_next_stage_input_func=f"{_PROC}.talker2vocoder",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2vocoder_full_payload",
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(

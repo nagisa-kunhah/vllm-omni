@@ -30,16 +30,39 @@ def sample_top_k_top_p(
 
     scores = logits / max(float(temperature), 1e-6)
     vocab = int(scores.shape[-1])
+    top_k = int(top_k)
+    top_p = float(top_p)
 
-    if 0 < int(top_k) < vocab:
-        values, _ = torch.topk(scores, int(top_k), dim=-1)
-        scores = scores.masked_fill(scores < values[..., -1:], float("-inf"))
+    if 0 < top_k < vocab:
+        topk_scores, topk_indices = torch.topk(scores, top_k, dim=-1)
+        if 0.0 < top_p < 1.0:
+            sorted_scores, sorted_order = torch.sort(topk_scores, descending=True, dim=-1)
+            sorted_indices = topk_indices.gather(-1, sorted_order)
+            sorted_probs = torch.softmax(sorted_scores, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            sorted_scores = sorted_scores.masked_fill(remove, float("-inf"))
+            probs = torch.softmax(sorted_scores, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            fallback = probs.sum(dim=-1) <= 0
+            sampled_rel = torch.multinomial(probs, num_samples=1, generator=generator)
+            sampled = sorted_indices.gather(-1, sampled_rel).reshape(-1)
+            return torch.where(fallback, torch.argmax(logits, dim=-1), sampled)
 
-    if 0.0 < float(top_p) < 1.0:
+        probs = torch.softmax(topk_scores, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        fallback = probs.sum(dim=-1) <= 0
+        sampled_rel = torch.multinomial(probs, num_samples=1, generator=generator)
+        sampled = topk_indices.gather(-1, sampled_rel).reshape(-1)
+        return torch.where(fallback, torch.argmax(logits, dim=-1), sampled)
+
+    if 0.0 < top_p < 1.0:
         sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
         sorted_probs = torch.softmax(sorted_scores, dim=-1)
         cumulative = torch.cumsum(sorted_probs, dim=-1)
-        remove = cumulative > float(top_p)
+        remove = cumulative > top_p
         remove[..., 1:] = remove[..., :-1].clone()
         remove[..., 0] = False
         mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, sorted_indices, remove)
@@ -104,16 +127,11 @@ class MossTTSLocalTransformer(nn.Module):
         self.max_positions = int(max_positions)
         self.attn_implementation = str(attn_implementation or "eager").lower()
         self.h = nn.ModuleList(
-            [
-                MossTTSLocalBlock(hidden_size, num_heads, inner_size, layer_norm_eps)
-                for _ in range(int(num_layers))
-            ]
+            [MossTTSLocalBlock(hidden_size, num_heads, inner_size, layer_norm_eps) for _ in range(int(num_layers))]
         )
         self.ln_f = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
 
-        inv_freq = 1.0 / (
-            float(rope_base) ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
-        )
+        inv_freq = 1.0 / (float(rope_base) ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         positions = torch.arange(self.max_positions, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         self.register_buffer("rope_cos", freqs.cos().repeat_interleave(2, dim=-1), persistent=False)
@@ -125,6 +143,18 @@ class MossTTSLocalTransformer(nn.Module):
         self._graph_input: torch.Tensor | None = None
         self._graph_output: torch.Tensor | None = None
         self._graph_batch_size: int = 0
+        self._rope_cache: dict[tuple[str, int | None, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _rope_tables(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (device.type, device.index, dtype)
+        cached = self._rope_cache.get(key)
+        if cached is None:
+            cached = (
+                self.rope_cos.to(device=device, dtype=dtype),
+                self.rope_sin.to(device=device, dtype=dtype),
+            )
+            self._rope_cache[key] = cached
+        return cached
 
     def _ensure_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
         if (
@@ -161,8 +191,9 @@ class MossTTSLocalTransformer(nn.Module):
     def _step_eager(self, hidden_states: torch.Tensor, position: int) -> torch.Tensor:
         """The actual computation (no graph)."""
         batch_size = int(hidden_states.shape[0])
-        cos = self.rope_cos[position].to(dtype=hidden_states.dtype)
-        sin = self.rope_sin[position].to(dtype=hidden_states.dtype)
+        rope_cos, rope_sin = self._rope_tables(hidden_states.device, hidden_states.dtype)
+        cos = rope_cos[position]
+        sin = rope_sin[position]
         x = hidden_states
         for layer_idx, block in enumerate(self.h):
             normed = block.ln_1(x)
@@ -178,7 +209,7 @@ class MossTTSLocalTransformer(nn.Module):
             key_len = position + 1
             keys = key_cache[:batch_size, :key_len]
             values = value_cache[:batch_size, :key_len]
-            scores = torch.einsum("bhd,bthd->bht", query, keys) * (self.head_dim ** -0.5)
+            scores = torch.einsum("bhd,bthd->bht", query, keys) * (self.head_dim**-0.5)
             probs = torch.softmax(scores, dim=-1)
             attn_out = torch.einsum("bht,bthd->bhd", probs, values).reshape(batch_size, self.hidden_size)
             x = x + block.attn.c_proj(attn_out)
@@ -192,11 +223,7 @@ class MossTTSLocalTransformer(nn.Module):
         self._ensure_kv_cache(batch_size, hidden_states.device, hidden_states.dtype)
 
         # Graph-accelerated path
-        if (
-            self._graph_enabled
-            and batch_size <= self._graph_batch_size
-            and hidden_states.device.type == "cuda"
-        ):
+        if self._graph_enabled and batch_size <= self._graph_batch_size and hidden_states.device.type == "cuda":
             key = (batch_size, position)
             if key not in self._graphs:
                 # Warmup + capture

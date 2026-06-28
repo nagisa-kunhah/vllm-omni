@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,6 +16,40 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 
 logger = init_logger(__name__)
+
+
+def _parse_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return bool(value.item())
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return None
+    return bool(value)
+
+
+def _codec_streaming_from_transfer_manager(transfer_manager: Any) -> bool:
+    raw = os.environ.get("MOSS_TTS_LOCAL_CODEC_STREAMING")
+    if raw is None:
+        raw = os.environ.get("MOSS_TTS_LOCAL_DEFAULT_CODEC_STREAMING")
+    parsed = _parse_optional_bool(raw)
+    if parsed is not None:
+        return parsed
+
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, Mapping) else {}
+    parsed = _parse_optional_bool(cfg.get("codec_streaming"))
+    return True if parsed is None else parsed
 
 
 def _get_audio_from_payload(payload: Any) -> torch.Tensor | None:
@@ -166,6 +201,15 @@ def vocoder_token_only(
     return talker2vocoder(source_outputs, prompt, requires_multimodal_data, streaming_context)
 
 
+def talker2vocoder_full_payload(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[Any]:
+    return talker2vocoder(source_outputs, prompt, requires_multimodal_data, streaming_context)
+
+
 def talker2vocoder_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,
@@ -210,7 +254,7 @@ def talker2vocoder_async_chunk(
                 meta=MetaStruct(
                     left_context_size=0,
                     finished=torch.tensor(True, dtype=torch.bool),
-                    codec_streaming=True,
+                    codec_streaming=_codec_streaming_from_transfer_manager(transfer_manager),
                     req_id=[req_id],
                 ),
                 request_id=req_id,
@@ -220,10 +264,14 @@ def talker2vocoder_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    codec_streaming = _codec_streaming_from_transfer_manager(transfer_manager)
     chunk_frames = int(cfg.get("codec_chunk_frames", 25) or 25)
     initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames", 0) or 0)
     if initial_chunk_frames > chunk_frames:
         initial_chunk_frames = chunk_frames
+
+    if not codec_streaming and not is_finished:
+        return None
 
     threshold = initial_chunk_frames if emitted_frames == 0 and initial_chunk_frames > 0 else chunk_frames
     if not is_finished and pending_frames < threshold:
@@ -240,24 +288,24 @@ def talker2vocoder_async_chunk(
             meta=MetaStruct(
                 left_context_size=0,
                 finished=torch.tensor(bool(finished), dtype=torch.bool),
-                codec_streaming=True,
+                codec_streaming=codec_streaming,
                 req_id=[req_id],
             ),
             request_id=req_id,
         )
+
+    if not codec_streaming:
+        state.pop(req_id, None)
+        return make_payload(acc, finished=True)
 
     if is_finished:
         payloads: list[OmniPayloadStruct] = []
         cursor = 0
         local_emitted = emitted_frames
         while cursor < pending_frames:
-            local_threshold = (
-                initial_chunk_frames
-                if local_emitted == 0 and initial_chunk_frames > 0
-                else chunk_frames
-            )
+            local_threshold = initial_chunk_frames if local_emitted == 0 and initial_chunk_frames > 0 else chunk_frames
             emit_frames = min(local_threshold, pending_frames - cursor)
-            chunk = acc[cursor:cursor + emit_frames]
+            chunk = acc[cursor : cursor + emit_frames]
             cursor += emit_frames
             local_emitted += emit_frames
             payloads.append(make_payload(chunk, finished=cursor >= pending_frames))
@@ -273,4 +321,9 @@ def talker2vocoder_async_chunk(
     return make_payload(chunk, finished=False)
 
 
-__all__ = ["talker2vocoder", "vocoder_token_only", "talker2vocoder_async_chunk"]
+__all__ = [
+    "talker2vocoder",
+    "talker2vocoder_full_payload",
+    "talker2vocoder_async_chunk",
+    "vocoder_token_only",
+]
