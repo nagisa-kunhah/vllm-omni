@@ -165,6 +165,8 @@ class NAVAPipeline(
         )
 
     def _validate_runtime_features(self) -> None:
+        if not self._is_cuda_device():
+            raise ValueError("NAVAPipeline is currently verified only on CUDA/NVIDIA GPUs.")
         if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
             raise ValueError("NAVAPipeline CPU and layerwise offload are not verified yet.")
         pc = self.od_config.parallel_config
@@ -183,6 +185,9 @@ class NAVAPipeline(
                 f"Unsupported settings: {enabled}, use_hsdp={pc.use_hsdp}, "
                 f"enable_expert_parallel={pc.enable_expert_parallel}."
             )
+
+    def _is_cuda_device(self) -> bool:
+        return self.device.type == "cuda"
 
     def _init_native_components(self) -> None:
         model_root = self._require_local_model_root()
@@ -613,8 +618,6 @@ class NAVAPipeline(
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
 
     def _capture_rng_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {
@@ -622,7 +625,7 @@ class NAVAPipeline(
             "numpy": np.random.get_state(),
             "torch_cpu": torch.get_rng_state(),
         }
-        if torch.cuda.is_available():
+        if self._is_cuda_device():
             state["torch_cuda"] = torch.cuda.get_rng_state(self.device)
         return state
 
@@ -631,7 +634,7 @@ class NAVAPipeline(
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["torch_cpu"])
         cuda_state = state.get("torch_cuda")
-        if cuda_state is not None and torch.cuda.is_available():
+        if cuda_state is not None and self._is_cuda_device():
             torch.cuda.set_rng_state(cuda_state, self.device)
 
 
