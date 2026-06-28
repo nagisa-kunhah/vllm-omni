@@ -93,6 +93,70 @@ validated default path:
 These should be tested with end-to-end serving benchmarks and audio-quality
 checks before being promoted to defaults.
 
+## Benchmark Commands
+
+Start the server with the recommended deploy config:
+
+```bash
+export MODEL=/path/to/OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
+export PORT=18038
+
+CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --trust-remote-code \
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml
+```
+
+Run a warmup pass before measuring:
+
+```bash
+vllm bench serve \
+  --omni \
+  --backend openai-audio-speech \
+  --endpoint /v1/audio/speech \
+  --model "$MODEL" \
+  --port "$PORT" \
+  --dataset-name seed-tts-text \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --num-prompts 128 \
+  --max-concurrency 64 \
+  --request-rate inf \
+  --extra-body '{"voice":"default","max_new_tokens":2048}' \
+  --percentile-metrics e2el,audio_ttfp,audio_rtf,audio_duration \
+  --metric-percentiles 50,90,95,99
+```
+
+Run the formal p500 pass:
+
+```bash
+vllm bench serve \
+  --omni \
+  --backend openai-audio-speech \
+  --endpoint /v1/audio/speech \
+  --model "$MODEL" \
+  --port "$PORT" \
+  --dataset-name seed-tts-text \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --num-prompts 500 \
+  --max-concurrency 64 \
+  --request-rate inf \
+  --extra-body '{"voice":"default","max_new_tokens":2048}' \
+  --percentile-metrics e2el,audio_ttfp,audio_rtf,audio_duration \
+  --metric-percentiles 50,90,95,99 \
+  --save-result \
+  --save-detailed \
+  --result-dir /tmp \
+  --result-filename moss_tts_local_p500_vllm_bench.json
+```
+
+The `vllm bench serve` command uses the standard streaming PCM speech backend.
+It is the recommended command for repeatable PR validation. The historical p500
+numbers below were collected with the same warmup-then-formal discipline on a
+local mixed-prompt JSONL driver, so treat them as a reference point rather than
+as byte-for-byte output from the command above.
+
 ## Benchmark Reference
 
 The latest H20 p500 validation used warmup before the formal run and the
