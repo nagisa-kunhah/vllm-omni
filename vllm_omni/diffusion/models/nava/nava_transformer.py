@@ -340,6 +340,7 @@ class WanDoubleStreamSelfAttention(nn.Module):
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            is_audio(bool): Whether to use the audio attention projections.
         """
         q, k, v = self._qkv_fn(x) if not is_audio else self._qkv_fn_audio(x)
 
@@ -372,10 +373,17 @@ class WanDoubleStreamSelfAttention(nn.Module):
     ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, C]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            x_vid(Tensor): Video hidden states with shape [B, L, C].
+            x_audio(Tensor): Audio hidden states with shape [B, L, C].
+            seq_lens_vid(Tensor): Video sequence lengths with shape [B].
+            seq_lens_audio(Tensor): Audio sequence lengths with shape [B].
+            grid_sizes_vid(Tensor): Video grid sizes with shape [B, 3], containing (F, H, W).
+            grid_sizes_audio(Tensor): Audio grid sizes.
+            freqs_vid(Tensor): Video RoPE frequencies.
+            freqs_audio(Tensor): Audio RoPE frequencies.
+            max_seq_len_vid(int): Maximum video sequence length.
+            max_seq_len_audio(int): Maximum audio sequence length.
+            use_joint_attention(bool): Whether to run joint audio-video attention.
         """
         if x_vid is not None and x_audio is None:
             return self._single_forward(x_vid, seq_lens_vid, grid_sizes_vid, freqs_vid, is_audio=False), None
@@ -528,9 +536,15 @@ class WanSelfAttention(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            seq_lens_vid(Tensor): Video sequence lengths with shape [B].
+            seq_lens_audio(Tensor): Audio sequence lengths with shape [B].
+            grid_sizes_vid(Tensor): Video grid sizes with shape [B, 3], containing (F, H, W).
+            grid_sizes_audio(Tensor): Audio grid sizes.
+            freqs_vid(Tensor): Video RoPE frequencies.
+            freqs_audio(Tensor): Audio RoPE frequencies.
+            max_seq_len_vid(int): Maximum video sequence length.
+            max_seq_len_audio(int): Maximum audio sequence length.
+            use_joint_attention(bool): Whether to run joint audio-video attention.
         """
         if max_seq_len_vid > 0 and max_seq_len_audio == 0:
             return self._single_forward(x, seq_lens_vid, grid_sizes_vid, freqs_vid)
@@ -662,6 +676,7 @@ class WanT2VDoubleStreamCrossAttention(WanDoubleStreamSelfAttention):
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            is_audio(bool): Whether to use the audio attention projections.
         """
         q, k, v = self._qkv_fn(x, context) if not is_audio else self._qkv_fn_audio(x, context)
 
@@ -676,9 +691,11 @@ class WanT2VDoubleStreamCrossAttention(WanDoubleStreamSelfAttention):
     def forward(self, x_vid, x_audio, context, context_lens, vid_seq_len=None):
         r"""
         Args:
-            x(Tensor): Shape [B, L1, C]
+            x_vid(Tensor): Video hidden states with shape [B, L1, C].
+            x_audio(Tensor): Audio hidden states with shape [B, L1, C].
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            vid_seq_len(int): Video sequence length when splitting concatenated output.
         """
         if x_vid is not None and x_audio is not None:
             q, k, v = self._qkv_fn(x_vid, context)
@@ -790,10 +807,19 @@ class WanDoubleStreamAttentionBlock(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, L1, 6, C]
-            seq_lens(Tensor): Shape [B], length of each sequence in batch
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            e_vid(Tensor): Video modulation tensor with shape [B, L1, 6, C].
+            e_audio(Tensor): Audio modulation tensor with shape [B, L1, 6, C].
+            freqs_vid(Tensor): Video RoPE frequencies.
+            freqs_audio(Tensor): Audio RoPE frequencies.
+            context(Tensor): Text context tensor with shape [B, L2, C].
+            context_lens(Tensor): Text context lengths with shape [B].
+            seq_lens_vid(Tensor): Video sequence lengths with shape [B].
+            seq_lens_audio(Tensor): Audio sequence lengths with shape [B].
+            grid_sizes_vid(Tensor): Video grid sizes with shape [B, 3], containing (F, H, W).
+            grid_sizes_audio(Tensor): Audio grid sizes.
+            max_seq_len_vid(int): Maximum video sequence length.
+            max_seq_len_audio(int): Maximum audio sequence length.
+            masking_modality(bool): Whether modality masking is enabled.
         """
         # has video input
         x_vid, x_audio = None, None
@@ -948,10 +974,19 @@ class WanAttentionBlock(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, L1, 6, C]
-            seq_lens(Tensor): Shape [B], length of each sequence in batch
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            e_vid(Tensor): Video modulation tensor with shape [B, L1, 6, C].
+            e_audio(Tensor): Audio modulation tensor with shape [B, L1, 6, C].
+            freqs_vid(Tensor): Video RoPE frequencies.
+            freqs_audio(Tensor): Audio RoPE frequencies.
+            context(Tensor): Text context tensor with shape [B, L2, C].
+            context_lens(Tensor): Text context lengths with shape [B].
+            seq_lens_vid(Tensor): Video sequence lengths with shape [B].
+            seq_lens_audio(Tensor): Audio sequence lengths with shape [B].
+            grid_sizes_vid(Tensor): Video grid sizes with shape [B, 3], containing (F, H, W).
+            grid_sizes_audio(Tensor): Audio grid sizes.
+            max_seq_len_vid(int): Maximum video sequence length.
+            max_seq_len_audio(int): Maximum audio sequence length.
+            masking_modality(bool): Whether modality masking is enabled.
         """
         if not self.split_av_qk_norm_modulation:
             if max_seq_len_vid > 0 and max_seq_len_audio > 0:
@@ -1121,8 +1156,10 @@ class WanAVModel(nn.Module):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
                 Fixed length for text embeddings
-            in_dim (`int`, *optional*, defaults to 16):
+            vid_in_dim (`int`, *optional*, defaults to 16):
                 Input video channels (C_in)
+            audio_in_dim (`int`, *optional*, defaults to 16):
+                Input audio channels (C_in)
             dim (`int`, *optional*, defaults to 2048):
                 Hidden dimension of the transformer
             ffn_dim (`int`, *optional*, defaults to 8192):
@@ -1131,8 +1168,10 @@ class WanAVModel(nn.Module):
                 Dimension for sinusoidal time embeddings
             text_dim (`int`, *optional*, defaults to 4096):
                 Input dimension for text embeddings
-            out_dim (`int`, *optional*, defaults to 16):
+            vid_out_dim (`int`, *optional*, defaults to 16):
                 Output video channels (C_out)
+            audio_out_dim (`int`, *optional*, defaults to 16):
+                Output audio channels (C_out)
             num_heads (`int`, *optional*, defaults to 16):
                 Number of attention heads
             num_layers (`int`, *optional*, defaults to 32):
@@ -1436,16 +1475,28 @@ class WanAVModel(nn.Module):
         Forward pass through the diffusion model
 
         Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-                OR
-                List of input audio tensors, each with shape [L, C_in]
+            vid (List[Tensor]):
+                List of input video tensors, each with shape [C_in, F, H, W].
+            audio (List[Tensor]):
+                List of input audio tensors, each with shape [L, C_in].
             t (Tensor):
                 Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
+            vid_context (List[Tensor]):
+                List of video text embeddings, each with shape [L, C].
+            audio_context (List[Tensor]):
+                List of audio text embeddings, each with shape [L, C].
+            vid_seq_len (int):
+                Maximum video sequence length for positional encoding.
+            audio_seq_len (int):
+                Maximum audio sequence length for positional encoding.
+            spk_embed (Tensor):
+                Optional speaker embedding.
+            spk_pos (Tensor):
+                Optional speaker embedding position.
+            masking_modality (bool):
+                Whether modality masking is enabled.
+            first_frame_is_clean (bool):
+                Whether first-frame conditioning should stay clean.
         Returns:
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
