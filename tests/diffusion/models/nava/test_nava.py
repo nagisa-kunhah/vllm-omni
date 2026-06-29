@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
 from vllm_omni.diffusion.models.nava.utils import image_to_tensor
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
+from vllm_omni.diffusion.models.nava.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _DIFFUSION_POST_PROCESS_FUNCS, _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -691,6 +692,131 @@ def test_audio_vae_checkpoint_key_mapping() -> None:
     )
 
 
+def test_nava_production_code_does_not_import_diffusers_pipelines() -> None:
+    forbidden = "diffusers" + ".pipelines"
+    for relative_path in (
+        "vllm_omni/diffusion/models/nava/audio_vae.py",
+        "vllm_omni/diffusion/models/nava/vocoder.py",
+    ):
+        source = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert forbidden not in source
+
+
+def test_local_vocoder_state_dict_keys_match_checkpoint_mapper() -> None:
+    vocoder = LTX2Vocoder(
+        in_channels=4,
+        hidden_channels=8,
+        out_channels=1,
+        upsample_kernel_sizes=[4],
+        upsample_factors=[2],
+        resnet_kernel_sizes=[3],
+        resnet_dilations=[[1]],
+        act_fn="snakebeta",
+        final_act_fn=None,
+        final_bias=False,
+    )
+    expected = vocoder.state_dict()
+    assert nava_audio_vae._map_vocoder_key("vocoder.conv_pre.weight", with_bwe=False) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.ups.0.weight", with_bwe=False) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.resblocks.0.convs1.0.weight", with_bwe=False) in expected
+
+    bwe_vocoder = LTX2VocoderWithBWE(
+        in_channels=4,
+        hidden_channels=8,
+        out_channels=1,
+        upsample_kernel_sizes=[4],
+        upsample_factors=[2],
+        resnet_kernel_sizes=[3],
+        resnet_dilations=[[1]],
+        act_fn="snakebeta",
+        final_act_fn=None,
+        final_bias=False,
+        bwe_in_channels=4,
+        bwe_hidden_channels=8,
+        bwe_out_channels=1,
+        bwe_upsample_kernel_sizes=[8],
+        bwe_upsample_factors=[4],
+        bwe_resnet_kernel_sizes=[3],
+        bwe_resnet_dilations=[[1]],
+        bwe_act_fn="snakebeta",
+        bwe_final_act_fn=None,
+        bwe_final_bias=False,
+        filter_length=4,
+        hop_length=2,
+        window_length=4,
+        num_mel_channels=4,
+        input_sampling_rate=8000,
+        output_sampling_rate=16000,
+    )
+    expected = bwe_vocoder.state_dict()
+    assert nava_audio_vae._map_vocoder_key("vocoder.vocoder.conv_pre.weight", with_bwe=True) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight", with_bwe=True) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.mel_basis", with_bwe=True) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.stft_fn.forward_basis", with_bwe=True) in expected
+
+
+def test_local_vocoder_matches_diffusers_small_model() -> None:
+    diffusers_vocoder = pytest.importorskip("diffusers.pipelines.ltx2.vocoder")
+    kwargs = {
+        "in_channels": 4,
+        "hidden_channels": 8,
+        "out_channels": 1,
+        "upsample_kernel_sizes": [4],
+        "upsample_factors": [2],
+        "resnet_kernel_sizes": [3],
+        "resnet_dilations": [[1]],
+        "act_fn": "snakebeta",
+        "final_act_fn": None,
+        "final_bias": False,
+    }
+    torch.manual_seed(123)
+    local = LTX2Vocoder(**kwargs)
+    reference = diffusers_vocoder.LTX2Vocoder(**kwargs)
+    reference.load_state_dict(local.state_dict())
+    hidden_states = torch.randn(2, 2, 3, 2)
+
+    torch.testing.assert_close(local(hidden_states), reference(hidden_states), rtol=1e-5, atol=1e-6)
+
+
+def test_local_bwe_vocoder_matches_diffusers_small_model() -> None:
+    diffusers_vocoder = pytest.importorskip("diffusers.pipelines.ltx2.vocoder")
+    kwargs = {
+        "in_channels": 4,
+        "hidden_channels": 8,
+        "out_channels": 1,
+        "upsample_kernel_sizes": [4],
+        "upsample_factors": [2],
+        "resnet_kernel_sizes": [3],
+        "resnet_dilations": [[1]],
+        "act_fn": "snakebeta",
+        "final_act_fn": None,
+        "final_bias": False,
+        "bwe_in_channels": 4,
+        "bwe_hidden_channels": 8,
+        "bwe_out_channels": 1,
+        "bwe_upsample_kernel_sizes": [8],
+        "bwe_upsample_factors": [4],
+        "bwe_resnet_kernel_sizes": [3],
+        "bwe_resnet_dilations": [[1]],
+        "bwe_act_fn": "snakebeta",
+        "bwe_final_act_fn": None,
+        "bwe_final_bias": False,
+        "filter_length": 4,
+        "hop_length": 2,
+        "window_length": 4,
+        "num_mel_channels": 4,
+        "input_sampling_rate": 8000,
+        "output_sampling_rate": 16000,
+    }
+    torch.manual_seed(123)
+    local = LTX2VocoderWithBWE(**kwargs)
+    reference = diffusers_vocoder.LTX2VocoderWithBWE(**kwargs)
+    reference.load_state_dict(local.state_dict())
+    hidden_states = torch.randn(2, 2, 3, 2)
+
+    torch.testing.assert_close(local(hidden_states), reference(hidden_states), rtol=1e-5, atol=1e-6)
+
+
 def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     class TinyAudioDecoder(nn.Module):
         def __init__(self) -> None:
@@ -726,8 +852,42 @@ def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, t
     assert waveform.shape == (1, 2, 12)
 
 
+def test_audio_vae_decode_resamples_from_vocoder_output_rate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class TinyAudioDecoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+            self.config = SimpleNamespace(latent_channels=2)
+
+        def decode(self, latents: torch.Tensor, return_dict: bool = False):
+            return (torch.ones(latents.shape[0], 2, latents.shape[2], 2, device=latents.device),)
+
+    class TinyVocoder(nn.Module):
+        output_sampling_rate = 8000
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+
+        def forward(self, mel: torch.Tensor) -> torch.Tensor:
+            return torch.ones(mel.shape[0], 2, 8, device=mel.device)
+
+    monkeypatch.setattr(NAVAAudioVAE, "_load_components", staticmethod(lambda _: (TinyAudioDecoder(), TinyVocoder())))
+    ckpt_dir = tmp_path / "params" / "LTX2"
+    ckpt_dir.mkdir(parents=True)
+    (ckpt_dir / "ltx-2.3-22b-dev_audio_vae.safetensors").write_bytes(b"placeholder")
+
+    audio_vae = NAVAAudioVAE(str(tmp_path), NAVAConfig(audio_vae_ckpt_dir="params", audio_sample_rate=16000))
+    waveform = audio_vae.decode(torch.zeros(1, 3, 4))
+
+    assert waveform.shape == (1, 2, 16)
+
+
 @pytest.mark.parametrize(
-    ("request", "negative", "align", "timbre", "expected"),
+    ("omni_request", "negative", "align", "timbre", "expected"),
     [
         (
             _make_request(
@@ -773,14 +933,14 @@ def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, t
 )
 def test_cfg_combine_video_audio_guidance(
     tmp_path: Path,
-    request: OmniDiffusionRequest,
+    omni_request: OmniDiffusionRequest,
     negative: dict[str, torch.Tensor] | None,
     align: dict[str, torch.Tensor] | None,
     timbre: dict[str, torch.Tensor] | None,
     expected: dict[str, torch.Tensor],
 ) -> None:
     pipeline = _make_pipeline(tmp_path)
-    ctx = pipeline._parse_request(request)
+    ctx = pipeline._parse_request(omni_request)
 
     out = pipeline._combine_guidance(
         ctx,

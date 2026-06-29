@@ -125,13 +125,12 @@ def _nava_attention(
 
     if window_size != (-1, -1):
         warnings.warn("Sliding-window attention is ignored by the scaled_dot_product_attention fallback.")
-    q_sdpa = q if q.dtype in half_dtypes else q.to(dtype)
-    q_sdpa = q_sdpa.to(v.dtype)
-    k_sdpa = k if k.dtype in half_dtypes else k.to(dtype)
-    k_sdpa = k_sdpa.to(v.dtype)
-    v_sdpa = v if v.dtype in half_dtypes else v.to(dtype)
+    compute_dtype = v.dtype if v.dtype in half_dtypes else dtype
+    q_sdpa = q.to(compute_dtype)
+    k_sdpa = k.to(compute_dtype)
+    v_sdpa = v.to(compute_dtype)
     if q_scale is not None:
-        q_sdpa = q_sdpa * q_scale
+        q_sdpa = (q_sdpa * q_scale).to(compute_dtype)
 
     chunks = []
     for index in range(batch):
