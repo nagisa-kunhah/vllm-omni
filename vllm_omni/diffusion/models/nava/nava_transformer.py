@@ -149,7 +149,23 @@ def _nava_attention(
             key_item = key_item.repeat_interleave(repeat, dim=1)
             value_item = value_item.repeat_interleave(repeat, dim=1)
         sdpa_context = sdpa_kernel(_NAVA_CUDA_SDPA_BACKENDS) if query_item.is_cuda else nullcontext()
-        with sdpa_context:
+        try:
+            with sdpa_context:
+                output = F.scaled_dot_product_attention(
+                    query_item,
+                    key_item,
+                    value_item,
+                    attn_mask=None,
+                    dropout_p=dropout_p,
+                    is_causal=causal,
+                    scale=softmax_scale,
+                )
+        except RuntimeError as e:
+            if not query_item.is_cuda or "No available kernel" not in str(e):
+                raise
+            logger.warning_once(
+                "cuDNN SDPA rejected this NAVA attention shape; falling back to default SDPA dispatcher."
+            )
             output = F.scaled_dot_product_attention(
                 query_item,
                 key_item,
