@@ -14,6 +14,7 @@ from safetensors.torch import load_file
 from torch import nn
 
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
+from vllm_omni.diffusion.models.nava.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
 
 
 def _read_safetensors_config(path: str) -> dict[str, Any]:
@@ -195,7 +196,6 @@ class NAVAAudioVAE(nn.Module):
     @staticmethod
     def _load_components(checkpoint_path: str):
         from diffusers import AutoencoderKLLTX2Audio
-        from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
 
         metadata = _read_safetensors_config(checkpoint_path)
         checkpoint = load_file(checkpoint_path, device="cpu")
