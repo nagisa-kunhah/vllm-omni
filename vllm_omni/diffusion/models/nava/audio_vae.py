@@ -12,9 +12,12 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 from vllm_omni.diffusion.models.nava.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
+
+logger = init_logger(__name__)
 
 
 def _read_safetensors_config(path: str) -> dict[str, Any]:
@@ -155,7 +158,20 @@ def _load_mapped_state(module: nn.Module, checkpoint: dict[str, torch.Tensor], m
             mapped[mapped_key] = value
     if not mapped:
         raise ValueError(f"No compatible NAVA audio checkpoint tensors found for {module.__class__.__name__}.")
-    module.load_state_dict(mapped, strict=False)
+    load_result = module.load_state_dict(mapped, strict=False)
+    if load_result.missing_keys:
+        missing = sorted(load_result.missing_keys)
+        preview = ", ".join(missing[:20])
+        if len(missing) > 20:
+            preview += ", ..."
+        logger.warning(
+            "NAVA audio checkpoint loaded %d/%d tensors for %s; missing %d tensor(s): %s",
+            len(mapped),
+            len(expected),
+            module.__class__.__name__,
+            len(missing),
+            preview,
+        )
 
 
 class NAVAAudioVAE(nn.Module):

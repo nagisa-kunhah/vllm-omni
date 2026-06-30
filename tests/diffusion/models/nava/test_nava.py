@@ -686,6 +686,20 @@ def test_audio_vae_checkpoint_key_mapping() -> None:
     )
 
 
+def test_load_mapped_state_warns_for_partial_checkpoint(monkeypatch) -> None:
+    module = nn.Linear(2, 2)
+    checkpoint = {"weight": torch.ones_like(module.weight)}
+    warnings = []
+
+    monkeypatch.setattr(nava_audio_vae.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+
+    nava_audio_vae._load_mapped_state(module, checkpoint, lambda key: key)
+
+    assert len(warnings) == 1
+    assert "loaded 1/2 tensors" in warnings[0]
+    assert "bias" in warnings[0]
+
+
 def test_antialias_act1d_string_snake_uses_non_beta_activation() -> None:
     act = AntiAliasAct1d("snake", channels=4)
 
