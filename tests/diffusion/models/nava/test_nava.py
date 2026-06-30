@@ -680,10 +680,8 @@ def test_video_vae_decode_reshapes_latent_frames_and_trims_output() -> None:
 
 def test_audio_vae_checkpoint_key_mapping() -> None:
     assert nava_audio_vae._map_audio_vae_key("audio_vae.decoder.conv_in.conv.weight") == ("decoder.conv_in.conv.weight")
-    assert nava_audio_vae._map_vocoder_key("vocoder.vocoder.conv_pre.weight", with_bwe=True) == (
-        "vocoder.conv_in.weight"
-    )
-    assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight", with_bwe=True) == (
+    assert nava_audio_vae._map_vocoder_key("vocoder.vocoder.conv_pre.weight") == "vocoder.conv_in.weight"
+    assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight") == (
         "bwe_generator.upsamplers.0.weight"
     )
 
@@ -712,9 +710,9 @@ def test_local_vocoder_state_dict_keys_match_checkpoint_mapper() -> None:
         final_bias=False,
     )
     expected = vocoder.state_dict()
-    assert nava_audio_vae._map_vocoder_key("vocoder.conv_pre.weight", with_bwe=False) in expected
-    assert nava_audio_vae._map_vocoder_key("vocoder.ups.0.weight", with_bwe=False) in expected
-    assert nava_audio_vae._map_vocoder_key("vocoder.resblocks.0.convs1.0.weight", with_bwe=False) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.conv_pre.weight") in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.ups.0.weight") in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.resblocks.0.convs1.0.weight") in expected
 
     bwe_vocoder = LTX2VocoderWithBWE(
         in_channels=4,
@@ -745,10 +743,10 @@ def test_local_vocoder_state_dict_keys_match_checkpoint_mapper() -> None:
         output_sampling_rate=16000,
     )
     expected = bwe_vocoder.state_dict()
-    assert nava_audio_vae._map_vocoder_key("vocoder.vocoder.conv_pre.weight", with_bwe=True) in expected
-    assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight", with_bwe=True) in expected
-    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.mel_basis", with_bwe=True) in expected
-    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.stft_fn.forward_basis", with_bwe=True) in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.vocoder.conv_pre.weight") in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight") in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.mel_basis") in expected
+    assert nava_audio_vae._map_vocoder_key("vocoder.mel_stft.stft_fn.forward_basis") in expected
 
 
 def test_local_vocoder_matches_diffusers_small_model() -> None:
