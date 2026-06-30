@@ -579,6 +579,66 @@ def test_speaker_encoder_loads_wav_file_without_torchcodec(tmp_path: Path) -> No
     assert waveform.dtype == torch.float32
 
 
+def test_speaker_encoder_missing_wav_file_does_not_fallback_to_torchaudio(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    speaker_encoder = NAVASpeakerEncoder(str(tmp_path), NAVAConfig())
+
+    def fail_load(path: str) -> tuple[torch.Tensor, int]:
+        raise AssertionError(f"torchaudio fallback should not run for missing file: {path}")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.speaker.torchaudio.load", fail_load)
+
+    with pytest.raises(FileNotFoundError):
+        speaker_encoder._load_waveform_file(str(tmp_path / "missing.wav"))
+
+
+def test_speaker_encoder_unreadable_wav_file_does_not_fallback_to_torchaudio(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wav_path = tmp_path / "speaker.wav"
+    wav_path.write_bytes(b"not a wav")
+    speaker_encoder = NAVASpeakerEncoder(str(tmp_path), NAVAConfig())
+
+    def fail_load(path: str) -> tuple[torch.Tensor, int]:
+        raise AssertionError(f"torchaudio fallback should not run for unreadable file: {path}")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.speaker.os.access", lambda path, mode: False)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.speaker.torchaudio.load", fail_load)
+
+    with pytest.raises(PermissionError):
+        speaker_encoder._load_waveform_file(str(wav_path))
+
+
+def test_speaker_encoder_soundfile_decode_error_falls_back_to_torchaudio(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sf = pytest.importorskip("soundfile")
+    wav_path = tmp_path / "speaker.wav"
+    wav_path.write_bytes(b"not a wav")
+    speaker_encoder = NAVASpeakerEncoder(str(tmp_path), NAVAConfig())
+    expected_waveform = torch.ones(1, 4)
+
+    def fail_read(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise sf.LibsndfileError(1, "Format not recognised.")
+
+    def fake_load(path: str) -> tuple[torch.Tensor, int]:
+        assert path == str(wav_path)
+        return expected_waveform, 16000
+
+    monkeypatch.setattr(sf, "read", fail_read)
+    monkeypatch.setattr("vllm_omni.diffusion.models.nava.speaker.torchaudio.load", fake_load)
+
+    waveform, sample_rate = speaker_encoder._load_waveform_file(str(wav_path))
+
+    assert waveform is expected_waveform
+    assert sample_rate == 16000
+
+
 def test_speaker_encoder_uses_torch_home_redimnet_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

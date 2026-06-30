@@ -92,13 +92,25 @@ class NAVASpeakerEncoder(nn.Module):
         return waveform.to(device)
 
     def _load_waveform_file(self, path: str) -> tuple[torch.Tensor, int]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        if os.path.isdir(path):
+            raise IsADirectoryError(path)
+        if not os.access(path, os.R_OK):
+            raise PermissionError(path)
+
         try:
             import soundfile as sf
-
-            waveform, sample_rate = sf.read(path, dtype="float32", always_2d=True)
-            return torch.from_numpy(waveform.T.copy()), int(sample_rate)
-        except Exception:
+        except ImportError:
             return torchaudio.load(path)
+
+        try:
+            waveform, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+        except (FileNotFoundError, PermissionError, OSError):
+            raise
+        except sf.LibsndfileError:
+            return torchaudio.load(path)
+        return torch.from_numpy(waveform.T.copy()), int(sample_rate)
 
     @staticmethod
     def _resample(waveform: torch.Tensor, *, orig_freq: int, new_freq: int) -> torch.Tensor:
