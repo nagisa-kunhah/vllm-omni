@@ -30,6 +30,7 @@ class NAVAVideoVAE(nn.Module):
             scale_dtype=torch.float32,
             autocast_dtype=torch.float32,
         )
+        self.vae.requires_grad_(False).eval()
 
     def encode_first_frame(self, image: torch.Tensor) -> torch.Tensor:
         if image.ndim != 4:
