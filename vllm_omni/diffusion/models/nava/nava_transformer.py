@@ -24,7 +24,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.models.nava.config import NAVAConfig
 
 logger = init_logger(__name__)
@@ -91,8 +90,10 @@ class WanLayerNorm(nn.LayerNorm):
         return super().forward(x.bfloat16()).type_as(x)
 
 
+# TODO: Wire NAVA through vLLM-Omni's Attention layer when enabling native
+# TP/SP/CFG support. This local SDPA fallback preserves upstream NAVA behavior
+# but intentionally bypasses framework attention sharding hooks.
 def _nava_attention(
-    attn: Attention,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -322,14 +323,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
         self.o_audio = nn.Linear(dim, dim)
         self.norm_q_audio = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k_audio = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn = Attention(
-            num_heads=num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            softmax_scale=1.0 / (self.head_dim**0.5),
-            role="self",
-            qkv_layout="BSND",
-        )
 
     # query, key, value function
     def _qkv_fn(self, x):
@@ -360,7 +353,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
         q, k, v = self._qkv_fn(x) if not is_audio else self._qkv_fn_audio(x)
 
         x = _nava_attention(
-            self.attn,
             q=_rope_apply(q, grid_sizes, freqs),
             k=_rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -438,7 +430,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 k_shifted = torch.gather(k_rope, dim=1, index=gather_indices_expanded)
                 v_shifted = torch.gather(v, dim=1, index=gather_indices_expanded)
                 x_shifted = _nava_attention(
-                    self.attn,
                     q=q_shifted,
                     k=k_shifted,
                     v=v_shifted,
@@ -454,7 +445,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                 x = torch.gather(x_shifted, dim=1, index=scatter_indices_expanded)
             else:
                 x_vid = _nava_attention(
-                    self.attn,
                     q=_rope_apply(q_vid, grid_sizes_vid, freqs_vid),
                     k=_rope_apply(k_vid, grid_sizes_vid, freqs_vid),
                     v=v_vid,
@@ -462,7 +452,6 @@ class WanDoubleStreamSelfAttention(nn.Module):
                     window_size=self.window_size,
                 )
                 x_audio = _nava_attention(
-                    self.attn,
                     q=_rope_apply(q_audio, grid_sizes_audio, freqs_audio),
                     k=_rope_apply(k_audio, grid_sizes_audio, freqs_audio),
                     v=v_audio,
@@ -495,14 +484,6 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn = Attention(
-            num_heads=num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            softmax_scale=1.0 / (self.head_dim**0.5),
-            role="self",
-            qkv_layout="BSND",
-        )
 
     # query, key, value function
     def _qkv_fn(self, x):
@@ -523,7 +504,6 @@ class WanSelfAttention(nn.Module):
         """
         q, k, v = self._qkv_fn(x)
         x = _nava_attention(
-            self.attn,
             q=_rope_apply(q, grid_sizes, freqs),
             k=_rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -591,7 +571,6 @@ class WanSelfAttention(nn.Module):
                 v_shifted = torch.gather(v, dim=1, index=gather_indices_expanded)
 
                 x_shifted = _nava_attention(
-                    self.attn,
                     q=q_shifted,
                     k=k_shifted,
                     v=v_shifted,
@@ -613,7 +592,6 @@ class WanSelfAttention(nn.Module):
                     v[:, max_seq_len_vid:, :],
                 )
                 x_vid = _nava_attention(
-                    self.attn,
                     q=_rope_apply(q_vid, grid_sizes_vid, freqs_vid),
                     k=_rope_apply(k_vid, grid_sizes_vid, freqs_vid),
                     v=v_vid,
@@ -621,7 +599,6 @@ class WanSelfAttention(nn.Module):
                     window_size=self.window_size,
                 )
                 x_audio = _nava_attention(
-                    self.attn,
                     q=_rope_apply(q_audio, grid_sizes_audio, freqs_audio),
                     k=_rope_apply(k_audio, grid_sizes_audio, freqs_audio),
                     v=v_audio,
@@ -656,7 +633,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         q, k, v = self._qkv_fn(x, context)
 
         # compute attention
-        x = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
+        x = _nava_attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -696,7 +673,7 @@ class WanT2VDoubleStreamCrossAttention(WanDoubleStreamSelfAttention):
         q, k, v = self._qkv_fn(x, context) if not is_audio else self._qkv_fn_audio(x, context)
 
         # compute attention
-        x = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
+        x = _nava_attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -717,8 +694,8 @@ class WanT2VDoubleStreamCrossAttention(WanDoubleStreamSelfAttention):
             q_audio, k_audio, v_audio = self._qkv_fn_audio(x_audio, context)
 
             # compute attention
-            x_vid = _nava_attention(self.attn, q, k, v, k_lens=context_lens)
-            x_audio = _nava_attention(self.attn, q_audio, k_audio, v_audio, k_lens=context_lens)
+            x_vid = _nava_attention(q, k, v, k_lens=context_lens)
+            x_audio = _nava_attention(q_audio, k_audio, v_audio, k_lens=context_lens)
 
             # output
             x_vid = x_vid.flatten(2)

@@ -18,7 +18,6 @@ from PIL import Image
 from torch import nn
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output, supports_multimodal_input
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -330,13 +329,10 @@ def test_config_normalizes_output_frames_to_vae_stride() -> None:
     assert cfg.video_output_frames(3) == 9
 
 
-def test_transformer_self_attention_owns_shared_attention_layer() -> None:
-    od_config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="TORCH_SDPA")
+def test_transformer_self_attention_does_not_create_unused_framework_attention() -> None:
+    attention = WanSelfAttention(dim=8, num_heads=2)
 
-    with set_current_diffusion_config(od_config):
-        attention = WanSelfAttention(dim=8, num_heads=2)
-
-    assert attention.attn.__class__.__name__ == "Attention"
+    assert not hasattr(attention, "attn")
 
 
 def test_nava_attention_uses_local_length_sliced_fallback() -> None:
@@ -346,7 +342,7 @@ def test_nava_attention_uses_local_length_sliced_fallback() -> None:
     v = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
     key_lens = torch.tensor([5, 3], dtype=torch.long)
 
-    output = _nava_attention(None, q, k, v, k_lens=key_lens)
+    output = _nava_attention(q, k, v, k_lens=key_lens)
     expected = []
     q_ref = q.to(torch.bfloat16)
     k_ref = k.to(torch.bfloat16)
@@ -371,7 +367,7 @@ def test_nava_attention_warns_for_ignored_sliding_window() -> None:
     v = torch.randn(1, 3, 2, 4)
 
     with pytest.warns(UserWarning, match="Sliding-window attention is ignored"):
-        output = _nava_attention(None, q, k, v, window_size=(2, 2))
+        output = _nava_attention(q, k, v, window_size=(2, 2))
 
     assert output.shape == q.shape
 
