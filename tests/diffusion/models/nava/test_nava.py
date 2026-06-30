@@ -37,7 +37,7 @@ from vllm_omni.diffusion.models.nava.scheduler import NAVAFlowMatchScheduler
 from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
 from vllm_omni.diffusion.models.nava.utils import image_to_tensor
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
-from vllm_omni.diffusion.models.nava.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
+from vllm_omni.diffusion.models.nava.vocoder import AntiAliasAct1d, LTX2Vocoder, LTX2VocoderWithBWE, SnakeBeta
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS, _DIFFUSION_POST_PROCESS_FUNCS, _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -684,6 +684,20 @@ def test_audio_vae_checkpoint_key_mapping() -> None:
     assert nava_audio_vae._map_vocoder_key("vocoder.bwe_generator.ups.0.weight") == (
         "bwe_generator.upsamplers.0.weight"
     )
+
+
+def test_antialias_act1d_string_snake_uses_non_beta_activation() -> None:
+    act = AntiAliasAct1d("snake", channels=4)
+
+    assert isinstance(act.act, SnakeBeta)
+    assert act.act.use_beta is False
+
+
+def test_antialias_act1d_string_snakebeta_uses_beta_activation() -> None:
+    act = AntiAliasAct1d("snakebeta", channels=4)
+
+    assert isinstance(act.act, SnakeBeta)
+    assert act.act.use_beta is True
 
 
 def test_nava_production_code_does_not_import_diffusers_pipelines() -> None:

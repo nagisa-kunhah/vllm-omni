@@ -175,9 +175,9 @@ class AntiAliasAct1d(nn.Module):
         self.upsample = UpSample1d(ratio=ratio, kernel_size=kernel_size)
         if isinstance(act_fn, str):
             if act_fn == "snakebeta":
-                act_fn = SnakeBeta(**kwargs)
+                act_fn = SnakeBeta(use_beta=True, **kwargs)
             elif act_fn == "snake":
-                act_fn = SnakeBeta(**kwargs)
+                act_fn = SnakeBeta(use_beta=False, **kwargs)
             else:
                 act_fn = nn.LeakyReLU(**kwargs)
         self.act = act_fn
