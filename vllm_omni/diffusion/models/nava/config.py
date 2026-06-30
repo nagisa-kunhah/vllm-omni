@@ -188,10 +188,6 @@ def parse_speech_spans(prompt: str) -> list[str]:
     return [match.group(1) for match in _SPEECH_SPAN_RE.finditer(prompt or "")]
 
 
-def count_speech_spans(prompt: str) -> int:
-    return len(parse_speech_spans(prompt))
-
-
 def inject_speaker_sentinel(prompt: str) -> str:
     return (prompt or "").replace("<S>", "<S><extra_id_2>")
 
