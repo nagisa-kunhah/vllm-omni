@@ -246,7 +246,7 @@ def test_custom_pipeline_args_without_component_keys_do_not_inject_missing_compo
     assert pipeline.transformer is transformer
 
 
-def test_default_text_encoder_compile_matches_upstream(
+def test_text_encoder_compile_defaults_to_eager_for_serving(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -259,7 +259,13 @@ def test_default_text_encoder_compile_matches_upstream(
 
     _patch_native_components(monkeypatch, text_encoder=make_text_encoder)
 
-    for custom_args in ({}, {"nava_text_encoder_compile": False}, {"disable_text_encoder_compile": True}):
+    for custom_args in (
+        {},
+        {"nava_text_encoder_compile": True},
+        {"nava_text_encoder_compile": False},
+        {"disable_text_encoder_compile": False},
+        {"disable_text_encoder_compile": True},
+    ):
         NAVAPipeline(
             od_config=OmniDiffusionConfig(
                 model=str(tmp_path),
@@ -268,7 +274,7 @@ def test_default_text_encoder_compile_matches_upstream(
             )
         )
 
-    assert captured == [True, False, False]
+    assert captured == [False, True, False, True, False]
 
 
 @pytest.mark.parametrize(

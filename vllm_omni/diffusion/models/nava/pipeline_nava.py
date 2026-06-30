@@ -193,7 +193,7 @@ class NAVAPipeline(
 
     def _init_native_components(self) -> None:
         model_root = self._require_local_model_root()
-        text_compile = as_bool(self._custom_pipeline_arg("nava_text_encoder_compile", True))
+        text_compile = as_bool(self._custom_pipeline_arg("nava_text_encoder_compile", False))
         if self._custom_pipeline_arg("disable_text_encoder_compile") is not None:
             text_compile = not as_bool(self._custom_pipeline_arg("disable_text_encoder_compile"))
         self.text_encoder = _NAVATextEncoder(

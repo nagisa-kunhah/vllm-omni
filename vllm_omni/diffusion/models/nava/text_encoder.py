@@ -193,7 +193,7 @@ class NAVAWanTextEncoder(nn.Module):
         config: NAVAConfig,
         device: torch.device,
         *,
-        compile_model: bool = True,
+        compile_model: bool = False,
     ) -> None:
         super().__init__()
         from transformers import AutoTokenizer
