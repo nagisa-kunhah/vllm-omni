@@ -125,12 +125,10 @@ def _map_audio_vae_key(key: str) -> str | None:
     return None
 
 
-def _map_vocoder_key(key: str, *, with_bwe: bool) -> str | None:
+def _map_vocoder_key(key: str) -> str | None:
     if not key.startswith("vocoder."):
         return None
     key = key.removeprefix("vocoder.")
-    if with_bwe:
-        key = key.replace("vocoder.", "vocoder.", 1)
     return _map_single_vocoder_key(key)
 
 
@@ -204,5 +202,5 @@ class NAVAAudioVAE(nn.Module):
         vocoder_cls = LTX2VocoderWithBWE if with_bwe else LTX2Vocoder
         vocoder = vocoder_cls(**vocoder_kwargs)
         _load_mapped_state(audio_vae, checkpoint, _map_audio_vae_key)
-        _load_mapped_state(vocoder, checkpoint, lambda key: _map_vocoder_key(key, with_bwe=with_bwe))
+        _load_mapped_state(vocoder, checkpoint, _map_vocoder_key)
         return audio_vae, vocoder
