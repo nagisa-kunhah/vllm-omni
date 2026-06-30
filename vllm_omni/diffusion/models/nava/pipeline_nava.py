@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.nava.speaker import NAVASpeakerEncoder
 from vllm_omni.diffusion.models.nava.text_encoder import NAVAWanTextEncoder as _NAVATextEncoder
 from vllm_omni.diffusion.models.nava.utils import as_bool, image_to_tensor, resolve_num_frames
 from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -79,6 +80,7 @@ class NAVAPipeline(
     SupportAudioInput,
     SupportAudioOutput,
     SupportsComponentDiscovery,
+    ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
 ):
     support_image_input: ClassVar[bool] = True
@@ -483,69 +485,71 @@ class NAVAPipeline(
         timesteps = self.scheduler.set_timesteps(ctx.num_steps, device=self.device)
         self.scheduler_audio.set_timesteps(ctx.num_steps, device=self.device)
         video_grid = self._video_grid(ctx)
-        for step_index, timestep in enumerate(timesteps):
-            timestep_tensor = timestep.reshape(1)
-            positive = self.transformer(
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                timestep=timestep_tensor,
-                text_embeds=text_embeds,
-                image_embeds=image_embeds,
-                speaker_embeds=speaker_embeds,
-                speaker_positions=speaker_positions,
-                video_grid=video_grid,
-                step_index=step_index,
-            )
-            negative = None
-            if negative_video_text_embeds is not None and negative_audio_text_embeds is not None:
-                negative = self.transformer(
-                    video_latents=video_latents,
-                    audio_latents=audio_latents,
-                    timestep=timestep_tensor,
-                    text_embeds=negative_video_text_embeds,
-                    audio_text_embeds=negative_audio_text_embeds,
-                    image_embeds=image_embeds,
-                    speaker_embeds=None,
-                    speaker_positions=None,
-                    video_grid=video_grid,
-                    step_index=step_index,
-                )
-            align = None
-            if ctx.align_3d_cfg:
-                align = self.transformer(
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for step_index, timestep in enumerate(timesteps):
+                timestep_tensor = timestep.reshape(1)
+                positive = self.transformer(
                     video_latents=video_latents,
                     audio_latents=audio_latents,
                     timestep=timestep_tensor,
                     text_embeds=text_embeds,
                     image_embeds=image_embeds,
                     speaker_embeds=speaker_embeds,
-                    speaker_positions=None,
-                    masking_modality=True,
-                    video_grid=video_grid,
-                    step_index=step_index,
-                )
-            timbre = None
-            if ctx.timbre_cfg and speaker_embeds is not None:
-                timbre = self.transformer(
-                    video_latents=video_latents,
-                    audio_latents=audio_latents,
-                    timestep=timestep_tensor,
-                    text_embeds=text_embeds,
-                    image_embeds=image_embeds,
-                    speaker_embeds=None,
                     speaker_positions=speaker_positions,
                     video_grid=video_grid,
                     step_index=step_index,
                 )
-            noise = self._combine_guidance(ctx, positive, negative, align=align, timbre=timbre)
-            # Denoise step: FlowMatch updates video/audio latents with matching
-            # timesteps so generated duration stays synchronized.
-            video_latents = self.scheduler.step(
-                noise["video"].to(torch.float32), timestep, video_latents.to(torch.float32)
-            )
-            audio_latents = self.scheduler_audio.step(
-                noise["audio"].to(torch.float32), timestep, audio_latents.to(torch.float32)
-            )
+                negative = None
+                if negative_video_text_embeds is not None and negative_audio_text_embeds is not None:
+                    negative = self.transformer(
+                        video_latents=video_latents,
+                        audio_latents=audio_latents,
+                        timestep=timestep_tensor,
+                        text_embeds=negative_video_text_embeds,
+                        audio_text_embeds=negative_audio_text_embeds,
+                        image_embeds=image_embeds,
+                        speaker_embeds=None,
+                        speaker_positions=None,
+                        video_grid=video_grid,
+                        step_index=step_index,
+                    )
+                align = None
+                if ctx.align_3d_cfg:
+                    align = self.transformer(
+                        video_latents=video_latents,
+                        audio_latents=audio_latents,
+                        timestep=timestep_tensor,
+                        text_embeds=text_embeds,
+                        image_embeds=image_embeds,
+                        speaker_embeds=speaker_embeds,
+                        speaker_positions=None,
+                        masking_modality=True,
+                        video_grid=video_grid,
+                        step_index=step_index,
+                    )
+                timbre = None
+                if ctx.timbre_cfg and speaker_embeds is not None:
+                    timbre = self.transformer(
+                        video_latents=video_latents,
+                        audio_latents=audio_latents,
+                        timestep=timestep_tensor,
+                        text_embeds=text_embeds,
+                        image_embeds=image_embeds,
+                        speaker_embeds=None,
+                        speaker_positions=speaker_positions,
+                        video_grid=video_grid,
+                        step_index=step_index,
+                    )
+                noise = self._combine_guidance(ctx, positive, negative, align=align, timbre=timbre)
+                # Denoise step: FlowMatch updates video/audio latents with matching
+                # timesteps so generated duration stays synchronized.
+                video_latents = self.scheduler.step(
+                    noise["video"].to(torch.float32), timestep, video_latents.to(torch.float32)
+                )
+                audio_latents = self.scheduler_audio.step(
+                    noise["audio"].to(torch.float32), timestep, audio_latents.to(torch.float32)
+                )
+                pbar.update()
         return video_latents, audio_latents
 
     def _video_grid(self, ctx: NAVARequestContext) -> tuple[int, int, int]:
