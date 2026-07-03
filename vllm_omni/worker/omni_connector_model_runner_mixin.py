@@ -16,6 +16,7 @@ import importlib
 import inspect
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -110,7 +111,7 @@ class OmniConnectorModelRunnerMixin:
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
-        logger.debug(
+        logger.info(
             "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
@@ -190,6 +191,7 @@ class OmniConnectorModelRunnerMixin:
         self._kv_triggered_requests: set[str] = set()
 
         self._lock = threading.Lock()
+        self._poll_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
 
@@ -216,6 +218,104 @@ class OmniConnectorModelRunnerMixin:
         # only after every field above has been bound, so a partially
         # constructed mixin is never observable as initialised.
         self._omni_connector_initialized = True
+
+    @staticmethod
+    def _stage1_coalesce_delay_s() -> float:
+        raw = (
+            os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_MS")
+            or os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_WINDOW_MS")
+            or os.environ.get("OMNI_CONNECTOR_COALESCE_MS")
+            or "0"
+        )
+        try:
+            return max(float(raw), 0.0) / 1000.0
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _stage1_coalesce_target() -> int:
+        raw = os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_TARGET") or os.environ.get(
+            "OMNI_CONNECTOR_COALESCE_TARGET"
+        )
+        if not raw:
+            return 0
+        try:
+            return max(int(raw), 0)
+        except ValueError:
+            return 0
+
+    def _maybe_coalesce_ready_payloads(self) -> None:
+        """Briefly wait for nearby connector arrivals to improve Stage1 batches.
+
+        This is intentionally gated and only runs after at least one payload is
+        already ready. It trades a tiny admission delay for fewer single-request
+        generation-stage forwards when many upstream requests finish within the
+        same few milliseconds.
+        """
+        delay_s = self._stage1_coalesce_delay_s()
+        if delay_s <= 0 or self._stage_id <= 0 or self._model_mode == "ar":
+            return
+        max_batch = int(getattr(getattr(self, "scheduler_config", None), "max_num_seqs", 0) or 0)
+        target_batch = self._stage1_coalesce_target()
+        if target_batch <= 0:
+            target_batch = max_batch
+        elif max_batch > 0:
+            target_batch = min(target_batch, max_batch)
+        deadline = time.perf_counter() + delay_s
+        sleep_step = min(0.0005, delay_s)
+        while True:
+            with self._lock:
+                ready = (
+                    len(self._finished_load_reqs)
+                    + len(self._full_payload_pending_broadcast_req_ids)
+                    + len(self._stage_recv_req_ids)
+                )
+                pending = len(self._pending_load_reqs)
+            if ready <= 0 or pending <= 0 or (target_batch > 0 and ready >= target_batch):
+                return
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return
+            time.sleep(min(sleep_step, remaining))
+
+    @staticmethod
+    def _stage1_sync_drain_enabled() -> bool:
+        raw = os.environ.get("MOSS_TTS_LOCAL_STAGE1_SYNC_DRAIN", "1")
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    def _drain_ready_full_payloads_once(self) -> None:
+        """Synchronously poll already-ready Stage1 payloads without sleeping.
+
+        The background recv thread is still the normal path. This opportunistic
+        drain closes the admission window where Stage 0 has already written
+        several payloads to SHM but Stage 1 reaches execute_model before
+        the recv thread publishes them to scheduler-visible ready sets.
+        Connector ``get`` is non-blocking for SharedMemoryConnector, so this
+        trades bounded metadata polling for larger same-cycle Stage 1 batches.
+        """
+        if (
+            not self._stage1_sync_drain_enabled()
+            or self._stage_id <= 0
+            or self._model_mode == "ar"
+            or self._omni_connector is None
+        ):
+            return
+        with self._lock:
+            pending_ids = list(self._pending_load_reqs.keys())
+        if not pending_ids:
+            return
+        max_batch = int(getattr(getattr(self, "scheduler_config", None), "max_num_seqs", 0) or 0)
+        if max_batch > 0:
+            pending_ids = pending_ids[:max_batch]
+        with self._poll_lock:
+            for req_id in pending_ids:
+                with self._lock:
+                    if req_id not in self._pending_load_reqs:
+                        continue
+                try:
+                    self._poll_single_request(req_id)
+                except Exception:
+                    logger.warning("Error synchronously draining data for %s", req_id, exc_info=True)
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
@@ -698,10 +798,12 @@ class OmniConnectorModelRunnerMixin:
         # returns its input unchanged under the same world_size<=1 condition,
         # so the original code path was a no-op here on every empty step.
         tp_group = self._get_local_tp_group()
+        self._drain_ready_full_payloads_once()
         if (
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
+        self._maybe_coalesce_ready_payloads()
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
         results = self._broadcast_tp_payload_packet(results)
@@ -721,6 +823,18 @@ class OmniConnectorModelRunnerMixin:
             list(results.keys()),
             self._stage_recv_req_ids,
         )
+        if os.environ.get("MOSS_TTS_LOCAL_STAGE1_ADMISSION_PROFILE") == "1":
+            with self._lock:
+                pending_load = len(self._pending_load_reqs)
+                pending_broadcast = len(self._full_payload_pending_broadcast_req_ids)
+                stage_recv = len(self._stage_recv_req_ids)
+            logger.info(
+                "[moss-stage1-admission] connector consumed=%d pending_load=%d pending_broadcast=%d stage_recv=%d",
+                len(results),
+                pending_load,
+                pending_broadcast,
+                stage_recv,
+            )
         return results
 
     def _get_model_config(self) -> Any:
@@ -1154,7 +1268,7 @@ class OmniConnectorModelRunnerMixin:
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
         if chunk_id == 0:
-            logger.debug(
+            logger.info(
                 "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
                 self._stage_id,
                 request_id,
@@ -1252,7 +1366,7 @@ class OmniConnectorModelRunnerMixin:
 
         active_requests = getattr(self, "requests", None)
         if active_requests is not None and request_id not in active_requests:
-            logger.debug("Skip receiving KV cache for inactive request %s", request_id)
+            logger.info("Skip receiving KV cache for inactive request %s", request_id)
             return False
 
         primary_ok = False
@@ -1272,7 +1386,7 @@ class OmniConnectorModelRunnerMixin:
                 if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
                     for key, value in cfg_kvs.items():
                         setattr(req.sampling_params, key, value)
-                    logger.debug("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
+                    logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
             except Exception:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
@@ -1530,6 +1644,10 @@ class OmniConnectorModelRunnerMixin:
             return OmniConnectorOutput()
 
         tp_group = self._get_local_tp_group()
+        if self._async_chunk and not (tp_group is not None and getattr(tp_group, "world_size", 1) > 1):
+            self._drain_ready_full_payloads_once()
+        if not (self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1):
+            self._maybe_coalesce_ready_payloads()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
@@ -1657,7 +1775,7 @@ class OmniConnectorModelRunnerMixin:
 
             _recv_poll_count += 1
             if _recv_poll_count % 5000 == 1:
-                logger.debug(
+                logger.info(
                     "[Stage-%s] _recv_loop: polling %s pending reqs: %s (poll#%s)",
                     self._stage_id,
                     len(pending_ids),
@@ -1670,7 +1788,8 @@ class OmniConnectorModelRunnerMixin:
                 if self._stop_event.is_set():
                     break
                 try:
-                    made_progress = self._poll_single_request(req_id) or made_progress
+                    with self._poll_lock:
+                        made_progress = self._poll_single_request(req_id) or made_progress
                 except Exception:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
@@ -2117,6 +2236,7 @@ class OmniConnectorModelRunnerMixin:
             "output_token_ids",
             "all_token_ids",
             "additional_information",
+            "additional_information_cpu",
             "sampling_params",
             "multi_modal_data",
             "mm_hashes",

@@ -12,6 +12,7 @@ transport half lives in OmniConnectorModelRunnerMixin.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from typing import Any
@@ -51,9 +52,6 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("Qwen3TTSCode2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
-        # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
-        # (Stage 1). Stage 1 consumes the complete mel/latent payload.
-        ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
         # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
         # token2audio (Stage 2).  Producer wires via
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
@@ -120,6 +118,26 @@ class OmniSchedulingCoordinator:
         # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
         # collect_timed_out_request_ids() to detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
+        # Optional full-payload admission coalescing for bursty two-stage
+        # pipelines.  Keep this env-gated because the coordinator is shared by
+        # multiple model families and extra admission latency is not universally
+        # desirable.
+        try:
+            self._full_payload_coalesce_target = max(
+                int(os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_TARGET", "0") or 0),
+                0,
+            )
+        except ValueError:
+            self._full_payload_coalesce_target = 0
+        try:
+            self._full_payload_coalesce_window_s = max(
+                float(os.environ.get("MOSS_TTS_LOCAL_STAGE1_COALESCE_WINDOW_MS", "0") or 0.0) / 1000.0,
+                0.0,
+            )
+        except ValueError:
+            self._full_payload_coalesce_window_s = 0.0
+        self._full_payload_ready_since: dict[str, float] = {}
+        self.last_full_payload_profile: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
@@ -186,7 +204,14 @@ class OmniSchedulingCoordinator:
         if self._stage_id == 0:
             return
 
+        profile_enabled = os.environ.get("MOSS_TTS_LOCAL_STAGE1_ADMISSION_PROFILE") == "1"
+        waiting_before = len(waiting_queue) if profile_enabled else 0
+        waiting_for_input_before = len(self._waiting_for_input) if profile_enabled else 0
+        running_before = len(running_queue) if profile_enabled else 0
+        now = time.monotonic()
         self._full_payload_input_received.update(stage_recv_req_ids)
+        for req_id in stage_recv_req_ids:
+            self._full_payload_ready_since.setdefault(req_id, now)
         if not self._async_chunk and stage_recv_req_ids:
             self.finished_requests.update(stage_recv_req_ids)
             logger.debug(
@@ -196,12 +221,34 @@ class OmniSchedulingCoordinator:
             )
         self.pending_input_registrations = []
 
+        coalesce_enabled = (
+            not self._async_chunk
+            and self._full_payload_coalesce_target > 1
+            and self._full_payload_coalesce_window_s > 0
+        )
+        ready_waiting = [
+            request for request in self._waiting_for_input if request.request_id in self._full_payload_input_received
+        ]
+        release_ready_ids: set[str] = set()
+        if ready_waiting:
+            if not coalesce_enabled or len(ready_waiting) >= self._full_payload_coalesce_target:
+                release_ready_ids = {request.request_id for request in ready_waiting}
+            else:
+                oldest_ready = min(
+                    self._full_payload_ready_since.get(request.request_id, now) for request in ready_waiting
+                )
+                if now - oldest_ready >= self._full_payload_coalesce_window_s:
+                    release_ready_ids = {request.request_id for request in ready_waiting}
+
         remaining: deque[Any] = deque()
+        released = 0
         for request in self._waiting_for_input:
-            if request.request_id in stage_recv_req_ids:
+            if request.request_id in release_ready_ids:
                 request.status = RequestStatus.WAITING
                 self._waiting_since.pop(request.request_id, None)
+                self._full_payload_ready_since.pop(request.request_id, None)
                 waiting_queue.add_request(request)
+                released += 1
             else:
                 remaining.append(request)
         self._waiting_for_input = remaining
@@ -245,6 +292,34 @@ class OmniSchedulingCoordinator:
                 # repeated O(N) removes from a list-backed queue.
                 waiting_queue.remove_requests(to_remove)
 
+        if profile_enabled:
+            self.last_full_payload_profile = {
+                "stage": self._stage_id,
+                "recv": len(stage_recv_req_ids),
+                "released": released,
+                "registered": len(self.pending_input_registrations),
+                "waiting_before": waiting_before,
+                "waiting_after": len(waiting_queue),
+                "waiting_for_input_before": waiting_for_input_before,
+                "waiting_for_input_after": len(self._waiting_for_input),
+                "running_before": running_before,
+                "running_after": len(running_queue),
+            }
+        if profile_enabled and (stage_recv_req_ids or released or self.pending_input_registrations):
+            logger.info(
+                "[moss-stage1-admission] coordinator recv=%d released=%d registered=%d "
+                "waiting=%d->%d waiting_input=%d->%d running=%d->%d",
+                self.last_full_payload_profile["recv"],
+                self.last_full_payload_profile["released"],
+                self.last_full_payload_profile["registered"],
+                self.last_full_payload_profile["waiting_before"],
+                self.last_full_payload_profile["waiting_after"],
+                self.last_full_payload_profile["waiting_for_input_before"],
+                self.last_full_payload_profile["waiting_for_input_after"],
+                self.last_full_payload_profile["running_before"],
+                self.last_full_payload_profile["running_after"],
+            )
+
     def process_pending_full_payload_inputs_legacy(
         self,
         waiting_queue: Any,
@@ -260,6 +335,7 @@ class OmniSchedulingCoordinator:
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
         self._waiting_since.pop(request_id, None)
+        self._full_payload_ready_since.pop(request_id, None)
 
     def collect_timed_out_request_ids(
         self,

@@ -1,5 +1,5 @@
 import contextlib
-import inspect
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -49,28 +49,26 @@ else:
 logger = init_logger(__name__)
 
 
-def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return only M-RoPE kwargs accepted by the model implementation."""
-    method = getattr(model, "get_mrope_input_positions")
-    try:
-        signature = inspect.signature(method)
-    except (TypeError, ValueError):
-        return kwargs
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        return kwargs
 
-    accepted = {
-        name
-        for name, param in signature.parameters.items()
-        if name not in {"self", "input_tokens"}
-        and param.kind
-        in {
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        }
-    }
-    return {key: value for key, value in kwargs.items() if key in accepted}
+def _omni_batch_preprocess_enabled() -> bool:
+    if _truthy_env("MOSS_TTS_LOCAL_DISABLE_BATCH_PREPROCESS"):
+        return False
+    value = os.environ.get("MOSS_TTS_LOCAL_ENABLE_BATCH_PREPROCESS")
+    if value is None:
+        return True
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _omni_fast_batch_preprocess_enabled() -> bool:
+    if _truthy_env("MOSS_TTS_LOCAL_DISABLE_FAST_BATCH_PREPROCESS"):
+        return False
+    value = os.environ.get("MOSS_TTS_LOCAL_ENABLE_FAST_BATCH_PREPROCESS")
+    if value is None:
+        return True
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -92,6 +90,20 @@ class OmniGPUModelRunner(GPUModelRunner):
             if sampled is not None:
                 return sampled
         return super()._to_list(sampled_token_ids)
+
+    def _maybe_disable_outer_cudagraph_for_model(self) -> None:
+        should_disable = getattr(self.model, "should_disable_outer_cudagraph", None)
+        if callable(should_disable):
+            disable_outer_cudagraph = bool(should_disable())
+        else:
+            disable_outer_cudagraph = bool(getattr(self.model, "disable_outer_cudagraph", False))
+        if not disable_outer_cudagraph:
+            return
+        cfg = self.compilation_config
+        cfg.cudagraph_mode = CUDAGraphMode.NONE
+        cfg.cudagraph_capture_sizes = []
+        cfg.max_cudagraph_capture_size = 0
+        cfg.cudagraph_num_of_warmups = 0
 
     def _omni_routed_experts_d2h(self, scheduler_output) -> None:
         """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
@@ -185,6 +197,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
+        self._maybe_disable_outer_cudagraph_for_model()
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
@@ -369,7 +382,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_w"] = target_w
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                **_filter_mrope_kwargs_for_model(self.model, kwargs),
+                **kwargs,
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
@@ -1344,24 +1357,21 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             traceback.print_exc()
 
-        # Per-request (start, end) hidden-row spans so make_omni_output can map
-        # flat hidden rows to the right request in mixed prefill+decode steps,
-        # instead of assuming an equal rows-per-request split (which samples the
-        # wrong rows whenever per-request token counts differ).
-        nstp = self._omni_num_scheduled_tokens_np
-        if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
-            try:
-                model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
-            except Exception as e:
-                # Visible on purpose: the fallback is the equal rows-per-request
-                # split, which can re-introduce the cross-request corruption this
-                # plumbing fixes — a silent failure here must not pass unnoticed.
-                logger.warning("[OMNI] Failed to compute request_token_spans: %s", e)
-
         if self._omni_query_start_loc_model_kwarg:
             try:
                 num_reqs = len(self.input_batch.req_ids)
                 model_kwargs_extra["omni_query_start_loc"] = self.query_start_loc.gpu[: num_reqs + 1]
+                num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
+                logits_indices_cpu = getattr(self, "_omni_logits_indices_cpu", None)
+                if num_scheduled_tokens_np is not None:
+                    spans = self._compute_request_token_spans(num_scheduled_tokens_np)
+                    model_kwargs_extra["request_token_spans"] = spans
+                    model_kwargs_extra["omni_span_lens"] = [end - start for start, end in spans]
+                    if logits_indices_cpu is not None:
+                        row_to_sample = {int(row): pos for pos, row in enumerate(logits_indices_cpu)}
+                        model_kwargs_extra["omni_sample_row_by_req"] = [
+                            row_to_sample.get(end - 1, -1) if end > start else -1 for start, end in spans
+                        ]
             except Exception as e:
                 logger.debug("[OMNI] Failed to attach query_start_loc: %s", e)
 
@@ -1384,15 +1394,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
         combined_multimodal_outputs: dict[str, object] | None = None,
         req_ids_filter: set[str] | None = None,
-        req_ids: list[str] | None = None,
-        query_start_loc_cpu: object | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
-        req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
-        if query_start_loc_cpu is None:
-            query_start_loc_cpu = self.query_start_loc.cpu
-            if callable(query_start_loc_cpu):
-                query_start_loc_cpu = query_start_loc_cpu()
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
@@ -1400,7 +1403,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 postprocess_uses_hidden_states = getattr(self.model, "postprocess_uses_hidden_states", True)
                 postprocess_uses_multimodal_outputs = getattr(self.model, "postprocess_uses_multimodal_outputs", True)
                 postprocess_uses_req_infos = getattr(self.model, "postprocess_uses_req_infos", True)
-                for req_index, req_id in enumerate(req_ids):
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
                     if req_ids_filter is not None and req_id not in req_ids_filter:
                         continue
                     req_infos = self.model_intermediate_buffer.get(req_id, {}) if postprocess_uses_req_infos else {}
@@ -1409,7 +1412,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                             # Combined hidden states contains all hidden states for every request
                             hidden_states_slice = combined_hidden_states[req_id]
                         else:
-                            start_offset = int(query_start_loc_cpu[req_index])
+                            start_offset = int(self.query_start_loc.cpu[req_index])
                             sched_tokens = int(num_scheduled_tokens_np[req_index])
                             s, e = start_offset, start_offset + sched_tokens
                             # only consider to store data into update dict.
@@ -1439,7 +1442,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
-            logger.error(f"Error merging for requests:{req_ids} additional information update: {e}")
+            logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}")
             import traceback
 
             traceback.print_exc()
@@ -1674,7 +1677,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             decode_req_ids = []
             decode_start_offsets = []
             decode_batch_items = []
-            batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            batch_decode_preprocess = (
+                getattr(self.model, "preprocess_decode_batch", None) if _omni_batch_preprocess_enabled() else None
+            )
+            decode_batch_fast_items = []
+            batch_decode_preprocess_fast = (
+                getattr(self.model, "preprocess_decode_batch_fast", None)
+                if _omni_batch_preprocess_enabled() and _omni_fast_batch_preprocess_enabled()
+                else None
+            )
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
@@ -1684,11 +1695,23 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_ids_b = [item[0] for item in decode_batch_items]
                 start_offsets_b = [item[1] for item in decode_batch_items]
                 req_infos_b = [item[2] for item in decode_batch_items]
-                ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
-                req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_decode_preprocess(
+                offsets_t = torch.tensor(start_offsets_b, device=input_ids.device, dtype=torch.long)
+                ids_b = input_ids.index_select(0, offsets_t).reshape(-1)
+                batch_result = batch_decode_preprocess(
                     input_ids=ids_b,
                     req_infos=req_infos_b,
                 )
+                if not isinstance(batch_result, tuple) or len(batch_result) not in (3, 5):
+                    raise TypeError(
+                        "preprocess_decode_batch must return either "
+                        "(input_ids, embeds, updates) or "
+                        "(input_ids, embeds, last_talker_hidden, text_step, updates)"
+                    )
+                has_mtp_batch = len(batch_result) == 5
+                if has_mtp_batch:
+                    req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_result
+                else:
+                    req_input_ids, req_embeds, updates = batch_result
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1696,54 +1719,55 @@ class OmniGPUModelRunner(GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
+                if offsets_t.device != req_embeds.device:
+                    offsets_t = offsets_t.to(device=req_embeds.device)
                 inputs_embeds.index_copy_(0, offsets_t, req_embeds)
                 input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
 
-                dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
-                self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
-                self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
-                self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
-                self.text_step.gpu[dst].copy_(text_step)
-
                 for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
-                    self._merge_additional_information_update(req_id_b, update_dict_b)
+                    if not update_dict_b:
+                        continue
+                    if isinstance(update_dict_b, dict) and len(update_dict_b) == 1 and "_kv_slot_id" in update_dict_b:
+                        existing = self.model_intermediate_buffer.setdefault(req_id_b, {})
+                        slot_id = update_dict_b["_kv_slot_id"]
+                        if existing.get("_kv_slot_id") != slot_id:
+                            existing["_kv_slot_id"] = slot_id
+                            req_state = self.requests.get(req_id_b)
+                            if req_state is not None:
+                                setattr(req_state, "additional_information_cpu", existing)
+                    else:
+                        self._merge_additional_information_update(req_id_b, update_dict_b)
 
-                decode_req_ids.extend(req_ids_b)
-                decode_start_offsets.extend(start_offsets_b)
+                if has_mtp_batch:
+                    dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
+                    self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
+                    self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
+                    self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
+                    self.text_step.gpu[dst].copy_(text_step)
+                    decode_req_ids.extend(req_ids_b)
+                    decode_start_offsets.extend(start_offsets_b)
                 decode_batch_items.clear()
 
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_infos = self.model_intermediate_buffer.get(req_id, {})
+            def flush_decode_batch_fast() -> None:
+                nonlocal inputs_embeds
+                if not decode_batch_fast_items:
+                    return
 
-                # mimo-audio check
-                req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
-
-                start_offset = int(self.query_start_loc.cpu[req_index])
-                sched_tokens = int(num_scheduled_tokens_np[req_index])
-                s, e = start_offset, start_offset + sched_tokens
-                span_len = int(e) - int(s)
-
-                # call the custom process function
-                req_infos["request_id"] = req_id
-                prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
-                prompt_len = len(prompt_token_ids or ())
-                num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
-                is_prefill = num_computed_tokens < prompt_len
-                req_infos["_omni_prompt_len"] = prompt_len
-                req_infos["_omni_num_computed_tokens"] = num_computed_tokens
-                req_infos["_omni_is_prefill"] = is_prefill
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
-                    decode_batch_items.append((req_id, s, req_infos))
-                    continue
-
-                flush_decode_batch()
-
-                embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                req_ids_b = [item[0] for item in decode_batch_fast_items]
+                start_offsets_b = [item[1] for item in decode_batch_fast_items]
+                prev_codes_b = [item[2] for item in decode_batch_fast_items]
+                slot_ids_b = [item[3] for item in decode_batch_fast_items]
+                offsets_t = torch.tensor(start_offsets_b, device=input_ids.device, dtype=torch.long)
+                ids_b = input_ids.index_select(0, offsets_t).reshape(-1)
+                batch_result = batch_decode_preprocess_fast(
+                    input_ids=ids_b,
+                    req_ids=req_ids_b,
+                    prev_codes=prev_codes_b,
+                    slot_ids=slot_ids_b,
                 )
+                if not isinstance(batch_result, tuple) or len(batch_result) != 3:
+                    raise TypeError("preprocess_decode_batch_fast must return (input_ids, embeds, updates)")
+                req_input_ids, req_embeds, updates = batch_result
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1751,26 +1775,134 @@ class OmniGPUModelRunner(GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                if self.has_talker_mtp and span_len == 1 and not is_prefill:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
-                    decode_start_offsets.append(s)
+                if offsets_t.device != req_embeds.device:
+                    offsets_t = offsets_t.to(device=req_embeds.device)
+                inputs_embeds.index_copy_(0, offsets_t, req_embeds)
+                input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
 
-                # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
+                    if not update_dict_b:
+                        continue
+                    if isinstance(update_dict_b, dict) and len(update_dict_b) == 1 and "_kv_slot_id" in update_dict_b:
+                        existing = self.model_intermediate_buffer.setdefault(req_id_b, {})
+                        slot_id = update_dict_b["_kv_slot_id"]
+                        if existing.get("_kv_slot_id") != slot_id:
+                            existing["_kv_slot_id"] = slot_id
+                            req_state = self.requests.get(req_id_b)
+                            if req_state is not None:
+                                setattr(req_state, "additional_information_cpu", existing)
+                    else:
+                        self._merge_additional_information_update(req_id_b, update_dict_b)
+                decode_batch_fast_items.clear()
 
-                # update the inputs_embeds and input_ids
-                seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
+            handled_bulk_fast_decode = False
+            if (
+                callable(batch_decode_preprocess_fast)
+                and input_ids is not None
+                and len(self.input_batch.req_ids) > 1
+                and bool(np.all(num_scheduled_tokens_np[: len(self.input_batch.req_ids)] == 1))
+            ):
+                try:
+                    start_offsets = self.query_start_loc.cpu[: len(self.input_batch.req_ids)].tolist()
+                    num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu[: len(self.input_batch.req_ids)]
+                    fast_items: list[tuple[str, int, Any, Any]] = []
+                    for req_index, req_id in enumerate(self.input_batch.req_ids):
+                        req_infos = self.model_intermediate_buffer.get(req_id, {})
+                        if not isinstance(req_infos, dict):
+                            raise TypeError("model_intermediate_buffer entry is not a dict")
+                        req_state = self.requests.get(req_id)
+                        if req_state is None:
+                            raise ValueError("bulk fast decode saw a missing request state")
+                        prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
+                        prompt_len = len(prompt_token_ids or ())
+                        num_computed_tokens = int(num_computed_tokens_cpu[req_index])
+                        if num_computed_tokens < prompt_len:
+                            raise ValueError("bulk fast decode saw a prefill row")
+                        audio_codes = req_infos.get("audio_codes", {})
+                        prev_codes = audio_codes.get("current") if isinstance(audio_codes, dict) else None
+                        fast_items.append(
+                            (
+                                req_id,
+                                int(start_offsets[req_index]),
+                                prev_codes,
+                                req_infos.get("_kv_slot_id"),
+                            )
+                        )
+                    decode_batch_fast_items.extend(fast_items)
+                    flush_decode_batch_fast()
+                    handled_bulk_fast_decode = True
+                except Exception:
+                    decode_batch_fast_items.clear()
+                    handled_bulk_fast_decode = False
+
+            if not handled_bulk_fast_decode:
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
+
+                    # mimo-audio check
+                    req_state = self.requests.get(req_id)
+                    req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    span_len = int(e) - int(s)
+
+                    prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
+                    prompt_len = len(prompt_token_ids or ())
+                    num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                    is_prefill = num_computed_tokens < prompt_len
+                    if callable(batch_decode_preprocess_fast) and span_len == 1 and not is_prefill:
+                        audio_codes = req_infos.get("audio_codes", {}) if isinstance(req_infos, dict) else {}
+                        prev_codes = audio_codes.get("current") if isinstance(audio_codes, dict) else None
+                        slot_id = req_infos.get("_kv_slot_id") if isinstance(req_infos, dict) else None
+                        decode_batch_fast_items.append((req_id, s, prev_codes, slot_id))
+                        continue
+
+                    # call the custom process function
+                    req_infos["request_id"] = req_id
+                    req_infos["_omni_prompt_len"] = prompt_len
+                    req_infos["_omni_num_computed_tokens"] = num_computed_tokens
+                    req_infos["_omni_is_prefill"] = is_prefill
+                    if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
+                        decode_batch_items.append((req_id, s, req_infos))
+                        continue
+
+                    flush_decode_batch_fast()
+                    flush_decode_batch()
+
+                    embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    )
+                    if inputs_embeds is None:
+                        inputs_embeds = torch.empty(
+                            (input_ids.shape[0], req_embeds.shape[-1]),
+                            device=req_embeds.device,
+                            dtype=req_embeds.dtype,
+                        )
+
+                    if self.has_talker_mtp and span_len == 1 and not is_prefill:
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                        decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                        self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                        self.text_step.gpu[decode_slice].copy_(text_step)
+                        decode_req_ids.append(req_id)
+                        decode_start_offsets.append(s)
+
+                    # TODO(Peiqi): the merge stage could move out from the critical path
+                    self._merge_additional_information_update(req_id, update_dict)
+
+                    # update the inputs_embeds and input_ids
+                    seg_len = min(span_len, req_embeds.shape[0])
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                    if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                        input_ids[s : s + seg_len] = req_input_ids
 
             flush_decode_batch()
+            flush_decode_batch_fast()
 
             # run talker mtp decode
             if self.has_talker_mtp:
@@ -1899,6 +2031,23 @@ class OmniGPUModelRunner(GPUModelRunner):
                 update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
                 self._merge_additional_information_update(req_id, update_dict)
 
+    def _maybe_make_omni_output_from_runner(
+        self,
+        model_output: torch.Tensor | OmniOutput,
+        model_kwargs: dict[str, Any],
+        model_kwargs_extra: dict[str, Any],
+    ) -> torch.Tensor | OmniOutput:
+        if isinstance(model_output, OmniOutput):
+            return model_output
+        kwargs = dict(model_kwargs)
+        kwargs.update(model_kwargs_extra)
+        if hasattr(self.model, "make_omni_output"):
+            return self.model.make_omni_output(model_output, **kwargs)
+        decode_omni_frame_output = getattr(self.model, "decode_omni_frame_output", None)
+        if callable(decode_omni_frame_output):
+            return decode_omni_frame_output(model_output, **kwargs)
+        return model_output
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1926,8 +2075,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
-        if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
-            model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        model_output = self._maybe_make_omni_output_from_runner(
+            model_output,
+            model_kwargs,
+            model_kwargs_extra,
+        )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
