@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -34,6 +35,16 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_scalar(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
 
 
 def _maybe_prefix(prefix: str, name: str) -> str:
@@ -1267,6 +1278,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    enable_stage0_decode_batch_preprocess: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -1322,6 +1334,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_accepts_req_infos = True
+        self._stage0_frame_graphs: dict[tuple[int, tuple[bool, float, int, float]], torch.cuda.CUDAGraph] = {}
+        self._stage0_frame_graph_input: torch.Tensor | None = None
+        self._stage0_frame_graph_continue: torch.Tensor | None = None
+        self._stage0_frame_graph_codes: torch.Tensor | None = None
+        self._stage0_frame_graph_max_batch = 0
+        self._stage0_frame_graph_bucket_sizes = self._parse_stage0_frame_graph_batch_buckets()
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
@@ -1332,6 +1350,25 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     # ------------------------------------------------------------------
     # vLLM hooks
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_stage0_frame_graph_batch_buckets() -> tuple[int, ...]:
+        raw = os.environ.get("MOSS_TTS_LOCAL_STAGE0_FRAME_GRAPH_BATCH_BUCKETS", "").strip()
+        if not raw:
+            return (1, 2, 4, 8, 16, 32, 64)
+        buckets: list[int] = []
+        for part in raw.split(","):
+            try:
+                value = int(part.strip())
+            except ValueError:
+                logger.warning("Ignoring invalid MOSS_TTS_LOCAL_STAGE0_FRAME_GRAPH_BATCH_BUCKETS entry: %s", part)
+                continue
+            if value > 0:
+                buckets.append(value)
+        return tuple(sorted(set(buckets))) or (1, 2, 4, 8, 16, 32, 64)
+
+    def should_enable_stage0_decode_batch_preprocess(self) -> bool:
+        return True
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -1459,7 +1496,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 else torch.full((self.n_vq,), self.audio_pad_token_id, dtype=torch.long, device=device)
             )
 
-            max_new_frames = info_dict.get("max_new_frames", [-1])[0]
+            max_new_frames_raw = _first_scalar(info_dict.get("max_new_frames"))
+            try:
+                max_new_frames = int(max_new_frames_raw) if max_new_frames_raw is not None else -1
+            except (TypeError, ValueError):
+                max_new_frames = -1
 
             info_update: dict[str, Any] = {
                 "audio_state": {
@@ -1485,10 +1526,317 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             mtp_hidden = torch.zeros((1, self.hidden_size), device=device, dtype=text_embed.dtype)
         return input_ids, text_embed, {"mtp_inputs": (mtp_hidden, torch.zeros_like(mtp_hidden))}
 
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Batch the Local decode-row embedding overlay.
+
+        This is the decode-only equivalent of calling ``preprocess`` for each
+        one-token row. It deliberately does not alter Qwen3 cache semantics or
+        pass a custom slot id; the runner only overlays ``inputs_embeds`` and
+        prepares the existing local-frame MTP buffers.
+        """
+        text_ids = input_ids.reshape(-1)
+        text_embed = self.model.embed_tokens(text_ids)
+        mtp_hidden_rows: list[torch.Tensor] = []
+        for info in req_infos:
+            hs = (info.get("hidden_states", {}) or {}) if isinstance(info, dict) else {}
+            last_hidden = hs.get("last")
+            if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
+                row = last_hidden.to(device=text_embed.device, dtype=text_embed.dtype).reshape(1, -1)
+                if row.shape[-1] != self.hidden_size:
+                    row = text_embed.new_zeros((1, self.hidden_size))
+            else:
+                row = text_embed.new_zeros((1, self.hidden_size))
+            mtp_hidden_rows.append(row)
+        if mtp_hidden_rows:
+            mtp_hidden = torch.cat(mtp_hidden_rows, dim=0)
+        else:
+            mtp_hidden = text_embed.new_empty((0, self.hidden_size))
+        text_step = torch.zeros_like(mtp_hidden)
+        updates = [{} for _ in req_infos]
+        return text_ids, text_embed, mtp_hidden, text_step, updates
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         if hidden_states.numel() == 0:
             return {}
         return {"hidden_states": {"last": hidden_states[-1].detach()}}
+
+    def _stage0_frame_graph_bucket(self, batch_size: int) -> int:
+        for bucket in self._stage0_frame_graph_bucket_sizes:
+            if batch_size <= bucket:
+                return int(bucket)
+        return int(batch_size)
+
+    def _ensure_stage0_frame_graph_buffers(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if (
+            self._stage0_frame_graph_input is not None
+            and self._stage0_frame_graph_input.device == device
+            and self._stage0_frame_graph_input.dtype == dtype
+            and self._stage0_frame_graph_max_batch >= batch_size
+        ):
+            return
+        cap = max(int(batch_size), self._stage0_frame_graph_max_batch, 1)
+        self._stage0_frame_graph_input = torch.zeros(cap, self.hidden_size, device=device, dtype=dtype)
+        self._stage0_frame_graph_continue = torch.zeros(cap, device=device, dtype=torch.bool)
+        self._stage0_frame_graph_codes = torch.zeros(cap, self.n_vq, device=device, dtype=torch.long)
+        self._stage0_frame_graph_max_batch = cap
+        self._stage0_frame_graphs.clear()
+
+    def _stage0_frame_graph_kernel(
+        self,
+        batch_size: int,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> None:
+        assert self._stage0_frame_graph_input is not None
+        assert self._stage0_frame_graph_continue is not None
+        assert self._stage0_frame_graph_codes is not None
+        should_continue, codes = self.local_transformer.generate_frame(
+            self._stage0_frame_graph_input[:batch_size],
+            self.audio_lm_heads,
+            self.audio_embeddings,
+            self.local_text_lm_head,
+            n_vq=self.n_vq,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=1.0,
+            history_per_codebook=None,
+            generator=None,
+        )
+        self._stage0_frame_graph_continue[:batch_size].copy_(should_continue)
+        self._stage0_frame_graph_codes[:batch_size].copy_(codes)
+
+    def _decode_stage0_local_frames_eager(
+        self,
+        hidden_batch: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.local_transformer.generate_frame(
+            hidden_batch,
+            self.audio_lm_heads,
+            self.audio_embeddings,
+            self.local_text_lm_head,
+            n_vq=self.n_vq,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=1.0,
+            history_per_codebook=None,
+            generator=generator,
+        )
+
+    def _decode_stage0_local_frames_graph(
+        self,
+        hidden_batch: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CUDA graph wrapper for the local frame transformer.
+
+        The graph is deliberately limited to deterministic/greedy frame decode.
+        Sampling and unsupported devices fall back to eager batching without
+        changing correctness.
+        """
+        if hidden_batch.device.type != "cuda" or do_sample:
+            return self._decode_stage0_local_frames_eager(
+                hidden_batch,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=None,
+            )
+        batch_size = int(hidden_batch.shape[0])
+        bucket = self._stage0_frame_graph_bucket(batch_size)
+        dtype = hidden_batch.dtype
+        self._ensure_stage0_frame_graph_buffers(batch_size=bucket, device=hidden_batch.device, dtype=dtype)
+        assert self._stage0_frame_graph_input is not None
+        assert self._stage0_frame_graph_continue is not None
+        assert self._stage0_frame_graph_codes is not None
+
+        self._stage0_frame_graph_input[:bucket].zero_()
+        self._stage0_frame_graph_input[:batch_size].copy_(hidden_batch)
+        graph_key = (bucket, (bool(do_sample), float(temperature), int(top_k), float(top_p)))
+        graph = self._stage0_frame_graphs.get(graph_key)
+        if graph is None:
+            self._stage0_frame_graph_kernel(
+                bucket,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._stage0_frame_graph_kernel(
+                    bucket,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+            self._stage0_frame_graphs[graph_key] = graph
+            return (
+                self._stage0_frame_graph_continue[:batch_size].clone(),
+                self._stage0_frame_graph_codes[:batch_size].clone(),
+            )
+
+        graph.replay()
+        return (
+            self._stage0_frame_graph_continue[:batch_size].clone(),
+            self._stage0_frame_graph_codes[:batch_size].clone(),
+        )
+
+    def _decode_stage0_local_frames(
+        self,
+        hidden_batch: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if generator is not None or not _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_FRAME_GRAPH"):
+            return self._decode_stage0_local_frames_eager(
+                hidden_batch,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+            )
+        try:
+            return self._decode_stage0_local_frames_graph(
+                hidden_batch,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        except Exception:
+            logger.exception("MOSS-TTS Local Stage-0 frame graph failed; falling back to eager local decode")
+            self._stage0_frame_graphs.clear()
+            return self._decode_stage0_local_frames_eager(
+                hidden_batch,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+            )
+
+    def _talker_mtp_stage0_batch(
+        self,
+        input_embeds: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, None]:
+        bsz = int(input_embeds.shape[0])
+        dev = input_embeds.device
+        input_embeds_out = input_embeds.reshape(bsz, -1).clone()
+
+        active_rows: list[int] = []
+        states: list[dict[str, Any]] = []
+        accs: list[torch.Tensor | None] = []
+        for i in range(bsz):
+            info = req_infos[i] if i < len(req_infos) and isinstance(req_infos[i], dict) else {}
+            state = dict(info.get("audio_state", {}) or {})
+            if state.get("is_stopping"):
+                info.setdefault("audio_codes", {}).update(
+                    {
+                        "current": input_embeds.new_empty((0, self.n_vq), dtype=torch.long),
+                        "emit": False,
+                    }
+                )
+                info["audio_state"] = state
+                continue
+            active_rows.append(i)
+            states.append(state)
+            acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+            accs.append(acc if isinstance(acc, torch.Tensor) else None)
+
+        if not active_rows:
+            return input_embeds_out, None
+
+        active_idx = torch.tensor(active_rows, device=dev, dtype=torch.long)
+        hidden_batch = last_talker_hidden.index_select(0, active_idx).to(dtype=input_embeds_out.dtype)
+        should_continue_t, codes_b = self._decode_stage0_local_frames(
+            hidden_batch,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            generator=generator,
+        )
+        for local_i, row_i in enumerate(active_rows):
+            info = req_infos[row_i] if row_i < len(req_infos) and isinstance(req_infos[row_i], dict) else {}
+            state = states[local_i]
+            step = int(state.get("step", 0))
+            max_new_frames = int(state.get("max_new_frames", -1))
+            should_continue = bool(should_continue_t[local_i].item())
+            new_codes = codes_b[local_i].to(device=dev, dtype=torch.long)
+            acc = accs[local_i]
+
+            if not should_continue or (0 <= max_new_frames <= step):
+                state["is_stopping"] = True
+                state["step"] = step + 1
+                info["audio_state"] = state
+                info["audio_codes"] = {
+                    "current": input_embeds.new_empty((0, self.n_vq), dtype=torch.long),
+                    "accumulated": acc,
+                    "emit": False,
+                }
+                continue
+
+            updated_acc = (
+                torch.cat([acc.to(dev), new_codes.unsqueeze(0)], dim=0)
+                if acc is not None
+                else new_codes.unsqueeze(0)
+            )
+            state["step"] = step + 1
+            current = new_codes.unsqueeze(0)
+            input_embeds_out[row_i : row_i + 1] = input_embeds_out[row_i : row_i + 1] + self._audio_embed(
+                current
+            ).to(dtype=input_embeds_out.dtype)
+            info["audio_state"] = state
+            info["audio_codes"] = {
+                "current": current,
+                "accumulated": updated_acc,
+                "emit": True,
+            }
+
+        return input_embeds_out, None
 
     @torch.inference_mode()
     def talker_mtp(
@@ -1525,6 +1873,18 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         audio_top_k = 25
         audio_top_p = 0.8
         do_sample_val = True if do_sample is None else bool(do_sample)
+
+        if _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_FRAME_GRAPH") and generator is None:
+            return self._talker_mtp_stage0_batch(
+                input_embeds,
+                last_talker_hidden,
+                req_infos,
+                do_sample=do_sample_val,
+                temperature=audio_temperature,
+                top_k=audio_top_k,
+                top_p=audio_top_p,
+                generator=generator,
+            )
 
         for i in range(bsz):
             info = req_infos[i] if i < len(req_infos) and isinstance(req_infos[i], dict) else {}
@@ -1637,8 +1997,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._batch_state_spans = kwargs.get("request_token_spans")
 
         per_req_codes: list[torch.Tensor] = []
+        per_req_finished: list[torch.Tensor] = []
         have_codes = False
         for info in info_dicts:
+            state = (info.get("audio_state", {}) or {}) if isinstance(info, dict) else {}
+            per_req_finished.append(
+                torch.tensor(bool(state.get("is_stopping")), device=hidden.device, dtype=torch.bool)
+            )
             current = (info.get("audio_codes", {}) or {}).get("current") if isinstance(info, dict) else None
             emit = bool((info.get("audio_codes", {}) or {}).get("emit")) if isinstance(info, dict) else False
             if emit and isinstance(current, torch.Tensor) and current.numel() > 0:
@@ -1671,6 +2036,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             text_hidden_states=hidden,
             multimodal_outputs={
                 "codes": {"audio": per_req_codes, "ref": per_req_ref_codes},
+                "meta": {"finished": per_req_finished},
             },
         )
 

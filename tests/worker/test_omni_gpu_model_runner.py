@@ -429,6 +429,55 @@ def test_maybe_run_batch_preprocess_skips_missing_hook():
     OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
 
 
+def test_stage0_decode_batch_preprocess_gate_requires_env(monkeypatch):
+    monkeypatch.delenv("MOSS_TTS_LOCAL_ENABLE_STAGE0_BATCH_PREPROCESS", raising=False)
+    runner = object.__new__(OmniGPUModelRunner)
+
+    class DummyModel:
+        has_preprocess = True
+        enable_stage0_decode_batch_preprocess = True
+
+        def preprocess_decode_batch(self, *, input_ids, req_infos):
+            raise AssertionError("not called")
+
+    runner.model = DummyModel()
+
+    assert not OmniGPUModelRunner._should_enable_stage0_decode_batch_preprocess(runner)
+
+
+def test_stage0_decode_batch_preprocess_gate_requires_model_capability(monkeypatch):
+    monkeypatch.setenv("MOSS_TTS_LOCAL_ENABLE_STAGE0_BATCH_PREPROCESS", "1")
+    runner = object.__new__(OmniGPUModelRunner)
+
+    class DummyModel:
+        has_preprocess = True
+
+        def preprocess_decode_batch(self, *, input_ids, req_infos):
+            raise AssertionError("not called")
+
+    runner.model = DummyModel()
+
+    assert not OmniGPUModelRunner._should_enable_stage0_decode_batch_preprocess(runner)
+
+
+def test_stage0_decode_batch_preprocess_gate_accepts_capability_method(monkeypatch):
+    monkeypatch.setenv("MOSS_TTS_LOCAL_ENABLE_STAGE0_BATCH_PREPROCESS", "1")
+    runner = object.__new__(OmniGPUModelRunner)
+
+    class DummyModel:
+        has_preprocess = True
+
+        def should_enable_stage0_decode_batch_preprocess(self):
+            return True
+
+        def preprocess_decode_batch(self, *, input_ids, req_infos):
+            raise AssertionError("not called")
+
+    runner.model = DummyModel()
+
+    assert OmniGPUModelRunner._should_enable_stage0_decode_batch_preprocess(runner)
+
+
 def _make_full_payload_accumulation_runner(
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     model_stage="talker",

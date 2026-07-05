@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -47,6 +48,10 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1524,6 +1529,25 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _should_enable_stage0_decode_batch_preprocess(self) -> bool:
+        """Return whether the model opted into the Stage-0 decode batch hook.
+
+        The hook is intentionally double gated: models must explicitly declare
+        support, and the deployment must enable it with an environment flag.
+        This keeps existing preprocess semantics unchanged by default.
+        """
+        if not _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_BATCH_PREPROCESS"):
+            return False
+        model = getattr(self, "model", None)
+        if model is None or not getattr(model, "has_preprocess", False):
+            return False
+        if not callable(getattr(model, "preprocess_decode_batch", None)):
+            return False
+        should_enable = getattr(model, "should_enable_stage0_decode_batch_preprocess", None)
+        if callable(should_enable):
+            return bool(should_enable())
+        return bool(getattr(model, "enable_stage0_decode_batch_preprocess", False))
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1674,7 +1698,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             decode_req_ids = []
             decode_start_offsets = []
             decode_batch_items = []
-            batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            batch_decode_preprocess = (
+                getattr(self.model, "preprocess_decode_batch", None)
+                if self._should_enable_stage0_decode_batch_preprocess()
+                else None
+            )
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
@@ -1685,10 +1713,22 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start_offsets_b = [item[1] for item in decode_batch_items]
                 req_infos_b = [item[2] for item in decode_batch_items]
                 ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
-                req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_decode_preprocess(
+                batch_result = batch_decode_preprocess(
                     input_ids=ids_b,
                     req_infos=req_infos_b,
                 )
+                if len(batch_result) == 3:
+                    req_input_ids, req_embeds, updates = batch_result
+                    last_talker_hidden = None
+                    text_step = None
+                elif len(batch_result) == 5:
+                    req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_result
+                else:
+                    raise RuntimeError(
+                        "preprocess_decode_batch must return either "
+                        "(input_ids, embeds, updates) or "
+                        "(input_ids, embeds, last_talker_hidden, text_step, updates)"
+                    )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1700,17 +1740,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 inputs_embeds.index_copy_(0, offsets_t, req_embeds)
                 input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
 
-                dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
-                self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
-                self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
-                self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
-                self.text_step.gpu[dst].copy_(text_step)
+                if self.has_talker_mtp and last_talker_hidden is not None and text_step is not None:
+                    dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
+                    self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
+                    self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
+                    self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
+                    self.text_step.gpu[dst].copy_(text_step)
+                    decode_req_ids.extend(req_ids_b)
+                    decode_start_offsets.extend(start_offsets_b)
 
                 for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
                     self._merge_additional_information_update(req_id_b, update_dict_b)
 
-                decode_req_ids.extend(req_ids_b)
-                decode_start_offsets.extend(start_offsets_b)
                 decode_batch_items.clear()
 
             for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -1734,7 +1775,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
+                if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 
