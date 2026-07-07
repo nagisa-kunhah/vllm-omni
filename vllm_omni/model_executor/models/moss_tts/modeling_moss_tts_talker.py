@@ -1279,6 +1279,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     has_preprocess: bool = True
     has_postprocess: bool = True
     enable_stage0_decode_batch_preprocess: bool = True
+    supports_talker_mtp_stable_seeded_batch: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -1334,12 +1335,22 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_accepts_req_infos = True
-        self._stage0_frame_graphs: dict[tuple[int, tuple[bool, float, int, float]], torch.cuda.CUDAGraph] = {}
+        self._stage0_frame_graphs: dict[tuple[Any, ...], torch.cuda.CUDAGraph] = {}
         self._stage0_frame_graph_input: torch.Tensor | None = None
+        self._stage0_frame_graph_seed: torch.Tensor | None = None
+        self._stage0_frame_graph_frame_step: torch.Tensor | None = None
         self._stage0_frame_graph_continue: torch.Tensor | None = None
         self._stage0_frame_graph_codes: torch.Tensor | None = None
+        self._stage0_frame_graph_audio_embed: torch.Tensor | None = None
         self._stage0_frame_graph_max_batch = 0
         self._stage0_frame_graph_bucket_sizes = self._parse_stage0_frame_graph_batch_buckets()
+        self._stage0_frame_graph_stats: dict[str, Any] = {
+            "capture_count": 0,
+            "replay_count": 0,
+            "eager_fallback_count": 0,
+            "fallback_by_reason": {},
+            "bucket_usage": {},
+        }
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
@@ -1369,6 +1380,24 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
     def should_enable_stage0_decode_batch_preprocess(self) -> bool:
         return True
+
+    def _record_stage0_frame_graph_fallback(self, reason: str, count: int = 1) -> None:
+        stats = self._stage0_frame_graph_stats
+        stats["eager_fallback_count"] = int(stats.get("eager_fallback_count", 0)) + int(count)
+        by_reason = stats.setdefault("fallback_by_reason", {})
+        by_reason[reason] = int(by_reason.get(reason, 0)) + int(count)
+
+    def _record_stage0_frame_graph_bucket(self, bucket: int, count: int = 1) -> None:
+        usage = self._stage0_frame_graph_stats.setdefault("bucket_usage", {})
+        usage[int(bucket)] = int(usage.get(int(bucket), 0)) + int(count)
+
+    def get_stage0_frame_graph_stats(self) -> dict[str, Any]:
+        stats = copy.deepcopy(self._stage0_frame_graph_stats)
+        graph_hits = int(stats.get("replay_count", 0))
+        eager = int(stats.get("eager_fallback_count", 0))
+        denom = graph_hits + eager
+        stats["graph_hit_rate"] = (float(graph_hits) / float(denom)) if denom else 0.0
+        return stats
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -1580,6 +1609,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     ) -> None:
         if (
             self._stage0_frame_graph_input is not None
+            and self._stage0_frame_graph_seed is not None
+            and self._stage0_frame_graph_frame_step is not None
             and self._stage0_frame_graph_input.device == device
             and self._stage0_frame_graph_input.dtype == dtype
             and self._stage0_frame_graph_max_batch >= batch_size
@@ -1587,8 +1618,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             return
         cap = max(int(batch_size), self._stage0_frame_graph_max_batch, 1)
         self._stage0_frame_graph_input = torch.zeros(cap, self.hidden_size, device=device, dtype=dtype)
+        self._stage0_frame_graph_seed = torch.zeros(cap, device=device, dtype=torch.long)
+        self._stage0_frame_graph_frame_step = torch.zeros(cap, device=device, dtype=torch.long)
         self._stage0_frame_graph_continue = torch.zeros(cap, device=device, dtype=torch.bool)
         self._stage0_frame_graph_codes = torch.zeros(cap, self.n_vq, device=device, dtype=torch.long)
+        self._stage0_frame_graph_audio_embed = torch.zeros(cap, self.hidden_size, device=device, dtype=dtype)
         self._stage0_frame_graph_max_batch = cap
         self._stage0_frame_graphs.clear()
 
@@ -1602,24 +1636,27 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         top_p: float,
     ) -> None:
         assert self._stage0_frame_graph_input is not None
+        assert self._stage0_frame_graph_seed is not None
+        assert self._stage0_frame_graph_frame_step is not None
         assert self._stage0_frame_graph_continue is not None
         assert self._stage0_frame_graph_codes is not None
-        should_continue, codes = self.local_transformer.generate_frame(
+        assert self._stage0_frame_graph_audio_embed is not None
+        should_continue, codes, audio_embed = self.local_transformer.generate_frame_graphable(
             self._stage0_frame_graph_input[:batch_size],
             self.audio_lm_heads,
             self.audio_embeddings,
             self.local_text_lm_head,
             n_vq=self.n_vq,
+            seed=self._stage0_frame_graph_seed[:batch_size],
+            frame_step=self._stage0_frame_graph_frame_step[:batch_size],
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            repetition_penalty=1.0,
-            history_per_codebook=None,
-            generator=None,
         )
         self._stage0_frame_graph_continue[:batch_size].copy_(should_continue)
         self._stage0_frame_graph_codes[:batch_size].copy_(codes)
+        self._stage0_frame_graph_audio_embed[:batch_size].copy_(audio_embed)
 
     def _decode_stage0_local_frames_eager(
         self,
@@ -1630,6 +1667,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         top_k: int,
         top_p: float,
         generator: torch.Generator | None,
+        repetition_penalty: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.local_transformer.generate_frame(
             hidden_batch,
@@ -1641,57 +1679,104 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            repetition_penalty=1.0,
+            repetition_penalty=repetition_penalty,
             history_per_codebook=None,
             generator=generator,
+        )
+
+    def _decode_stage0_local_frames_seeded_eager(
+        self,
+        hidden_batch: torch.Tensor,
+        *,
+        seed: torch.Tensor,
+        frame_step: torch.Tensor,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.local_transformer.generate_frame_graphable(
+            hidden_batch,
+            self.audio_lm_heads,
+            self.audio_embeddings,
+            self.local_text_lm_head,
+            n_vq=self.n_vq,
+            seed=seed,
+            frame_step=frame_step,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
         )
 
     def _decode_stage0_local_frames_graph(
         self,
         hidden_batch: torch.Tensor,
         *,
+        seed: torch.Tensor,
+        frame_step: torch.Tensor,
         do_sample: bool,
         temperature: float,
         top_k: int,
         top_p: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """CUDA graph wrapper for the local frame transformer.
-
-        The graph is deliberately limited to deterministic/greedy frame decode.
-        Sampling and unsupported devices fall back to eager batching without
-        changing correctness.
-        """
-        if hidden_batch.device.type != "cuda" or do_sample:
-            return self._decode_stage0_local_frames_eager(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CUDA graph wrapper for seeded local frame decode."""
+        if hidden_batch.device.type != "cuda":
+            self._record_stage0_frame_graph_fallback("cpu_device", int(hidden_batch.shape[0]))
+            return self._decode_stage0_local_frames_seeded_eager(
                 hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
                 do_sample=do_sample,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                generator=None,
             )
         batch_size = int(hidden_batch.shape[0])
+        if hidden_batch.dim() != 2 or hidden_batch.shape[-1] != self.hidden_size or batch_size <= 0:
+            self._record_stage0_frame_graph_fallback("unsupported_shape", max(batch_size, 1))
+            return self._decode_stage0_local_frames_seeded_eager(
+                hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
         bucket = self._stage0_frame_graph_bucket(batch_size)
         dtype = hidden_batch.dtype
         self._ensure_stage0_frame_graph_buffers(batch_size=bucket, device=hidden_batch.device, dtype=dtype)
         assert self._stage0_frame_graph_input is not None
+        assert self._stage0_frame_graph_seed is not None
+        assert self._stage0_frame_graph_frame_step is not None
         assert self._stage0_frame_graph_continue is not None
         assert self._stage0_frame_graph_codes is not None
+        assert self._stage0_frame_graph_audio_embed is not None
 
         self._stage0_frame_graph_input[:bucket].zero_()
+        self._stage0_frame_graph_seed[:bucket].zero_()
+        self._stage0_frame_graph_frame_step[:bucket].zero_()
         self._stage0_frame_graph_input[:batch_size].copy_(hidden_batch)
-        graph_key = (bucket, (bool(do_sample), float(temperature), int(top_k), float(top_p)))
+        self._stage0_frame_graph_seed[:batch_size].copy_(seed.to(device=hidden_batch.device, dtype=torch.long))
+        self._stage0_frame_graph_frame_step[:batch_size].copy_(
+            frame_step.to(device=hidden_batch.device, dtype=torch.long)
+        )
+        self._record_stage0_frame_graph_bucket(bucket)
+        graph_key = (
+            int(bucket),
+            str(dtype),
+            str(hidden_batch.device),
+            bool(do_sample),
+            float(temperature),
+            int(top_k),
+            float(top_p),
+            int(self.n_vq),
+            int(self.audio_vocab_size),
+        )
         graph = self._stage0_frame_graphs.get(graph_key)
         if graph is None:
-            self._stage0_frame_graph_kernel(
-                bucket,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            try:
                 self._stage0_frame_graph_kernel(
                     bucket,
                     do_sample=do_sample,
@@ -1699,29 +1784,75 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                     top_k=top_k,
                     top_p=top_p,
                 )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self._stage0_frame_graph_kernel(
+                        bucket,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+            except Exception:
+                self._record_stage0_frame_graph_fallback("capture_failed", batch_size)
+                logger.exception("MOSS-TTS Local Stage-0 frame graph capture failed; falling back to eager")
+                self._stage0_frame_graphs.pop(graph_key, None)
+                return self._decode_stage0_local_frames_seeded_eager(
+                    hidden_batch,
+                    seed=seed,
+                    frame_step=frame_step,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
             self._stage0_frame_graphs[graph_key] = graph
+            self._stage0_frame_graph_stats["capture_count"] = int(
+                self._stage0_frame_graph_stats.get("capture_count", 0)
+            ) + 1
             return (
                 self._stage0_frame_graph_continue[:batch_size].clone(),
                 self._stage0_frame_graph_codes[:batch_size].clone(),
+                self._stage0_frame_graph_audio_embed[:batch_size].clone(),
             )
 
-        graph.replay()
+        try:
+            graph.replay()
+        except Exception:
+            self._record_stage0_frame_graph_fallback("replay_failed", batch_size)
+            logger.exception("MOSS-TTS Local Stage-0 frame graph replay failed; falling back to eager")
+            self._stage0_frame_graphs.pop(graph_key, None)
+            return self._decode_stage0_local_frames_seeded_eager(
+                hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        self._stage0_frame_graph_stats["replay_count"] = int(self._stage0_frame_graph_stats.get("replay_count", 0)) + 1
         return (
             self._stage0_frame_graph_continue[:batch_size].clone(),
             self._stage0_frame_graph_codes[:batch_size].clone(),
+            self._stage0_frame_graph_audio_embed[:batch_size].clone(),
         )
 
     def _decode_stage0_local_frames(
         self,
         hidden_batch: torch.Tensor,
         *,
+        seed: torch.Tensor | None = None,
+        frame_step: torch.Tensor | None = None,
         do_sample: bool,
         temperature: float,
         top_k: int,
         top_p: float,
         generator: torch.Generator | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if generator is not None or not _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_FRAME_GRAPH"):
+        repetition_penalty: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if repetition_penalty != 1.0:
+            self._record_stage0_frame_graph_fallback("repetition_penalty", int(hidden_batch.shape[0]))
             return self._decode_stage0_local_frames_eager(
                 hidden_batch,
                 do_sample=do_sample,
@@ -1729,25 +1860,50 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 generator=generator,
+                repetition_penalty=repetition_penalty,
+            ) + (None,)
+        if seed is None or frame_step is None:
+            self._record_stage0_frame_graph_fallback("no_seed", int(hidden_batch.shape[0]))
+            return self._decode_stage0_local_frames_eager(
+                hidden_batch,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+            ) + (None,)
+        if not _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_FRAME_GRAPH"):
+            return self._decode_stage0_local_frames_seeded_eager(
+                hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
             )
         try:
             return self._decode_stage0_local_frames_graph(
                 hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
                 do_sample=do_sample,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
             )
         except Exception:
+            self._record_stage0_frame_graph_fallback("capture_failed", int(hidden_batch.shape[0]))
             logger.exception("MOSS-TTS Local Stage-0 frame graph failed; falling back to eager local decode")
             self._stage0_frame_graphs.clear()
-            return self._decode_stage0_local_frames_eager(
+            return self._decode_stage0_local_frames_seeded_eager(
                 hidden_batch,
+                seed=seed,
+                frame_step=frame_step,
                 do_sample=do_sample,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                generator=generator,
             )
 
     def _talker_mtp_stage0_batch(
@@ -1769,6 +1925,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         active_rows: list[int] = []
         states: list[dict[str, Any]] = []
         accs: list[torch.Tensor | None] = []
+        seeds: list[int | None] = []
         for i in range(bsz):
             info = req_infos[i] if i < len(req_infos) and isinstance(req_infos[i], dict) else {}
             state = dict(info.get("audio_state", {}) or {})
@@ -1785,20 +1942,63 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             states.append(state)
             acc = (info.get("audio_codes", {}) or {}).get("accumulated")
             accs.append(acc if isinstance(acc, torch.Tensor) else None)
+            seed_raw = info.get("tts_local_seed", state.get("tts_local_seed"))
+            try:
+                seed = int(seed_raw) if seed_raw is not None else None
+            except (TypeError, ValueError):
+                seed = None
+            seeds.append(seed)
 
         if not active_rows:
             return input_embeds_out, None
 
         active_idx = torch.tensor(active_rows, device=dev, dtype=torch.long)
         hidden_batch = last_talker_hidden.index_select(0, active_idx).to(dtype=input_embeds_out.dtype)
-        should_continue_t, codes_b = self._decode_stage0_local_frames(
-            hidden_batch,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            generator=generator,
-        )
+        num_active = len(active_rows)
+        should_continue_t = torch.empty(num_active, dtype=torch.bool, device=dev)
+        codes_b = torch.empty(num_active, self.n_vq, dtype=torch.long, device=dev)
+        audio_embed_b = torch.empty(num_active, self.hidden_size, dtype=input_embeds_out.dtype, device=dev)
+        have_audio_embed = torch.zeros(num_active, dtype=torch.bool, device=dev)
+
+        seeded_local_rows = [i for i, seed in enumerate(seeds) if seed is not None]
+        if seeded_local_rows:
+            seeded_idx = torch.tensor(seeded_local_rows, device=dev, dtype=torch.long)
+            seed_t = torch.tensor([int(seeds[i]) for i in seeded_local_rows], device=dev, dtype=torch.long)
+            step_t = torch.tensor(
+                [int(states[i].get("step", 0)) for i in seeded_local_rows],
+                device=dev,
+                dtype=torch.long,
+            )
+            should_continue_s, codes_s, audio_embed_s = self._decode_stage0_local_frames(
+                hidden_batch.index_select(0, seeded_idx),
+                seed=seed_t,
+                frame_step=step_t,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=None,
+            )
+            should_continue_t.index_copy_(0, seeded_idx, should_continue_s)
+            codes_b.index_copy_(0, seeded_idx, codes_s)
+            if audio_embed_s is not None:
+                audio_embed_b.index_copy_(0, seeded_idx, audio_embed_s.to(dtype=input_embeds_out.dtype))
+                have_audio_embed.index_fill_(0, seeded_idx, True)
+
+        for local_i, seed in enumerate(seeds):
+            if seed is not None:
+                continue
+            should_continue_u, codes_u, _ = self._decode_stage0_local_frames(
+                hidden_batch[local_i : local_i + 1],
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+            )
+            should_continue_t[local_i : local_i + 1] = should_continue_u
+            codes_b[local_i : local_i + 1] = codes_u
+
         for local_i, row_i in enumerate(active_rows):
             info = req_infos[row_i] if row_i < len(req_infos) and isinstance(req_infos[row_i], dict) else {}
             state = states[local_i]
@@ -1826,9 +2026,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             )
             state["step"] = step + 1
             current = new_codes.unsqueeze(0)
-            input_embeds_out[row_i : row_i + 1] = input_embeds_out[row_i : row_i + 1] + self._audio_embed(
-                current
-            ).to(dtype=input_embeds_out.dtype)
+            if bool(have_audio_embed[local_i].item()):
+                audio_embed = audio_embed_b[local_i : local_i + 1]
+            else:
+                audio_embed = self._audio_embed(current).to(dtype=input_embeds_out.dtype)
+            input_embeds_out[row_i : row_i + 1] = input_embeds_out[row_i : row_i + 1] + audio_embed
             info["audio_state"] = state
             info["audio_codes"] = {
                 "current": current,

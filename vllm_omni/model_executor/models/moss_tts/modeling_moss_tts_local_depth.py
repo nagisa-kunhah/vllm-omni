@@ -27,6 +27,82 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     _sample_token,
 )
 
+_RNG_MODULUS = 2_147_483_647
+
+
+def _stable_uniform01(
+    seed: torch.Tensor,
+    frame_step: torch.Tensor,
+    codebook_index: int,
+    sample_kind: int,
+) -> torch.Tensor:
+    """Deterministic per-row uniform random value in [0, 1).
+
+    The row position is intentionally not part of the mix, so a request gets
+    the same random stream regardless of which other requests share the batch.
+    The arithmetic stays below int64 overflow before the modulo.
+    """
+    seed_i64 = torch.remainder(seed.to(dtype=torch.long), _RNG_MODULUS)
+    step_i64 = torch.remainder(frame_step.to(dtype=torch.long), _RNG_MODULUS)
+    x = torch.remainder(
+        seed_i64
+        + step_i64 * 1_103_515_245
+        + int(codebook_index + 1) * 97_531
+        + int(sample_kind + 1) * 2_654_435_761,
+        _RNG_MODULUS,
+    )
+    x = torch.remainder(x * 48_271 + 12_820_163, _RNG_MODULUS)
+    x = torch.remainder(x * 40_692 + 7_253_089, _RNG_MODULUS)
+    return (x.to(dtype=torch.float32) + 0.5) / float(_RNG_MODULUS)
+
+
+def _sample_token_stable(
+    logits: torch.Tensor,
+    seed: torch.Tensor,
+    frame_step: torch.Tensor,
+    *,
+    codebook_index: int,
+    sample_kind: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    do_sample: bool,
+) -> torch.Tensor:
+    """Graph-friendly top-k/top-p sampler with deterministic tensor RNG."""
+    if not do_sample or temperature <= 0:
+        return logits.argmax(dim=-1)
+
+    logits = logits.float() / max(float(temperature), 1e-6)
+    vocab_size = int(logits.shape[-1])
+    if top_k and top_k > 0 and top_k < vocab_size:
+        top_vals, _ = torch.topk(logits, int(top_k), dim=-1)
+        thresh = top_vals[..., -1:].expand_as(logits)
+        logits = torch.where(logits < thresh, torch.full_like(logits, float("-inf")), logits)
+
+    if 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        sorted_finite = torch.isfinite(sorted_logits)
+        safe_sorted_logits = torch.where(
+            sorted_finite.any(dim=-1, keepdim=True),
+            sorted_logits,
+            torch.zeros_like(sorted_logits),
+        )
+        probs = F.softmax(safe_sorted_logits, dim=-1)
+        cum = probs.cumsum(dim=-1)
+        drop = cum > float(top_p)
+        drop[..., 1:] = drop[..., :-1].clone()
+        drop[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_idx, sorted_logits)
+
+    finite = torch.isfinite(logits)
+    safe_logits = torch.where(finite.any(dim=-1, keepdim=True), logits, torch.zeros_like(logits))
+    probs = F.softmax(safe_logits, dim=-1)
+    cdf = probs.cumsum(dim=-1)
+    u = _stable_uniform01(seed, frame_step, codebook_index, sample_kind).to(device=logits.device)
+    sampled = (cdf < u.unsqueeze(-1)).sum(dim=-1)
+    return sampled.clamp_max(vocab_size - 1).to(dtype=torch.long)
+
 
 class _MossTTSLocalAttention(nn.Module):
     """GPT2-style fused-QKV self-attention with interleaved RoPE.
@@ -235,6 +311,82 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 local_hidden = hidden[:, channel_index + 1, :]
 
         return should_continue, codes
+
+    @torch.no_grad()
+    def generate_frame_graphable(
+        self,
+        backbone_last_hidden: torch.Tensor,  # (B, H)
+        audio_lm_heads: nn.ModuleList,  # n_vq x Linear(H -> audio_vocab_size)
+        audio_embeddings: nn.ModuleList,  # n_vq x Embedding(audio_vocab_size, H)
+        local_text_lm_head: nn.Module,  # Linear(H -> 2): [continue, stop]
+        *,
+        n_vq: int,
+        seed: torch.Tensor,
+        frame_step: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        text_temperature: float = 1.0,
+        text_top_k: int = 50,
+        text_top_p: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate one frame using only tensor RNG/state.
+
+        Returns ``(should_continue, codes, audio_embed)``. ``audio_embed`` is
+        the additive embedding for the sampled code frame, ready to overlay on
+        the next text-token embedding.
+        """
+        batch_size = backbone_last_hidden.shape[0]
+        dtype = self.ln_f.weight.dtype
+        seed = seed.to(device=backbone_last_hidden.device, dtype=torch.long).reshape(batch_size)
+        frame_step = frame_step.to(device=backbone_last_hidden.device, dtype=torch.long).reshape(batch_size)
+
+        embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
+        embeds[:, 0, :] = backbone_last_hidden.to(dtype)
+
+        hidden = self._forward_prefix(embeds[:, :1, :])
+        local_hidden = hidden[:, 0, :]
+
+        binary_logits = local_text_lm_head(local_hidden).float()
+        binary_choice = _sample_token_stable(
+            binary_logits,
+            seed,
+            frame_step,
+            codebook_index=-1,
+            sample_kind=0,
+            temperature=text_temperature,
+            top_k=text_top_k,
+            top_p=text_top_p,
+            do_sample=do_sample,
+        )
+        should_continue = binary_choice.eq(0)
+
+        codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
+        audio_embed = backbone_last_hidden.new_zeros((batch_size, self.hidden_size), dtype=dtype)
+        for channel_index in range(n_vq):
+            channel_logits = audio_lm_heads[channel_index](local_hidden).float()
+            channel_token = _sample_token_stable(
+                channel_logits,
+                seed,
+                frame_step,
+                codebook_index=channel_index,
+                sample_kind=channel_index + 1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+            )
+            codes[:, channel_index] = channel_token
+            channel_embed = audio_embeddings[channel_index](channel_token).to(dtype)
+            audio_embed = audio_embed + channel_embed
+
+            if channel_index + 1 < n_vq:
+                embeds[:, channel_index + 1, :] = channel_embed
+                hidden = self._forward_prefix(embeds[:, : channel_index + 2, :])
+                local_hidden = hidden[:, channel_index + 1, :]
+
+        return should_continue, codes, audio_embed
 
 
 __all__ = ["MossTTSLocalDepthTransformer"]

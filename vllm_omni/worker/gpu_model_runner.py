@@ -1867,7 +1867,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 seed = extra_args.get("tts_local_seed")
             return int(seed) if seed is not None else None
 
-        if decode_batch_size > 1 and any(_explicit_talker_seed(req_id) is not None for req_id in decode_req_ids):
+        supports_stable_seeded_batch = bool(
+            getattr(self.model, "supports_talker_mtp_stable_seeded_batch", False)
+            and getattr(self.model, "talker_mtp_accepts_req_infos", False)
+            and _env_enabled("MOSS_TTS_LOCAL_ENABLE_STAGE0_FRAME_GRAPH")
+        )
+        if (
+            not supports_stable_seeded_batch
+            and decode_batch_size > 1
+            and any(_explicit_talker_seed(req_id) is not None for req_id in decode_req_ids)
+        ):
             # A torch.Generator is a single stream. Using one generator for a
             # multi-row batch would make explicitly-seeded requests depend on
             # other rows in the same scheduler step, so keep that path scalar.
@@ -1891,7 +1900,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
 
         generator = None
-        if decode_req_ids:
+        if decode_req_ids and not supports_stable_seeded_batch:
             first_req_id = decode_req_ids[0]
             seed = _explicit_talker_seed(first_req_id)
             if seed is not None:
@@ -1914,9 +1923,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             talker_kwargs["generator"] = generator
         if getattr(self.model, "talker_mtp_accepts_req_infos", False):
             talker_kwargs["req_ids"] = decode_req_ids
-            talker_kwargs["req_infos"] = [
-                self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
-            ]
+            req_infos = [self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids]
+            if supports_stable_seeded_batch:
+                for req_id, req_info in zip(decode_req_ids, req_infos, strict=True):
+                    seed = _explicit_talker_seed(req_id)
+                    if seed is not None:
+                        req_info["tts_local_seed"] = int(seed)
+                    else:
+                        req_info.pop("tts_local_seed", None)
+            talker_kwargs["req_infos"] = req_infos
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
