@@ -338,6 +338,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 text_attention_mask=prompt_attention_mask,
                 ref_image_hidden_states=None,
                 freqs_cis=self.gen_freqs_cis,
+                teacache_branch="positive",
             )
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
@@ -348,6 +349,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                     text_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
+                    teacache_branch="negative",
                 )
                 model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]

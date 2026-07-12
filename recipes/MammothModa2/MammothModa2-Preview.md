@@ -85,6 +85,27 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output mammoth_t2i.png
 ```
 
+TeaCache can be enabled for the DiT stage with the same user-facing sampling
+parameters:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview \
+  --stage-configs-path vllm_omni/deploy/mammoth_moda2.yaml \
+  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+  --height 1024 \
+  --width 1024 \
+  --cache-backend tea_cache \
+  --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+  --output mammoth_t2i_teacache.png
+```
+
+The bundled MammothModa2 TeaCache coefficients are a Lumina2 bootstrap because
+MammothModa2's DiT uses Lumina-style timestep/caption embedding, refiners, and
+joint transformer layers. Treat them as conservative defaults; run model-specific
+quality/speed validation before replacing them with MammothModa2-fitted
+coefficients.
+
 The `--extra-body` JSON forwards MammothModa2-specific parameters into
 `OmniDiffusionSamplingParams.extra_args`. Keys are filtered against the model's
 declared `extra_body_params` (see
