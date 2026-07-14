@@ -224,6 +224,7 @@ reasoner/generator components inside the model forward pass.
 | Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attrs (Layerwise specific) |
 |--------------|----------------|-----------|---------------------|-------------------|-----------------------------------|
 | LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| JoyImageEditPipeline | `jdopensource/JoyAI-Image-Edit-Diffusers` | `JoyImageEditTransformer3DModel` | ✓ | ✓ | `"double_blocks"` |
 | NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | `"layers"` |
 | OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | `"transformer"` |
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | `"transformer_blocks"` |
