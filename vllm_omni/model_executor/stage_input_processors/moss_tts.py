@@ -98,24 +98,6 @@ def _moss_raw_control_sentinel(req_id: str) -> OmniPayloadStruct:
     )
 
 
-def _moss_raw_tensor_payload(req_id: str, chunk_codes: torch.Tensor, finished: bool) -> OmniPayloadStruct:
-    codec_codes = chunk_codes.transpose(0, 1).contiguous().to(torch.long)
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=codec_codes),
-        meta=MetaStruct(
-            req_id=[req_id],
-            left_context_size=0,
-            codec_streaming=True,
-            codec_chunk_frames=int(chunk_codes.shape[0]),
-            codec_left_context_frames=0,
-            code_flat_numel=int(codec_codes.numel()),
-            stream_finished=torch.tensor(bool(finished), dtype=torch.bool),
-            finished=torch.tensor(bool(finished), dtype=torch.bool),
-        ),
-        request_id=req_id,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Non-streaming (sync): called once after Stage 0 finishes
 # ---------------------------------------------------------------------------
@@ -406,7 +388,22 @@ def talker2codec_raw_async_chunk(
         transfer_manager.request_payload.pop(req_id, None)
         _prune_moss_raw_finalized_states(transfer_manager)
 
-    return _moss_raw_tensor_payload(req_id, chunk_codes, finished)
+    codec_codes = chunk_codes.transpose(0, 1).contiguous().to(torch.long)
+
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=codec_codes),
+        meta=MetaStruct(
+            req_id=[req_id],
+            left_context_size=0,
+            codec_streaming=True,
+            codec_chunk_frames=int(chunk_codes.shape[0]),
+            codec_left_context_frames=0,
+            code_flat_numel=int(codec_codes.numel()),
+            stream_finished=torch.tensor(finished, dtype=torch.bool),
+            finished=torch.tensor(finished, dtype=torch.bool),
+        ),
+        request_id=req_id,
+    )
 
 
 __all__ = [
