@@ -35,6 +35,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
+_MOSS_LOCAL_REP_WINDOW = 50
+
 
 def _maybe_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
@@ -152,7 +154,6 @@ def _moss_local_append_history_frame(
     n_vq: int,
 ) -> dict[str, Any]:
     accumulated = audio_codes.get("accumulated")
-    rep_window = 50
     if isinstance(accumulated, dict):
         current_length = int(accumulated.get("length", 0) or 0)
     elif isinstance(accumulated, torch.Tensor):
@@ -162,7 +163,7 @@ def _moss_local_append_history_frame(
     state = _moss_local_normalize_history(
         audio_codes,
         n_vq=n_vq,
-        rep_window=rep_window,
+        rep_window=_MOSS_LOCAL_REP_WINDOW,
         required_length=current_length + 1,
     )
 
@@ -1675,8 +1676,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 )
                 continue
 
-            rep_window = 50
-            hist_per_cb = _moss_local_get_history_tail_per_codebook(audio_codes, self.n_vq, rep_window)
+            hist_per_cb = _moss_local_get_history_tail_per_codebook(
+                audio_codes, self.n_vq, _MOSS_LOCAL_REP_WINDOW
+            )
 
             should_continue_t, new_codes_b = self.local_transformer.generate_frame(
                 last_talker_hidden[i : i + 1],
