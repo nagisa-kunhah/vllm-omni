@@ -53,7 +53,8 @@ def _moss_codec_codes_from_payload_or_input(
         if isinstance(codes, dict):
             payload = codes.get("audio")
 
-    source = payload if payload is not None else input_seg
+    has_payload = payload is not None
+    source = payload if has_payload else input_seg
     if isinstance(source, torch.Tensor):
         codes_tensor = source
     elif isinstance(source, (list, tuple)):
@@ -62,18 +63,20 @@ def _moss_codec_codes_from_payload_or_input(
         return None
 
     if codes_tensor.ndim == 2:
-        if int(codes_tensor.shape[0]) == int(n_vq):
-            codes_nq_t = codes_tensor
-        elif int(codes_tensor.shape[1]) == int(n_vq):
-            codes_nq_t = codes_tensor.transpose(0, 1)
-        else:
+        if not has_payload:
             logger.warning(
-                "MossTTS codec payload shape %s does not match n_vq=%d; skipping.",
+                "MossTTS codec input_ids must be flat codebook-major tokens; got 2-D shape %s.",
+                tuple(codes_tensor.shape),
+            )
+            return None
+        if int(codes_tensor.shape[0]) != int(n_vq):
+            logger.warning(
+                "MossTTS codec payload must use codec-native shape (n_vq, T); got %s for n_vq=%d.",
                 tuple(codes_tensor.shape),
                 n_vq,
             )
             return None
-        return codes_nq_t.to(device=device, dtype=torch.long).contiguous()
+        return codes_tensor.to(device=device, dtype=torch.long).contiguous()
 
     flat = codes_tensor.reshape(-1)
     if flat.numel() == 0:

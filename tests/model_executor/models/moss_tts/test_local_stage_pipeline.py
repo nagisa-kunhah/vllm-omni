@@ -199,7 +199,6 @@ def test_codec_decoder_accepts_connector_payload_layouts_and_control_sentinel() 
 
     cases = [
         (_codec_info(native), native),
-        (_codec_info(frame_major), frame_major.transpose(0, 1).contiguous()),
         (_codec_info(flat), flat.reshape(N_VQ, 2)),
         (_codec_info(list(range(N_VQ * 2))), flat.reshape(N_VQ, 2)),
         ({"meta": {}}, flat.reshape(N_VQ, 2)),
@@ -210,6 +209,8 @@ def test_codec_decoder_accepts_connector_payload_layouts_and_control_sentinel() 
         assert parsed.dtype == torch.long
         assert parsed.device.type == "cpu"
         assert torch.equal(parsed, expected)
+
+    assert _moss_codec_codes_from_payload_or_input(flat, _codec_info(frame_major), N_VQ, "cpu") is None
 
     decoder = _decoder()
     out = decoder.forward(
