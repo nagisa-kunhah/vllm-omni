@@ -1676,9 +1676,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 )
                 continue
 
-            hist_per_cb = _moss_local_get_history_tail_per_codebook(
-                audio_codes, self.n_vq, _MOSS_LOCAL_REP_WINDOW
-            )
+            hist_per_cb = _moss_local_get_history_tail_per_codebook(audio_codes, self.n_vq, _MOSS_LOCAL_REP_WINDOW)
 
             should_continue_t, new_codes_b = self.local_transformer.generate_frame(
                 last_talker_hidden[i : i + 1],
