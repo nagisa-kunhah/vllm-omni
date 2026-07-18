@@ -440,7 +440,7 @@ class NAVAPipeline(
     ) -> dict[str, torch.Tensor]:
         latent_h, latent_w = self.nava_config.video_latent_hw(ctx.height, ctx.width)
         video_tokens = ctx.frames * latent_h * latent_w
-        audio_tokens = self.nava_config.audio_latent_length(ctx.frames)
+        audio_tokens = self.nava_config.audio_latent_length(ctx.frames, fps=ctx.fps)
         # Video/audio latent initialization fixes the generated duration and
         # resolution before denoising starts. Upstream initializes and keeps
         # sampling latents in float32; the transformer casts internally where
