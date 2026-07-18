@@ -13,7 +13,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHand
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = os.getenv("VLLM_TEST_NAVA_MODEL", "/autodl-fs/data/models/NAVA")
+MODEL = os.getenv("VLLM_TEST_NAVA_MODEL", "baidu/NAVA")
 SERVED_MODEL_NAME = "nava"
 PROMPT = "A person speaks while standing near the sea."
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
