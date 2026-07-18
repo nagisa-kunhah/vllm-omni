@@ -1,0 +1,52 @@
+# Opt-in MiniCPM-o 4.5 deploy profile with an upstream stage-level CUDA Graph
+# for the Stage 0 thinker decode path. The default profile remains eager.
+#
+# Stage 0 captures only FULL_DECODE_ONLY at batch size 1; prefill and
+# multimodal encoder work stay outside the graph. Stage 1 remains eager so
+# the Talker/Token2Wav path and its inter-stage payload are unchanged.
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [1]
+      cudagraph_num_of_warmups: 2
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    # Keep Talker and in-process Token2Wav eager while validating thinker
+    # capture and replay.
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.75
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+# MiniCPM-o 4.5 has only been verified on CUDA devices.
+platforms: {}

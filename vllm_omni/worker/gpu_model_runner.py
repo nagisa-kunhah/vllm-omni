@@ -825,7 +825,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             return None
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | tuple | OmniOutput) -> dict:
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -833,6 +833,20 @@ class OmniGPUModelRunner(GPUModelRunner):
         ):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
+
+        elif (
+            hasattr(self.model, "have_multimodal_outputs")
+            and self.model.have_multimodal_outputs
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == len(OmniOutput._fields)
+            and isinstance(hidden_states[0], torch.Tensor)
+            and (hidden_states[1] is None or isinstance(hidden_states[1], dict))
+        ):
+            # vLLM's CUDA graph output weak-reference helper rebuilds a
+            # NamedTuple as a plain tuple for replay. Recover the OmniOutput
+            # fields so inter-stage payloads such as MiniCPM's latent survive.
+            text_hidden_states = hidden_states[0]
+            multimodal_outputs = hidden_states[1]
 
         elif isinstance(hidden_states, torch.Tensor):
             text_hidden_states = hidden_states

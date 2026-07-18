@@ -216,22 +216,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if self.model_stage == "llm":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
             # TODO: Remove this hack when NPU supports batched inputs properly
-            added_batch_dim = False
-            if input_ids is not None and input_ids.ndim == 1:
+            input_ids_added_batch_dim = input_ids is not None and input_ids.ndim == 1
+            positions_added_batch_dim = positions is not None and positions.ndim == 1
+            inputs_embeds_added_batch_dim = inputs_embeds is not None and inputs_embeds.ndim == 2
+
+            if input_ids_added_batch_dim:
                 input_ids = input_ids.unsqueeze(0)
-                added_batch_dim = True
-            if positions is not None and positions.ndim == 1:
+            if positions_added_batch_dim:
                 positions = positions.unsqueeze(0)
-                added_batch_dim = True
-            if inputs_embeds is not None and inputs_embeds.ndim == 2:
+            if inputs_embeds_added_batch_dim:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
-                added_batch_dim = True
             thinker_dev = self._module_device(self.thinker)
 
             # if input_ids is None, set it to a zero tensor
             if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev).unsqueeze(0)
-                added_batch_dim = True
+                input_ids_added_batch_dim = True
+
+            added_batch_dim = input_ids_added_batch_dim or positions_added_batch_dim or inputs_embeds_added_batch_dim
 
             # Ensure inputs on thinker's device
             if input_ids is not None and input_ids.device != thinker_dev:
@@ -243,16 +245,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
-                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                thinker_input_ids = input_ids[0] if input_ids is not None and input_ids_added_batch_dim else input_ids
                 thinker_positions = positions[0] if positions.ndim > 1 else positions
                 thinker_inputs_embeds = (
-                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                    inputs_embeds[0] if inputs_embeds is not None and inputs_embeds_added_batch_dim else inputs_embeds
                 )
             else:
-                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
-                thinker_positions = positions[0] if positions is not None and added_batch_dim else positions
+                thinker_input_ids = input_ids[0] if input_ids is not None and input_ids_added_batch_dim else input_ids
+                thinker_positions = positions[0] if positions is not None and positions_added_batch_dim else positions
                 thinker_inputs_embeds = (
-                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                    inputs_embeds[0] if inputs_embeds is not None and inputs_embeds_added_batch_dim else inputs_embeds
                 )
 
             # Run thinker

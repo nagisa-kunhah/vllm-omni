@@ -15,20 +15,25 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
+    load_deploy_config,
+    merge_pipeline_deploy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 _PIPELINE_KEY = "minicpmo_4_5"
+_DEPLOY_DIR = Path(__file__).parents[4] / "vllm_omni" / "deploy"
 
 
 class TestRegistryDeclaration:
@@ -141,3 +146,52 @@ class TestHfConfigPredicate:
 
     def test_rejects_empty_version(self, predicate) -> None:
         assert predicate(SimpleNamespace(version="")) is False
+
+
+class TestCudaGraphDeployProfile:
+    """The CUDA Graph profile opts in only the Stage 0 thinker decode path."""
+
+    def test_default_profile_remains_eager(self) -> None:
+        default = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        stage0 = next(stage for stage in default.stages if stage.stage_id == 0)
+        assert stage0.enforce_eager is True
+        assert stage0.compilation_config is None
+
+    def test_profile_preserves_stage_routing_and_graph_settings(self) -> None:
+        deploy_path = _DEPLOY_DIR / "minicpmo_4_5_cudagraph.yaml"
+        deploy = load_deploy_config(deploy_path)
+        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 2
+        stage0, stage1 = stages
+        assert stage0.model_stage == "llm"
+        assert stage1.model_stage == "tts"
+        assert stage0.yaml_engine_args["model_arch"] == "MiniCPMO45OmniForConditionalGeneration"
+        assert stage1.yaml_engine_args["model_arch"] == "MiniCPMO45OmniForConditionalGeneration"
+        assert stage0.yaml_engine_args["enforce_eager"] is False
+        assert stage0.yaml_engine_args["compilation_config"] == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+            "cudagraph_num_of_warmups": 2,
+        }
+        assert stage1.yaml_engine_args["enforce_eager"] is True
+
+    def test_structured_config_keeps_graph_on_thinker_only(self) -> None:
+        config = VllmOmniConfig.from_registry(
+            _PIPELINE_KEY,
+            deploy_config_path="minicpmo_4_5_cudagraph",
+        )
+
+        stage0 = config.stage_by_id(0)
+        stage1 = config.stage_by_id(1)
+        assert stage0.model_stage == "llm"
+        assert stage1.model_stage == "tts"
+        assert stage0.model_config.enforce_eager is False
+        assert stage0.model_config.compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+            "cudagraph_num_of_warmups": 2,
+        }
+        assert stage1.model_config.enforce_eager is True
+        assert stage1.model_config.compilation_config is None
