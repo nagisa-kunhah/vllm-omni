@@ -1069,6 +1069,25 @@ def test_forward_runs_native_generation_steps(tmp_path: Path) -> None:
     assert all(call["audio_text_embeds"] is not call["text_embeds"] for call in negative_calls)
 
 
+def test_forward_skips_negative_cfg_when_guidance_scales_are_one(tmp_path: Path) -> None:
+    transformer = FakeTransformer()
+    pipeline = _make_pipeline(tmp_path, transformer=transformer)
+
+    pipeline.forward(
+        _make_request(
+            "plain prompt",
+            extra_args={
+                "align_3d_cfg": False,
+                "video_guidance_scale": 1.0,
+                "audio_guidance_scale": 1.0,
+            },
+        )
+    )
+
+    assert len(transformer.calls) == 2
+    assert all("audio_text_embeds" not in call for call in transformer.calls)
+
+
 @pytest.mark.parametrize(
     "positive",
     [

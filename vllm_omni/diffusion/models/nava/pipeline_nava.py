@@ -472,8 +472,8 @@ class NAVAPipeline(
         video_latents: torch.Tensor,
         audio_latents: torch.Tensor,
         text_embeds: torch.Tensor,
-        negative_video_text_embeds: torch.Tensor | None,
-        negative_audio_text_embeds: torch.Tensor | None,
+        negative_video_text_embeds: torch.Tensor | list[torch.Tensor],
+        negative_audio_text_embeds: torch.Tensor | list[torch.Tensor],
         image_embeds: torch.Tensor | None,
         speaker_embeds: torch.Tensor | None,
         speaker_positions: list[list[int]] | None,
@@ -485,6 +485,7 @@ class NAVAPipeline(
         timesteps = self.scheduler.set_timesteps(ctx.num_steps, device=self.device)
         self.scheduler_audio.set_timesteps(ctx.num_steps, device=self.device)
         video_grid = self._video_grid(ctx)
+        needs_negative_cfg = ctx.video_guidance_scale != 1.0 or ctx.audio_guidance_scale != 1.0
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_index, timestep in enumerate(timesteps):
                 timestep_tensor = timestep.reshape(1)
@@ -500,7 +501,7 @@ class NAVAPipeline(
                     step_index=step_index,
                 )
                 negative = None
-                if negative_video_text_embeds is not None and negative_audio_text_embeds is not None:
+                if needs_negative_cfg:
                     negative = self.transformer(
                         video_latents=video_latents,
                         audio_latents=audio_latents,
