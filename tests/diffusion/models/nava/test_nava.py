@@ -680,7 +680,7 @@ def test_speaker_encoder_uses_torch_home_redimnet_cache(
     [
         ({"seed": 3}, (1, 5, 3), (1, 3, 4), 24),
         ({"num_frames": 9, "seed": 3}, (1, 9, 3), (1, 6, 4), 24),
-        ({"frame_rate": 8, "seed": 3}, (1, 5, 3), (1, 3, 4), 8),
+        ({"frame_rate": 8, "seed": 3}, (1, 5, 3), (1, 9, 4), 8),
     ],
 )
 def test_prepare_latents_shapes(
