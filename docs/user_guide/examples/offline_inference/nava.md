@@ -1,7 +1,10 @@
 # NAVA Offline Inference
 
-NAVA is exposed through `NAVAPipeline` for audio-video generation. The
-text/image-conditioned audio-video and speaker timbre paths are wired for
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/nava>.
+
+
+This example documents the native `NAVAPipeline` request shape in vLLM-Omni.
+The text/image-conditioned audio-video and speaker timbre paths are wired for
 real-checkpoint E2E validation. Speaker references use local ReDimNet assets
 prepared by the download script; runtime inference does not fetch speaker code.
 
@@ -40,5 +43,16 @@ python examples/offline_inference/nava/end2end.py \
   --output outputs/nava_timbre.pt
 ```
 
-NAVA acceleration and multi-GPU features are not listed as supported until
+Acceleration and multi-GPU modes for NAVA are not listed as supported until
 they are verified with real checkpoints.
+
+## Example materials
+
+??? abstract "download_nava.py"
+    ``````py
+    --8<-- "examples/offline_inference/nava/download_nava.py"
+    ``````
+??? abstract "end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/nava/end2end.py"
+    ``````
