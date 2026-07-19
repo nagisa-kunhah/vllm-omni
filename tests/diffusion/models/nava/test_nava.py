@@ -26,6 +26,7 @@ from vllm_omni.diffusion.models.nava.audio_vae import NAVAAudioVAE
 from vllm_omni.diffusion.models.nava.config import NAVAConfig, inject_speaker_sentinel, parse_speech_spans
 from vllm_omni.diffusion.models.nava.nava_transformer import (
     NAVATransformer,
+    WanLayerNorm,
     WanSelfAttention,
     _nava_attention,
     _rope_apply_1d,
@@ -163,6 +164,7 @@ def _make_pipeline(
         custom_pipeline_args=custom_pipeline_args_extra or {},
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(NAVAPipeline, "_validate_runtime_features", lambda self: None)
         _patch_native_components(
             monkeypatch,
             text_encoder=lambda *args, **kwargs: text_encoder,
@@ -176,7 +178,7 @@ def _make_pipeline(
 
 def _make_request(prompt: Any, **sampling_kwargs: Any) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[prompt],
+        prompt=prompt,
         sampling_params=OmniDiffusionSamplingParams(**sampling_kwargs),
         request_id="nava-test",
     )
@@ -257,6 +259,7 @@ def test_text_encoder_compile_defaults_to_eager_for_serving(
         captured.append(bool(kwargs["compile_model"]))
         return FakeTextEncoder()
 
+    monkeypatch.setattr(NAVAPipeline, "_validate_runtime_features", lambda self: None)
     _patch_native_components(monkeypatch, text_encoder=make_text_encoder)
 
     for custom_args in (
@@ -407,6 +410,7 @@ model:
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(NAVAPipeline, "_validate_runtime_features", lambda self: None)
         _patch_native_components(monkeypatch)
         pipeline = NAVAPipeline(od_config=od_config)
 
@@ -911,10 +915,14 @@ def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, t
             super().__init__()
             self.weight = nn.Parameter(torch.ones(()))
             self.config = SimpleNamespace(latent_channels=2)
+            self.register_buffer("latents_mean", torch.zeros(4))
+            self.register_buffer("latents_std", torch.ones(4))
             self.seen_shape: torch.Size | None = None
+            self.seen_latents: torch.Tensor | None = None
 
         def decode(self, latents: torch.Tensor, return_dict: bool = False):
             self.seen_shape = latents.shape
+            self.seen_latents = latents.detach().clone()
             return (torch.ones(latents.shape[0], 2, latents.shape[2], 2, device=latents.device),)
 
     class TinyVocoder(nn.Module):
@@ -940,6 +948,50 @@ def test_audio_vae_decode_unpatchifies_tokens(monkeypatch: pytest.MonkeyPatch, t
     assert waveform.shape == (1, 2, 12)
 
 
+def test_audio_vae_decode_denormalizes_checkpoint_latents(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class TinyAudioDecoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+            self.config = SimpleNamespace(latent_channels=2)
+            self.register_buffer("latents_mean", torch.tensor([1.0, 2.0, 3.0, 4.0]))
+            self.register_buffer("latents_std", torch.tensor([10.0, 20.0, 30.0, 40.0]))
+            self.seen_latents: torch.Tensor | None = None
+
+        def decode(self, latents: torch.Tensor, return_dict: bool = False):
+            self.seen_latents = latents.detach().clone()
+            return (torch.ones(latents.shape[0], 2, latents.shape[2], 2, device=latents.device),)
+
+    class TinyVocoder(nn.Module):
+        output_sampling_rate = 16000
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+
+        def forward(self, mel: torch.Tensor) -> torch.Tensor:
+            return torch.ones(mel.shape[0], 2, mel.shape[2] * 4, device=mel.device)
+
+    decoder = TinyAudioDecoder()
+    monkeypatch.setattr(NAVAAudioVAE, "_load_components", staticmethod(lambda _: (decoder, TinyVocoder())))
+    ckpt_dir = tmp_path / "params" / "LTX2"
+    ckpt_dir.mkdir(parents=True)
+    (ckpt_dir / "ltx-2.3-22b-dev_audio_vae.safetensors").write_bytes(b"placeholder")
+
+    audio_vae = NAVAAudioVAE(str(tmp_path), NAVAConfig(audio_vae_ckpt_dir="params"))
+    audio_vae.decode(torch.ones(1, 3, 4))
+
+    expected = torch.tensor(
+        [
+            [
+                [[11.0, 22.0], [11.0, 22.0], [11.0, 22.0]],
+                [[33.0, 44.0], [33.0, 44.0], [33.0, 44.0]],
+            ]
+        ]
+    )
+    torch.testing.assert_close(decoder.seen_latents, expected)
+
+
 def test_audio_vae_decode_resamples_from_vocoder_output_rate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -949,6 +1001,8 @@ def test_audio_vae_decode_resamples_from_vocoder_output_rate(
             super().__init__()
             self.weight = nn.Parameter(torch.ones(()))
             self.config = SimpleNamespace(latent_channels=2)
+            self.register_buffer("latents_mean", torch.zeros(4))
+            self.register_buffer("latents_std", torch.ones(4))
 
         def decode(self, latents: torch.Tensor, return_dict: bool = False):
             return (torch.ones(latents.shape[0], 2, latents.shape[2], 2, device=latents.device),)
@@ -1192,8 +1246,10 @@ def test_nava_default_init_requires_local_model_assets(tmp_path: Path) -> None:
         model_config={"height": 16, "width": 16, "num_frames": 5},
     )
 
-    with pytest.raises(FileNotFoundError, match="text tokenizer"):
-        NAVAPipeline(od_config=od_config)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(NAVAPipeline, "_validate_runtime_features", lambda self: None)
+        with pytest.raises(FileNotFoundError, match="text tokenizer"):
+            NAVAPipeline(od_config=od_config)
 
 
 def test_transformer_load_weights_handles_prefixless_and_unmatched_keys() -> None:
@@ -1208,6 +1264,19 @@ def test_transformer_load_weights_handles_prefixless_and_unmatched_keys() -> Non
 
     assert loaded == {"backbone.weight"}
     assert torch.equal(transformer.backbone.weight, torch.ones(2, 2))
+
+
+def test_transformer_load_weights_preserves_fp32_norm3_parameters() -> None:
+    transformer = NAVATransformer.__new__(NAVATransformer)
+    nn.Module.__init__(transformer)
+    transformer.backbone = nn.Module()
+    transformer.backbone.norm3 = WanLayerNorm(2, elementwise_affine=True).float()
+
+    loaded = transformer.load_weights([("backbone.norm3.weight", torch.ones(2))])
+
+    assert loaded == {"backbone.norm3.weight"}
+    assert transformer.backbone.norm3.weight.dtype == torch.float32
+    assert torch.equal(transformer.backbone.norm3.weight, torch.ones(2))
 
 
 def test_transformer_marks_first_frame_clean_for_image_conditioning() -> None:
@@ -1337,8 +1406,13 @@ def test_nava_rejects_unverified_parallelism(tmp_path: Path, parallel_config: Di
         model_config={"height": 16, "width": 16, "num_frames": 5},
     )
 
-    with pytest.raises(ValueError, match="not verified"):
-        NAVAPipeline(od_config=od_config)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.nava.pipeline_nava.get_local_device",
+            lambda: torch.device("cuda"),
+        )
+        with pytest.raises(ValueError, match="not verified"):
+            NAVAPipeline(od_config=od_config)
 
 
 def test_download_script_writes_model_index_without_external_runtime_install(

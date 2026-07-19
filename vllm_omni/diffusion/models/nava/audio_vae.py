@@ -193,9 +193,15 @@ class NAVAAudioVAE(nn.Module):
             batch, frames, channels = audio_latents.shape
             if channels % latent_channels != 0:
                 raise ValueError(f"NAVA audio latent channels must be divisible by {latent_channels}, got {channels}.")
+            audio_latents = self._denormalize_latents(audio_latents)
             mel_bins = channels // latent_channels
             audio_latents = audio_latents.reshape(batch, frames, latent_channels, mel_bins).permute(0, 2, 1, 3)
-        elif audio_latents.ndim != 4:
+        elif audio_latents.ndim == 4:
+            batch, channels, frames, mel_bins = audio_latents.shape
+            audio_latents = audio_latents.permute(0, 2, 1, 3).reshape(batch, frames, channels * mel_bins)
+            audio_latents = self._denormalize_latents(audio_latents)
+            audio_latents = audio_latents.reshape(batch, frames, channels, mel_bins).permute(0, 2, 1, 3)
+        else:
             raise ValueError(f"NAVA audio latents must be [B, T, C] or [B, C, T, M], got {audio_latents.shape}.")
 
         dtype = next(self.audio_vae.parameters()).dtype
@@ -206,6 +212,16 @@ class NAVAAudioVAE(nn.Module):
         if source_rate != self.sample_rate:
             waveform = torchaudio.functional.resample(waveform, orig_freq=source_rate, new_freq=self.sample_rate)
         return waveform.clamp(-0.99, 0.99)
+
+    def _denormalize_latents(self, audio_latents: torch.Tensor) -> torch.Tensor:
+        mean = self.audio_vae.latents_mean.to(device=audio_latents.device, dtype=audio_latents.dtype)
+        std = self.audio_vae.latents_std.to(device=audio_latents.device, dtype=audio_latents.dtype)
+        if audio_latents.shape[-1] != mean.numel():
+            raise ValueError(
+                "NAVA audio latent channel count must match checkpoint statistics: "
+                f"got {audio_latents.shape[-1]}, expected {mean.numel()}."
+            )
+        return audio_latents * std.view(1, 1, -1) + mean.view(1, 1, -1)
 
     @staticmethod
     def _load_components(checkpoint_path: str):
