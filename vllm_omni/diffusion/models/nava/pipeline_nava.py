@@ -271,9 +271,12 @@ class NAVAPipeline(
         return NAVAConfig.from_dict(config_data)
 
     def _parse_request(self, request: OmniDiffusionRequest) -> NAVARequestContext:
-        if len(request.prompts) != 1:
+        prompts = getattr(request, "prompts", None)
+        if prompts is None:
+            prompts = [request.prompt]
+        if len(prompts) != 1:
             raise ValueError("NAVAPipeline currently supports one prompt per request. Use request-level batching.")
-        prompt_data = request.prompts[0]
+        prompt_data = prompts[0]
         prompt = prompt_data if isinstance(prompt_data, str) else str(prompt_data.get("prompt", ""))
         if not prompt:
             raise ValueError("NAVAPipeline requires a non-empty prompt.")

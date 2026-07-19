@@ -748,11 +748,11 @@ class WanDoubleStreamAttentionBlock(nn.Module):
             self.norm1_audio = WanLayerNorm(dim, eps, elementwise_affine=False)  # pre-self-attention normalization
         self.self_attn = WanDoubleStreamSelfAttention(dim, num_heads, window_size, qk_norm, eps)  # self-attention
         self.norm3 = (
-            WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+            WanLayerNorm(dim, eps, elementwise_affine=True).float() if cross_attn_norm else nn.Identity()
         )  # optional pre-cross-attention normalization
         if not no_split_norm_ffn:
             self.norm3_audio = (
-                WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+                WanLayerNorm(dim, eps, elementwise_affine=True).float() if cross_attn_norm else nn.Identity()
             )  # optional pre-cross-attention normalization
 
         self.cross_attn = WanT2VDoubleStreamCrossAttention(
@@ -1855,10 +1855,7 @@ class NAVATransformer(nn.Module):
             if not name.startswith("backbone.") and f"backbone.{name}" in params:
                 name = f"backbone.{name}"
             if name in params:
-                if ".norm3." in name or ".norm3_audio." in name:
-                    params[name].data = tensor.to(device=params[name].device)
-                else:
-                    default_weight_loader(params[name], tensor)
+                default_weight_loader(params[name], tensor)
                 loaded.add(name)
             else:
                 unmatched.append(name)
