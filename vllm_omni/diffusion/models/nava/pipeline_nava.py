@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.nava.video_vae import NAVAVideoVAE
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
 
@@ -100,6 +101,7 @@ class NAVAPipeline(
         del prefix
         self.od_config = od_config
         self.device = get_local_device()
+        self.model_root = self._resolve_model_root()
         self.nava_config = self._load_nava_config(od_config)
         self.audio_sample_rate = self.nava_config.audio_sample_rate
         self.fps = self.nava_config.fps
@@ -192,33 +194,31 @@ class NAVAPipeline(
         return self.device.type == "cuda"
 
     def _init_native_components(self) -> None:
-        model_root = self._require_local_model_root()
         text_compile = as_bool(self._custom_pipeline_arg("nava_text_encoder_compile", False))
         if self._custom_pipeline_arg("disable_text_encoder_compile") is not None:
             text_compile = not as_bool(self._custom_pipeline_arg("disable_text_encoder_compile"))
         self.text_encoder = _NAVATextEncoder(
-            model_root,
+            self.model_root,
             self.nava_config,
             self.device,
             compile_model=text_compile,
         )
-        self.video_vae = NAVAVideoVAE(model_root, self.nava_config, self.device)
-        self.audio_vae = NAVAAudioVAE(model_root, self.nava_config)
-        self.speaker_encoder = NAVASpeakerEncoder(model_root, self.nava_config)
+        self.video_vae = NAVAVideoVAE(self.model_root, self.nava_config, self.device)
+        self.audio_vae = NAVAAudioVAE(self.model_root, self.nava_config)
+        self.speaker_encoder = NAVASpeakerEncoder(self.model_root, self.nava_config)
         self.transformer = NAVATransformer(self.nava_config)
         self.to(self.device)
 
-    def _require_local_model_root(self) -> str:
+    def _resolve_model_root(self) -> str:
         model = str(self.od_config.model or "")
-        if not model or not os.path.isdir(model):
-            raise FileNotFoundError(
-                "NAVAPipeline requires a local baidu/NAVA directory prepared by "
-                "examples/offline_inference/nava/download_nava.py."
-            )
-        return model
+        if not model:
+            raise ValueError("NAVAPipeline requires a local model directory or Hugging Face repo id.")
+        if os.path.isdir(model):
+            return model
+        return download_weights_from_hf_specific(model, None, ["*"], revision=self.od_config.revision)
 
     def _init_weight_sources(self) -> None:
-        model = self.od_config.model
+        model = self.model_root
         if not model:
             return
         self.weights_sources = [
@@ -236,23 +236,23 @@ class NAVAPipeline(
         config_data: dict[str, Any] = dict(DEFAULT_NAVA_MODEL_INDEX)
         explicit = dict(od_config.model_config or {})
         explicit_config_name = explicit.get("config_name", explicit.get("config"))
-        if od_config.model and os.path.isdir(str(od_config.model)):
-            index_path = os.path.join(str(od_config.model), "model_index.json")
+        if self.model_root and os.path.isdir(self.model_root):
+            index_path = os.path.join(self.model_root, "model_index.json")
             if os.path.exists(index_path):
                 with open(index_path, encoding="utf-8") as f:
                     index_data = json.load(f)
                 if isinstance(index_data, dict):
                     config_data.update(index_data)
             config_name = str(explicit_config_name or config_data.get("config") or DEFAULT_NAVA_MODEL_INDEX["config"])
-            config_path = os.path.join(str(od_config.model), config_name)
+            config_path = os.path.join(self.model_root, config_name)
             if not os.path.exists(config_path) and config_name == "configs/nava.yaml":
-                legacy_path = os.path.join(str(od_config.model), "nava.yaml")
+                legacy_path = os.path.join(self.model_root, "nava.yaml")
                 if os.path.exists(legacy_path):
                     config_path = legacy_path
                     config_data["config"] = "nava.yaml"
             if os.path.exists(config_path):
                 config_data.update(_load_yaml(config_path))
-            joint_config_path = os.path.join(str(od_config.model), "config.json")
+            joint_config_path = os.path.join(self.model_root, "config.json")
             if os.path.exists(joint_config_path):
                 with open(joint_config_path, encoding="utf-8") as f:
                     joint_config = json.load(f)
@@ -286,7 +286,8 @@ class NAVAPipeline(
         speaker_condition = self._parse_speaker_condition(prompt, multi_modal_data, extra)
         image = multi_modal_data.get("image")
 
-        frames = max(1, int(resolve_num_frames(sp.num_frames, extra, self.nava_config.frames)))
+        output_frames = max(1, int(resolve_num_frames(sp.num_frames, extra, self.nava_config.frames)))
+        latent_frames = self.nava_config.video_latent_frames(output_frames)
         return NAVARequestContext(
             prompt=prompt,
             negative_prompt=str(extra.get("negative_prompt", self.nava_config.negative_prompt)),
@@ -296,7 +297,7 @@ class NAVAPipeline(
             speaker_condition=speaker_condition,
             height=int(sp.height or extra.get("height") or self.nava_config.log_height),
             width=int(sp.width or extra.get("width") or self.nava_config.log_width),
-            frames=frames,
+            frames=latent_frames,
             fps=float(sp.resolved_frame_rate or extra.get("fps") or self.nava_config.fps),
             seed=int(sp.seed if sp.seed is not None else extra.get("seed", 100)),
             num_steps=int(
