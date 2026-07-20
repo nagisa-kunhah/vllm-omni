@@ -385,9 +385,49 @@ def test_pipeline_weight_source_and_loaded_names_are_transformer_scoped(tmp_path
     pipeline = _make_pipeline(tmp_path)
 
     assert [source.prefix for source in pipeline.weights_sources] == ["transformer."]
+    assert [source.model_or_path for source in pipeline.weights_sources] == [str(tmp_path)]
     loaded = pipeline.load_weights([("transformer.backbone.weight", torch.ones(1))])
 
     assert loaded == {"transformer.backbone.weight"}
+
+
+def test_pipeline_resolves_hf_repo_id_before_native_component_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = tmp_path / "nava-snapshot"
+    _write_minimal_model_dir(model_root)
+    calls: list[tuple[str, str | None, list[str], str | None]] = []
+
+    def fake_download(
+        model: str,
+        cache_dir: str | None,
+        allow_patterns: list[str],
+        *,
+        revision: str | None = None,
+    ) -> str:
+        calls.append((model, cache_dir, allow_patterns, revision))
+        return str(model_root)
+
+    monkeypatch.setattr(NAVAPipeline, "_validate_runtime_features", lambda self: None)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.nava.pipeline_nava.download_weights_from_hf_specific",
+        fake_download,
+    )
+    _patch_native_components(monkeypatch)
+
+    pipeline = NAVAPipeline(
+        od_config=OmniDiffusionConfig(
+            model="baidu/NAVA",
+            model_class_name="NAVAPipeline",
+            revision="main",
+            model_config={"height": 16, "width": 16, "num_frames": 5},
+        )
+    )
+
+    assert calls == [("baidu/NAVA", None, ["*"], "main")]
+    assert pipeline.model_root == str(model_root)
+    assert [source.model_or_path for source in pipeline.weights_sources] == [str(model_root)]
 
 
 def test_pipeline_loads_explicit_config_file_before_building_nava_config(tmp_path: Path) -> None:
@@ -433,8 +473,9 @@ def test_parse_request_text_image_speaker_and_errors(tmp_path: Path) -> None:
         None,
         None,
         7,
-        10,
+        3,
     )
+    assert pipeline.nava_config.video_output_frames(text_ctx.frames) == 9
     assert image_ctx.image is image
     assert speaker_ctx.speaker_condition is not None
     assert speaker_ctx.speaker_condition.wavs == ["speaker.wav"]
@@ -682,9 +723,9 @@ def test_speaker_encoder_uses_torch_home_redimnet_cache(
 @pytest.mark.parametrize(
     ("sampling_kwargs", "expected_video_shape", "expected_audio_shape", "expected_fps"),
     [
-        ({"seed": 3}, (1, 5, 3), (1, 3, 4), 24),
-        ({"num_frames": 9, "seed": 3}, (1, 9, 3), (1, 6, 4), 24),
-        ({"frame_rate": 8, "seed": 3}, (1, 5, 3), (1, 9, 4), 8),
+        ({"seed": 3}, (1, 2, 3), (1, 1, 4), 24),
+        ({"num_frames": 9, "seed": 3}, (1, 3, 3), (1, 2, 4), 24),
+        ({"frame_rate": 8, "seed": 3}, (1, 2, 3), (1, 3, 4), 8),
     ],
 )
 def test_prepare_latents_shapes(
@@ -720,10 +761,10 @@ def test_decode_video_passes_output_frames_with_latent_tokens(tmp_path: Path) ->
     pipeline = _make_pipeline(tmp_path, video_vae=video_vae)
     ctx = pipeline._parse_request(_make_request("plain prompt", num_frames=9))
 
-    video = pipeline._decode_video(torch.zeros(1, 9, 3), ctx)
+    video = pipeline._decode_video(torch.zeros(1, 3, 3), ctx)
 
-    assert video.shape == (1, 3, 33, 16, 16)
-    assert video_vae.decode_calls == [{"height": 16, "width": 16, "frames": 33, "shape": torch.Size([1, 9, 3])}]
+    assert video.shape == (1, 3, 9, 16, 16)
+    assert video_vae.decode_calls == [{"height": 16, "width": 16, "frames": 9, "shape": torch.Size([1, 3, 3])}]
 
 
 def test_video_vae_decode_reshapes_latent_frames_and_trims_output() -> None:
