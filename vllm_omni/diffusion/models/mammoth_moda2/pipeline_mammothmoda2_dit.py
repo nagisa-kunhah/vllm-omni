@@ -100,6 +100,15 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.make_empty_intermediate_tensors = lambda: None
 
         self._llm_hidden_size = llm_hidden_size
+        self.cache_backend = None
+
+    def set_cache_backend(self, cache_backend: Any) -> None:
+        self.cache_backend = cache_backend
+
+    def _refresh_cache(self, num_inference_steps: int) -> None:
+        if self.cache_backend is None or not self.cache_backend.is_enabled():
+            return
+        self.cache_backend.refresh(self, num_inference_steps, verbose=False)
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
@@ -202,6 +211,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
         cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
         num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
+        self._refresh_cache(num_inference_steps)
 
         negative_cond = info.get("negative_prompt_embeds")
         negative_attention_mask = info.get("negative_prompt_attention_mask")

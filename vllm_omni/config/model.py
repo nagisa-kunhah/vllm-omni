@@ -139,6 +139,8 @@ class OmniModelConfig(ModelConfig):
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    cache_backend: str | None = "none"
+    cache_config: Any = None
 
     @property
     def registry(self):

@@ -166,6 +166,8 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    cache_backend: str = "none"
+    cache_config: Any = None
     worker_type: str | None = None
     task_type: str | None = None
     worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
@@ -353,6 +355,8 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            cache_backend=getattr(self, "cache_backend", "none"),
+            cache_config=getattr(self, "cache_config", None),
         )
         return omni_config
 
@@ -467,7 +471,7 @@ class OrchestratorArgs:
     diffusion_attention_backend: str | None = None
     diffusion_attention_config: str | None = None
     cache_backend: str = "none"
-    cache_config: str | None = None
+    cache_config: Any = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
@@ -511,6 +515,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        "cache_backend",  # orch: inject into cache-capable stages; engine: enable stage cache
+        "cache_config",  # orch: normalize/inject defaults; engine: instantiate cache backend
     }
 )
 

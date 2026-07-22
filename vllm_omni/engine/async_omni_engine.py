@@ -1155,6 +1155,45 @@ class AsyncOmniEngine:
             )
             self._omni_lb_policy = str(derived)
 
+    @classmethod
+    def _inject_diffusion_cache_config(cls, stage_configs: list[Any], kwargs: dict[str, Any]) -> None:
+        """Apply top-level diffusion cache args to diffusion stages.
+
+        Legacy multi-stage YAMLs prefer stage-local engine args during the
+        base-kwargs merge. That is the right default for normal engine args, but
+        user-facing cache flags such as ``--cache-backend tea_cache`` are meant
+        to enable acceleration on diffusion stages without editing every deploy
+        YAML. Preserve explicit stage values and only fill missing cache fields.
+        """
+        cache_backend = kwargs.get("cache_backend")
+        if cache_backend in (None, "", "none"):
+            return
+
+        cache_config = cls._normalize_cache_config(cache_backend, kwargs.get("cache_config"))
+        enable_cache_dit_summary = kwargs.get("enable_cache_dit_summary")
+
+        for cfg in stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion" and getattr(cfg, "model_stage", None) != "dit":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+
+                stage_cache_backend = getattr(cfg.engine_args, "cache_backend", None)
+                if stage_cache_backend in (None, "", "none"):
+                    cfg.engine_args.cache_backend = cache_backend
+
+                stage_cache_config = getattr(cfg.engine_args, "cache_config", None)
+                if stage_cache_config in (None, {}):
+                    cfg.engine_args.cache_config = cache_config
+
+                if enable_cache_dit_summary is not None:
+                    current_summary = getattr(cfg.engine_args, "enable_cache_dit_summary", None)
+                    if current_summary is None:
+                        cfg.engine_args.enable_cache_dit_summary = enable_cache_dit_summary
+            except Exception as exc:
+                logger.warning("Failed to inject diffusion cache config for stage: %s", exc)
+
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1191,6 +1230,7 @@ class AsyncOmniEngine:
         # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
+        self._inject_diffusion_cache_config(stage_configs, kwargs)
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:
