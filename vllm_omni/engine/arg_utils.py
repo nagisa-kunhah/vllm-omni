@@ -209,6 +209,8 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    cache_backend: str = "none"
+    cache_config: Any = None
     worker_type: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
@@ -440,6 +442,8 @@ class OmniEngineArgs(EngineArgs):
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
+            cache_backend=getattr(self, "cache_backend", "none"),
+            cache_config=getattr(self, "cache_config", None),
         )
         return omni_config
 
@@ -623,6 +627,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        "cache_backend",  # orch: inject into cache-capable stages; engine: enable stage cache
+        "cache_config",  # orch: normalize/inject defaults; engine: instantiate cache backend
     }
 )
 
