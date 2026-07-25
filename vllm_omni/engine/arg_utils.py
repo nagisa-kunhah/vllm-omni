@@ -210,7 +210,7 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     cache_backend: str = "none"
-    cache_config: Any = None
+    cache_config: dict[str, Any] | str | None = None
     worker_type: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
