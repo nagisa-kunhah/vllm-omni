@@ -1121,7 +1121,6 @@ class AsyncOmniEngine:
             return
 
         cache_config = cls._normalize_cache_config(cache_backend, kwargs.get("cache_config"))
-        enable_cache_dit_summary = kwargs.get("enable_cache_dit_summary")
 
         for cfg in stage_configs:
             try:
@@ -1137,11 +1136,6 @@ class AsyncOmniEngine:
                 stage_cache_config = getattr(cfg.engine_args, "cache_config", None)
                 if stage_cache_config in (None, {}):
                     cfg.engine_args.cache_config = cache_config
-
-                if enable_cache_dit_summary is not None:
-                    current_summary = getattr(cfg.engine_args, "enable_cache_dit_summary", None)
-                    if current_summary is None:
-                        cfg.engine_args.enable_cache_dit_summary = enable_cache_dit_summary
             except Exception as exc:
                 logger.warning("Failed to inject diffusion cache config for stage: %s", exc)
 
