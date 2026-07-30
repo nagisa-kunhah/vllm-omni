@@ -1,13 +1,20 @@
-# Opt-in MiniCPM-o 4.5 deploy profile with an upstream stage-level CUDA Graph
-# for the Stage 0 thinker decode path. The default profile remains eager.
-#
-# Stage 0 captures only FULL_DECODE_ONLY at batch size 1; prefill and
-# multimodal encoder work stay outside the graph. Stage 1 remains eager so
-# the Talker/Token2Wav path and its inter-stage payload are unchanged.
-async_chunk: false
+# Opt-in MiniCPM-o 4.5 profile for validating the Stage 0 thinker decode
+# CUDA Graph independently from the Talker and Code2Wav stages.
+pipeline: minicpmo_4_5
+async_chunk: true
 
 trust_remote_code: true
 enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
 
 stages:
   - stage_id: 0
@@ -18,6 +25,12 @@ stages:
       cudagraph_mode: FULL_DECODE_ONLY
       cudagraph_capture_sizes: [1]
       cudagraph_num_of_warmups: 2
+    # FULL CUDA graphs require a fixed FlashAttention split count. Using the
+    # default 32-way reduction changes BF16 accumulation order enough to alter
+    # greedy decoding on low-margin tokens; one split matches the eager and
+    # piecewise paths while retaining most of the graph speedup.
+    attention_config:
+      flash_attn_max_num_splits_for_cuda_graph: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -33,20 +46,39 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Keep Talker and in-process Token2Wav eager while validating thinker
-    # capture and replay.
     max_num_seqs: 1
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.55
     enforce_eager: true
     max_num_batched_tokens: 8192
     devices: "1"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 1
+      min_tokens: 50
+      max_tokens: 2048
+      stop_token_ids: [1]
       seed: 42
       detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "1"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
 
 # MiniCPM-o 4.5 has only been verified on CUDA devices.
 platforms: {}
