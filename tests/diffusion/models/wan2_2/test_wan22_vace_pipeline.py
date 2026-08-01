@@ -282,3 +282,67 @@ def test_vace_forward_rejects_mismatched_condition_shapes(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="VACE condition"):
         pipeline.forward(batch)
+
+
+def test_vace_forward_rejects_mismatched_reference_image_counts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace.current_omni_platform",
+        SimpleNamespace(is_available=lambda: False),
+    )
+    pipeline = _make_vace_pipeline()
+    pipeline.transformer.vace_patch_embedding = object()
+    pipeline.transformer_2 = None
+    pipeline.scheduler = StubScheduler([9])
+    pipeline.od_config = SimpleNamespace(flow_shift=3.0)
+    pipeline._sample_solver = "unipc"
+    pipeline._flow_shift = 3.0
+    pipeline.boundary_ratio = None
+    pipeline._guidance_scale = None
+    pipeline._num_timesteps = None
+    pipeline._current_timestep = None
+    pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: (torch.zeros(2, 2, 3), None)  # type: ignore[method-assign]
+
+    def _fake_preprocess(video, mask, reference_images, **kwargs):
+        del kwargs
+        return video, mask, [reference_images]
+
+    pipeline.preprocess_conditions = _fake_preprocess  # type: ignore[method-assign]
+    pipeline.prepare_video_latents = (  # type: ignore[method-assign]
+        lambda video, mask, refs, generator, device: torch.zeros(1, 8, 5, 2, 2)
+    )
+    pipeline.prepare_masks = lambda mask, refs: torch.zeros(1, 4, 5, 2, 2)  # type: ignore[method-assign]
+    video = torch.zeros(1, 3, 5, 16, 16)
+    mask = torch.ones_like(video)
+    reference = torch.zeros(3, 16, 16)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={
+                    "prompt": "first",
+                    "additional_information": {
+                        "source_video": video,
+                        "mask": mask,
+                        "reference_images": [reference],
+                    },
+                },
+                sampling_params=_make_vace_sampling(),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={
+                    "prompt": "second",
+                    "additional_information": {
+                        "source_video": video,
+                        "mask": mask,
+                        "reference_images": [reference, reference],
+                    },
+                },
+                sampling_params=_make_vace_sampling(),
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="same number of reference images"):
+        pipeline.forward(batch)

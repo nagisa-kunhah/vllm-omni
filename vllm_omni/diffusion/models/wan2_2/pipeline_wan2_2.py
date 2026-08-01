@@ -204,6 +204,8 @@ def get_wan22_post_process_func(
         output_type: str = "np",
         sampling_params=None,
     ):
+        if sampling_params is not None and sampling_params.output_type is not None:
+            output_type = sampling_params.output_type
         if output_type == "latent":
             return video
         video_metadata = {}

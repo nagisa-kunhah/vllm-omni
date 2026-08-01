@@ -653,6 +653,47 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 2
         assert first.num_waiting_reqs == 0
 
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+            ({"sample_solver": "unipc"}, {}),
+            ({"flow_shift": 3.0}, {}),
+        ],
+    )
+    def test_batches_incompatible_wan_scheduler_structure_separately(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        first_id = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=first_extra_args,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=second_extra_args,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [first_id]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=3))

@@ -63,6 +63,20 @@ _S2V_DEFAULT_NEG_PROMPT = (
 _AUDIO_VIDEO_RATE = 30
 
 
+def _make_clip_generators(
+    seeds: list[int | None],
+    request_generators: list[torch.Generator | None],
+    clip_index: int,
+    device: torch.device,
+) -> list[torch.Generator | None]:
+    return [
+        torch.Generator(device=device).manual_seed((seed if seed is not None else 0) + clip_index)
+        if seed is not None or request_generator is None
+        else request_generator
+        for seed, request_generator in zip(seeds, request_generators)
+    ]
+
+
 def _linear_interpolation(
     features: torch.Tensor,
     input_fps: float,
@@ -243,7 +257,10 @@ def get_wan22_s2v_post_process_func(
     def post_process_func(
         output,
         output_type: str = "np",
+        sampling_params=None,
     ):
+        if sampling_params is not None and sampling_params.output_type is not None:
+            output_type = sampling_params.output_type
         # output is (video_tensor, audio_waveform_np, audio_sample_rate)
         if isinstance(output, tuple) and len(output) == 3:
             video, audio_waveform, audio_sr = output
@@ -1169,6 +1186,7 @@ class Wan22S2VPipeline(
             generators = request_generators
         else:
             generators = [request_generators] * batch_size
+        seeds = [sampling.seed for sampling in sampling_params_list for _ in range(num_outputs_per_prompt)]
         request_latents = req.collate_request_tensors("latents", None)
 
         # ---- 1. Text encoding ----
@@ -1284,6 +1302,7 @@ class Wan22S2VPipeline(
         videos_last_frames = torch.zeros([batch_size, 3, motion_frames, height, width], dtype=dtype, device=device)
 
         for r in range(num_repeat):
+            clip_generators = _make_clip_generators(seeds, generators, r, device)
             # -- Noise --
             if r == 0 and request_latents is not None:
                 latents = request_latents.to(device=device, dtype=dtype)
@@ -1298,9 +1317,9 @@ class Wan22S2VPipeline(
                             lat_motion_frames=lat_motion_frames,
                             dtype=dtype,
                             device=device,
-                            generator=request_generator,
+                            generator=clip_generator,
                         )
-                        for request_generator in generators
+                        for clip_generator in clip_generators
                     ]
                 )
 
@@ -1356,7 +1375,7 @@ class Wan22S2VPipeline(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 guidance_scale=guidance_scale,
-                clip_generator=generators,
+                clip_generator=clip_generators,
                 dtype=dtype,
                 device=device,
                 max_seq_len=max_seq_len,
@@ -1431,7 +1450,7 @@ class Wan22S2VPipeline(
         # ---- Concatenate all clips ----
         output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
 
-        return split_diffusion_output_by_request(
+        outputs = split_diffusion_output_by_request(
             DiffusionOutput(
                 output=(output, raw_audio_waveform, raw_audio_sr),
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -1439,6 +1458,10 @@ class Wan22S2VPipeline(
             req,
             num_outputs_per_prompt=num_outputs_per_prompt,
         )
+        for request_output in outputs:
+            video, audio, sample_rate = request_output.output
+            request_output.output = (video, audio[0], sample_rate)
+        return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

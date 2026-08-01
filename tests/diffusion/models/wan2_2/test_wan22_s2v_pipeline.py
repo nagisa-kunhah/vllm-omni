@@ -7,11 +7,26 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
+    Wan22S2VPipeline,
+    _make_clip_generators,
+    get_wan22_s2v_post_process_func,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_wan22_s2v_postprocess_honors_request_output_type() -> None:
+    video = torch.zeros(1, 4, 1, 2, 2)
+
+    output = get_wan22_s2v_post_process_func(SimpleNamespace())(
+        (video, np.zeros(1, dtype=np.float32), 16000),
+        sampling_params=SimpleNamespace(output_type="latent"),
+    )
+
+    assert output is video
 
 
 def _make_s2v_sampling(**overrides):
@@ -62,6 +77,25 @@ def test_s2v_predict_noise_keeps_batch_dimension() -> None:
     result = pipeline.predict_noise(hidden_states=torch.zeros(1, 16, 2, 2, 2))
 
     assert result.shape == (1, 16, 2, 2, 2)
+
+
+def test_s2v_clip_generators_preserve_main_seed_per_clip_behavior() -> None:
+    explicit_generator = torch.Generator(device="cpu").manual_seed(999)
+
+    generators = _make_clip_generators(
+        seeds=[1234, 5678, None, None],
+        request_generators=[
+            torch.Generator(device="cpu").manual_seed(1234),
+            torch.Generator(device="cpu").manual_seed(5678),
+            explicit_generator,
+            None,
+        ],
+        clip_index=2,
+        device=torch.device("cpu"),
+    )
+
+    assert [generator.initial_seed() for generator in generators if generator is not None] == [1236, 5680, 999, 2]
+    assert generators[2] is explicit_generator
 
 
 def test_s2v_forward_rejects_different_num_repeat() -> None:
@@ -129,6 +163,66 @@ def test_s2v_forward_rejects_different_audio_time_lengths() -> None:
         pipeline.forward(batch)
 
 
+def test_s2v_forward_rejects_different_init_first_frame() -> None:
+    pipeline = _make_s2v_validation_pipeline()
+    image = PIL.Image.new("RGB", (16, 16))
+    audio = np.zeros(16000, dtype=np.float32)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={
+                    "prompt": "first",
+                    "multi_modal_data": {"image": image, "audio": audio},
+                    "additional_information": {"init_first_frame": True},
+                },
+                sampling_params=_make_s2v_sampling(),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={
+                    "prompt": "second",
+                    "multi_modal_data": {"image": image, "audio": audio},
+                    "additional_information": {"init_first_frame": False},
+                },
+                sampling_params=_make_s2v_sampling(),
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="init_first_frame"):
+        pipeline.forward(batch)
+
+
+def test_s2v_forward_rejects_different_raw_audio_shapes() -> None:
+    pipeline = _make_s2v_validation_pipeline()
+    pipeline.encode_audio = lambda *args, **kwargs: (torch.zeros(1, 1, 2, 16), 1, 16)  # type: ignore[method-assign]
+    image = PIL.Image.new("RGB", (16, 16))
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={
+                    "prompt": "first",
+                    "multi_modal_data": {"image": image, "audio": np.zeros(16000, dtype=np.float32)},
+                },
+                sampling_params=_make_s2v_sampling(),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={
+                    "prompt": "second",
+                    "multi_modal_data": {"image": image, "audio": np.zeros(8000, dtype=np.float32)},
+                },
+                sampling_params=_make_s2v_sampling(),
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="raw audio shapes and sample rates"):
+        pipeline.forward(batch)
+
+
 def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
     pipeline = object.__new__(Wan22S2VPipeline)
     nn.Module.__init__(pipeline)
@@ -164,7 +258,8 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
     pipeline.diffuse = MagicMock(side_effect=lambda **kwargs: kwargs["latents"])
 
     image = PIL.Image.new("RGB", (16, 16))
-    audio = np.zeros(16000, dtype=np.float32)
+    audio_a = np.zeros(16000, dtype=np.float32)
+    audio_b = np.ones(16000, dtype=np.float32)
     latents_a = torch.zeros(2, 16, 2, 2, 2)
     latents_b = torch.ones(2, 16, 2, 2, 2)
     generators_a = [torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)]
@@ -176,7 +271,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                 prompt={
                     "prompt": "first",
                     "negative_prompt": "negative first",
-                    "multi_modal_data": {"image": image, "audio": audio},
+                    "multi_modal_data": {"image": image, "audio": audio_a},
                 },
                 sampling_params=_make_s2v_sampling(
                     num_outputs_per_prompt=2,
@@ -189,7 +284,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                 prompt={
                     "prompt": "second",
                     "negative_prompt": "negative second",
-                    "multi_modal_data": {"image": image, "audio": audio},
+                    "multi_modal_data": {"image": image, "audio": audio_b},
                 },
                 sampling_params=_make_s2v_sampling(
                     num_outputs_per_prompt=2,
@@ -207,6 +302,10 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
     assert len(outputs) == 2
     assert outputs[0].output[0].shape[0] == 2
     assert outputs[1].output[0].shape[0] == 2
+    assert outputs[0].output[1].shape == (16000,)
+    assert outputs[1].output[1].shape == (16000,)
+    np.testing.assert_array_equal(outputs[0].output[1], audio_a)
+    np.testing.assert_array_equal(outputs[1].output[1], audio_b)
     torch.testing.assert_close(pipeline.diffuse.call_args.kwargs["latents"], torch.cat([latents_a, latents_b]))
     assert pipeline.diffuse.call_args.kwargs["clip_generator"] == generators_a + generators_b
     assert pipeline.encode_prompt.call_args.kwargs["prompt"] == ["first", "second"]

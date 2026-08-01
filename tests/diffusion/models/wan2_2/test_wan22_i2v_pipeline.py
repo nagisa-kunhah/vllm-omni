@@ -11,11 +11,23 @@ from torch import nn
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
+    get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_wan22_i2v_postprocess_honors_request_output_type() -> None:
+    video = torch.zeros(1, 4, 1, 2, 2)
+
+    output = get_wan22_i2v_post_process_func(SimpleNamespace())(
+        video,
+        sampling_params=SimpleNamespace(output_type="latent"),
+    )
+
+    assert output is video
 
 
 def _make_i2v_pipeline(*, expand_timesteps: bool) -> Wan22I2VPipeline:
@@ -290,4 +302,29 @@ def test_i2v_forward_rejects_mismatched_tensor_condition_shapes(monkeypatch) -> 
     )
 
     with pytest.raises(ValueError, match="image condition"):
+        pipeline.forward(batch)
+
+
+def test_i2v_forward_rejects_mixed_last_image_presence() -> None:
+    pipeline = _make_i2v_pipeline(expand_timesteps=True)
+    image = torch.zeros(1, 3, 16, 16)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={
+                    "prompt": "first",
+                    "multi_modal_data": {"image": image, "last_image": image},
+                },
+                sampling_params=_make_i2v_sampling(),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt": "second", "multi_modal_data": {"image": image}},
+                sampling_params=_make_i2v_sampling(),
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mix of provided and missing last_image"):
         pipeline.forward(batch)
