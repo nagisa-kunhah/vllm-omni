@@ -217,11 +217,13 @@ class TestGetRequestBatchSamplingParamsKey:
         num_inference_steps: int = 2,
         seed: int | None = 123,
         generator: torch.Generator | None = None,
+        extra_args: dict | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             seed=seed,
             generator=generator,
+            extra_args=extra_args or {},
         )
         return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
 
@@ -239,6 +241,32 @@ class TestGetRequestBatchSamplingParamsKey:
         assert scheduler._build_sampling_params_key(
             self._make(seed=1, generator=gen_a)
         ) == scheduler._build_sampling_params_key(self._make(seed=2, generator=gen_b))
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_distinguishes_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) != scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
+    def test_uses_none_for_unspecified_wan_scheduler_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        key = scheduler._build_sampling_params_key(self._make())
+
+        assert key.sample_solver is None
+        assert key.flow_shift is None
 
 
 class TestRequestScheduler:
