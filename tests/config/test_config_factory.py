@@ -1291,6 +1291,22 @@ stages:
         if deploy.trust_remote_code is not None:
             assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
 
+    def test_mammoth_cache_cli_overrides_reach_dit_stage(self):
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={
+                "cache_backend": "tea_cache",
+                "cache_config": {"rel_l1_thresh": 0.1},
+            },
+            deploy_config_path=get_deploy_config_path("mammoth_moda2.yaml"),
+        )
+
+        dit_stage = stages[1].to_omegaconf()
+        assert dit_stage.engine_args.model_stage == "dit"
+        assert dit_stage.engine_args.cache_backend == "tea_cache"
+        assert dit_stage.engine_args.cache_config == {"rel_l1_thresh": 0.1}
+
     @pytest.mark.parametrize(
         ("config_json", "model_index", "expected_pipeline"),
         [
