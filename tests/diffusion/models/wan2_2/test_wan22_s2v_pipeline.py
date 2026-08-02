@@ -10,23 +10,11 @@ import torch.nn as nn
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     Wan22S2VPipeline,
     _make_clip_generators,
-    get_wan22_s2v_post_process_func,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_wan22_s2v_postprocess_honors_request_output_type() -> None:
-    video = torch.zeros(1, 4, 1, 2, 2)
-
-    output = get_wan22_s2v_post_process_func(SimpleNamespace())(
-        (video, np.zeros(1, dtype=np.float32), 16000),
-        sampling_params=SimpleNamespace(output_type="latent"),
-    )
-
-    assert output is video
 
 
 def _make_s2v_sampling(**overrides):

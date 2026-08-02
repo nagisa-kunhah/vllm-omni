@@ -42,6 +42,20 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _vace_condition_structure(value: object) -> tuple:
+    if value is None:
+        return ("none",)
+    if isinstance(value, str):
+        return ("path", value)
+    if isinstance(value, PIL.Image.Image):
+        return ("image", value.size)
+    if isinstance(value, torch.Tensor):
+        return ("tensor", tuple(value.shape), str(value.dtype))
+    if isinstance(value, list):
+        return ("list", tuple(_vace_condition_structure(item) for item in value))
+    return (type(value).__name__,)
+
+
 def create_vace_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
@@ -104,6 +118,7 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
             prompt["additional_information"] = {}
 
         if not multi_modal_data:
+            request.batch_compatibility_key = ("wan22_vace_condition", ("none",), ("none",), ("none",))
             request.prompt = prompt
             return request
 
@@ -154,6 +169,13 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
             elif isinstance(mask, PIL.Image.Image):
                 mask = [mask]
             prompt["additional_information"]["mask"] = mask
+
+        request.batch_compatibility_key = (
+            "wan22_vace_condition",
+            _vace_condition_structure(ref_images),
+            _vace_condition_structure(source_video),
+            _vace_condition_structure(mask),
+        )
 
         request.prompt = prompt
         return request

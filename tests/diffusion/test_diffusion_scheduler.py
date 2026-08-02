@@ -218,6 +218,7 @@ class TestGetRequestBatchSamplingParamsKey:
         seed: int | None = 123,
         generator: torch.Generator | None = None,
         extra_args: dict | None = None,
+        condition_key: tuple | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -225,7 +226,12 @@ class TestGetRequestBatchSamplingParamsKey:
             generator=generator,
             extra_args=extra_args or {},
         )
-        return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-{num_inference_steps}",
+            batch_compatibility_key=condition_key,
+        )
 
     def test_distinguishes_num_inference_steps(self) -> None:
         scheduler = RequestScheduler()
@@ -267,6 +273,13 @@ class TestGetRequestBatchSamplingParamsKey:
 
         assert key.sample_solver is None
         assert key.flow_shift is None
+
+    def test_distinguishes_pipeline_condition_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(condition_key=("wan22_s2v_condition", True))
+        ) != scheduler._build_sampling_params_key(self._make(condition_key=("wan22_s2v_condition", False)))
 
 
 class TestRequestScheduler:
@@ -629,6 +642,38 @@ class TestRequestScheduler:
         assert _new_ids(first) == [omitted]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
+
+    def test_batches_incompatible_pipeline_conditions_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        request_a = OmniDiffusionRequest(
+            prompt="a",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123),
+            request_id="a",
+            batch_compatibility_key=("wan22_s2v_condition", True),
+        )
+        request_b = OmniDiffusionRequest(
+            prompt="b",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=456),
+            request_id="b",
+            batch_compatibility_key=("wan22_s2v_condition", False),
+        )
+        scheduler.add_request(request_a)
+        scheduler.add_request(request_b)
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == ["a"]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(first, _make_request_output("a"))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == ["b"]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
 
     def test_batches_different_request_local_seed_together(self) -> None:
         scheduler = RequestScheduler()

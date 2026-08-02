@@ -137,6 +137,11 @@ class RequestBatchSamplingParamsKey:
     sample_solver: str | None = None
     flow_shift: float | None = None
 
+    # Pipeline-specific condition structure populated during preprocessing.
+    # It prevents independently valid requests with incompatible conditions
+    # from being admitted to the same request batch.
+    condition_key: tuple[Any, ...] | None = None
+
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0

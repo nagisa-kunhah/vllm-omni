@@ -63,6 +63,16 @@ _S2V_DEFAULT_NEG_PROMPT = (
 _AUDIO_VIDEO_RATE = 30
 
 
+def _s2v_audio_condition_key(audio: str | np.ndarray | None) -> tuple[Any, ...]:
+    if isinstance(audio, str):
+        # File paths are deliberately conservative: two different files may
+        # have different durations even when their request metadata matches.
+        return ("path", audio)
+    if isinstance(audio, np.ndarray):
+        return ("array", tuple(audio.shape), str(audio.dtype))
+    return (type(audio).__name__,)
+
+
 def _make_clip_generators(
     seeds: list[int | None],
     request_generators: list[torch.Generator | None],
@@ -257,10 +267,7 @@ def get_wan22_s2v_post_process_func(
     def post_process_func(
         output,
         output_type: str = "np",
-        sampling_params=None,
     ):
-        if sampling_params is not None and sampling_params.output_type is not None:
-            output_type = sampling_params.output_type
         # output is (video_tensor, audio_waveform_np, audio_sample_rate)
         if isinstance(output, tuple) and len(output) == 3:
             video, audio_waveform, audio_sr = output
@@ -353,6 +360,12 @@ def get_wan22_s2v_pre_process_func(
         )
         prompt["additional_information"]["init_first_frame"] = (
             multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
+        )
+        request.batch_compatibility_key = (
+            "wan22_s2v_condition",
+            bool(prompt["additional_information"]["init_first_frame"]),
+            prompt["additional_information"].get("num_repeat"),
+            _s2v_audio_condition_key(raw_audio),
         )
         request.prompt = prompt
 

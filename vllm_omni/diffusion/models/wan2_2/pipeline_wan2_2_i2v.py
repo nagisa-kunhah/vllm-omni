@@ -95,6 +95,8 @@ def get_wan22_i2v_pre_process_func(
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        last_image = multi_modal_data.get("last_image", None) if multi_modal_data is not None else None
+        request.batch_compatibility_key = ("wan22_i2v_last_image", last_image is not None)
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
         if "additional_information" not in prompt:
