@@ -200,6 +200,33 @@ def test_adaln_projection_offload_preserves_cache_and_clear_restores_weights():
     torch.testing.assert_close(projection.compute_flat(t_emb), direct, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for allocator accounting")
+def test_adaln_projection_offload_releases_cuda_allocator_storage():
+    device = torch.device("cuda")
+    torch.accelerator.empty_cache()
+    projection = _make_tiny_adaln_projection().to(device)
+    t_emb = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=device)
+    direct = projection.compute_flat(t_emb)
+    projection.install_precomputed(
+        direct.unsqueeze(0),
+        torch.zeros((), dtype=torch.long, device=device),
+    )
+    torch.accelerator.synchronize()
+    allocated_before = torch.cuda.memory_allocated(device)
+
+    freed_bytes = projection.offload_projection()
+    torch.accelerator.synchronize()
+    allocated_after = torch.cuda.memory_allocated(device)
+
+    assert freed_bytes > 0
+    assert allocated_before - allocated_after >= freed_bytes
+    assert all(parameter.is_cuda and parameter.numel() == 0 for parameter in projection.linear.parameters())
+
+    projection.clear_precomputed()
+    assert all(parameter.is_cuda and parameter.numel() > 0 for parameter in projection.linear.parameters())
+
+
 class _CountingTimeEmbedder(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -280,6 +307,35 @@ def test_model_cache_hit_and_changed_schedule_rebuild_with_weight_offload():
     assert calls_after_first == [2, 2, 2]
     assert [projection.linear.calls for projection in model._adaln_projections] == [4, 4, 4]
     assert all(projection.projection_weights_offloaded for projection in model._adaln_projections)
+
+
+def test_model_does_not_manually_offload_dtensor_owned_parameters(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+    from vllm_omni.diffusion.models.minimax_h3.adaln_schedule_cache import (
+        minimax_h3_adaln_schedule_key,
+    )
+
+    class FakeDTensor(torch.nn.Parameter):
+        def to_local(self):
+            return self
+
+    monkeypatch.setattr(minimax_h3_transformer, "DTensor", FakeDTensor)
+    branch = _make_branch("t2va")
+    plan = _schedule(branch, middle_video=0.5, middle_audio=0.25)
+    model = _make_adaln_schedule_model()
+    projection = model._adaln_projections[0]
+    projection.linear.weight = FakeDTensor(projection.linear.weight.detach())
+
+    cache = model.prepare_adaln_schedule_cache(
+        unique_timestep_plan=tuple(step.unique_timesteps for step in plan),
+        schedule_key=minimax_h3_adaln_schedule_key(plan),
+        offload_weights=True,
+    )
+
+    assert cache is not None
+    assert cache.offloaded_projection_bytes == 0
+    assert all(not item.projection_weights_offloaded for item in model._adaln_projections)
+    assert projection.linear.weight.numel() > 0
 
 
 def test_model_weight_offload_falls_back_when_tables_are_larger():
