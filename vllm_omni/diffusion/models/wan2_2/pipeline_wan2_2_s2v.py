@@ -1254,7 +1254,7 @@ class Wan22S2VPipeline(
         for request_audio_path in audio_paths:
             assert request_audio_path is not None
             if isinstance(request_audio_path, np.ndarray):
-                raw_audio_waveforms.append(request_audio_path.astype(np.float32))
+                raw_audio_waveforms.append(request_audio_path.astype(np.float32, copy=False))
                 raw_audio_sample_rates.append(16000)
             else:
                 raw_audio_waveform, raw_audio_sr = load_audio(request_audio_path, sr=None, mono=True)
@@ -1262,7 +1262,6 @@ class Wan22S2VPipeline(
                 raw_audio_sample_rates.append(raw_audio_sr)
         if len(set(raw_audio_sample_rates)) != 1 or len({waveform.shape for waveform in raw_audio_waveforms}) != 1:
             raise ValueError("Batched S2V requests must have matching raw audio shapes and sample rates.")
-        raw_audio_waveform = np.repeat(np.stack(raw_audio_waveforms), num_outputs_per_prompt, axis=0)
         raw_audio_sr = raw_audio_sample_rates[0]
 
         # ---- 3. Reference image encoding ----
@@ -1465,15 +1464,14 @@ class Wan22S2VPipeline(
 
         outputs = split_diffusion_output_by_request(
             DiffusionOutput(
-                output=(output, raw_audio_waveform, raw_audio_sr),
+                output=output,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             ),
             req,
             num_outputs_per_prompt=num_outputs_per_prompt,
         )
-        for request_output in outputs:
-            video, audio, sample_rate = request_output.output
-            request_output.output = (video, audio[0], sample_rate)
+        for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
+            request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)
         return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

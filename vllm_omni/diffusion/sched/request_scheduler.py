@@ -25,6 +25,20 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
 
 
+def _normalize_explicit_sample_solver(value: object | None) -> str | None:
+    """Normalize an explicitly provided solver without selecting a default."""
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def _normalize_explicit_flow_shift(value: object | None) -> float | None:
+    """Normalize an explicitly provided flow shift without selecting a default."""
+    if value is None:
+        return None
+    return float(value)
+
+
 class RequestScheduler(BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
@@ -35,8 +49,11 @@ class RequestScheduler(BaseScheduler):
         lora_request = getattr(sampling, "lora_request", None)
         key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
         extra_args = sampling.extra_args or {}
-        key_kwargs["sample_solver"] = extra_args.get("sample_solver")
-        key_kwargs["flow_shift"] = extra_args.get("flow_shift")
+        # Match pipeline resolution for explicit overrides, but preserve None:
+        # pipeline/engine defaults are configuration-dependent and must not be
+        # inferred while building the request-batch key.
+        key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
+        key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
         key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
         key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
         return RequestBatchSamplingParamsKey(**key_kwargs)

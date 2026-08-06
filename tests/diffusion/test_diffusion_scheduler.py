@@ -266,6 +266,24 @@ class TestGetRequestBatchSamplingParamsKey:
             self._make(extra_args=first_extra_args)
         ) != scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
 
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": " Euler "}, {"sample_solver": "euler"}),
+            ({"flow_shift": "5.0"}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_normalizes_equivalent_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) == scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
     def test_uses_none_for_unspecified_wan_scheduler_structure(self) -> None:
         scheduler = RequestScheduler()
 

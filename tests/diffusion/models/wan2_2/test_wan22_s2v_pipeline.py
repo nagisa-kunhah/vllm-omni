@@ -294,6 +294,8 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
     assert outputs[1].output[1].shape == (16000,)
     np.testing.assert_array_equal(outputs[0].output[1], audio_a)
     np.testing.assert_array_equal(outputs[1].output[1], audio_b)
+    assert np.shares_memory(outputs[0].output[1], audio_a)
+    assert np.shares_memory(outputs[1].output[1], audio_b)
     torch.testing.assert_close(pipeline.diffuse.call_args.kwargs["latents"], torch.cat([latents_a, latents_b]))
     assert pipeline.diffuse.call_args.kwargs["clip_generator"] == generators_a + generators_b
     assert pipeline.encode_prompt.call_args.kwargs["prompt"] == ["first", "second"]
