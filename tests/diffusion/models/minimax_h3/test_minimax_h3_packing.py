@@ -161,3 +161,183 @@ def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
         noise_aug=0.5,
     )
     assert result.shape == rows.shape
+
+
+def test_denoise_branch_reuses_packed_input_workspaces():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MINIMAX_H3_AUDIO_ROW_WIDTH,
+        MINIMAX_H3_VIDEO_ROW_WIDTH,
+        MiniMaxH3DenoiseBranch,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+    )
+
+    packed = minimax_h3_packed_sequence(
+        text_len=2,
+        latent_t=1,
+        latent_h=2,
+        latent_w=2,
+        audio_t=1,
+        include_keyframe_cond=False,
+    )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, 3),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    video_first = torch.full((branch.img_pos.numel(), MINIMAX_H3_VIDEO_ROW_WIDTH), 1.0)
+    audio_first = torch.full((branch.audio_pos.numel(), MINIMAX_H3_AUDIO_ROW_WIDTH), 2.0)
+    first = branch.forward_kwargs(
+        video_rows=video_first,
+        audio_rows=audio_first,
+        t_video=0.2,
+        t_audio=0.3,
+        imgvid_cond_timestep=0.999,
+        audio_ref_cond_timestep=1.0,
+    )
+
+    video_second = torch.full((branch.img_pos.numel(), MINIMAX_H3_VIDEO_ROW_WIDTH), 3.0)
+    audio_second = torch.full((branch.audio_pos.numel(), MINIMAX_H3_AUDIO_ROW_WIDTH), 4.0)
+    second = branch.forward_kwargs(
+        video_rows=video_second,
+        audio_rows=audio_second,
+        t_video=0.4,
+        t_audio=0.5,
+        imgvid_cond_timestep=0.999,
+        audio_ref_cond_timestep=1.0,
+    )
+
+    assert second["x"] is first["x"]
+    assert second["audio_x"] is first["audio_x"]
+    torch.testing.assert_close(second["x"][0, branch.img_pos_dev], video_second)
+    torch.testing.assert_close(second["audio_x"][0, branch.audio_pos_dev], audio_second)
+
+
+def test_denoise_loop_reuses_state_storage_across_steps():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MINIMAX_H3_AUDIO_ROW_WIDTH,
+        MINIMAX_H3_VIDEO_ROW_WIDTH,
+        MiniMaxH3DenoiseBranch,
+        minimax_h3_denoise_loop,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+    )
+
+    packed = minimax_h3_packed_sequence(
+        text_len=2,
+        latent_t=1,
+        latent_h=2,
+        latent_w=2,
+        audio_t=1,
+        include_keyframe_cond=False,
+    )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, 3),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+
+    def model(**kwargs):
+        return (
+            torch.zeros(kwargs["update_mask"].numel(), MINIMAX_H3_VIDEO_ROW_WIDTH),
+            torch.zeros(kwargs["audio_pos_info"]["position_ids"].numel(), MINIMAX_H3_AUDIO_ROW_WIDTH),
+        )
+
+    state_ptrs: list[tuple[int, int]] = []
+    minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=torch.ones(branch.img_pos.numel(), MINIMAX_H3_VIDEO_ROW_WIDTH),
+        initial_audio_rows=torch.ones(branch.audio_pos.numel(), MINIMAX_H3_AUDIO_ROW_WIDTH),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+        on_step=lambda _step, video, audio: state_ptrs.append((video.data_ptr(), audio.data_ptr())),
+    )
+
+    assert len(set(state_ptrs)) == 1
+
+
+@pytest.mark.parametrize(
+    ("layout", "t_video", "t_audio", "imgvid_condition_timestep", "audio_condition_timestep"),
+    [
+        ("t2va", 0.2, 0.3, 0.999, 1.0),
+        ("fl2va", 0.2, 0.3, 0.999, 1.0),
+        ("ref2va", 0.2, 0.3, 0.999, 1.0),
+        ("ref2va", 0.5, 0.5, 0.5, 0.5),
+    ],
+)
+def test_denoise_branch_reuses_exact_timestep_inverse_metadata(
+    layout,
+    t_video,
+    t_audio,
+    imgvid_condition_timestep,
+    audio_condition_timestep,
+):
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MINIMAX_H3_AUDIO_ROW_WIDTH,
+        MINIMAX_H3_VIDEO_ROW_WIDTH,
+        MiniMaxH3DenoiseBranch,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    common = dict(text_len=2, latent_t=1, latent_h=2, latent_w=2, audio_t=1)
+    if layout == "ref2va":
+        packed = minimax_h3_packed_sequence_ref2va_blocks(
+            **common,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 2, "latent_w": 2},
+                {"kind": "audio", "ref_audio_t": 1},
+            ],
+        )
+    else:
+        packed = minimax_h3_packed_sequence(
+            **common,
+            include_keyframe_cond=layout == "fl2va",
+            keyframe_frame_indices=[0] if layout == "fl2va" else None,
+            frame_count=1 if layout == "fl2va" else None,
+        )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, 3),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    video_rows = torch.zeros(branch.img_pos.numel(), MINIMAX_H3_VIDEO_ROW_WIDTH)
+    audio_rows = torch.zeros(branch.audio_pos.numel(), MINIMAX_H3_AUDIO_ROW_WIDTH)
+
+    expected_timesteps = torch.full((branch.seq_len,), t_video, dtype=torch.float32)
+    expected_timesteps[branch.img_pos_dev[branch.update_mask_dev]] = t_video
+    expected_timesteps[branch.img_pos_dev[~branch.update_mask_dev]] = imgvid_condition_timestep
+    expected_timesteps[branch.audio_pos_dev[branch.audio_update_mask_dev]] = t_audio
+    expected_timesteps[branch.audio_pos_dev[~branch.audio_update_mask_dev]] = audio_condition_timestep
+    expected_unique, expected_inverse = torch.unique(expected_timesteps, sorted=True, return_inverse=True)
+
+    first = branch.forward_kwargs(
+        video_rows=video_rows,
+        audio_rows=audio_rows,
+        t_video=t_video,
+        t_audio=t_audio,
+        imgvid_cond_timestep=imgvid_condition_timestep,
+        audio_ref_cond_timestep=audio_condition_timestep,
+    )
+    torch.testing.assert_close(first["unique_timesteps"], expected_unique)
+    torch.testing.assert_close(first["inverse_indices"], expected_inverse)
+
+    second = branch.forward_kwargs(
+        video_rows=video_rows,
+        audio_rows=audio_rows,
+        t_video=t_video,
+        t_audio=t_audio,
+        imgvid_cond_timestep=imgvid_condition_timestep,
+        audio_ref_cond_timestep=audio_condition_timestep,
+    )
+    assert second["inverse_indices"] is first["inverse_indices"]

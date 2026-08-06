@@ -32,7 +32,10 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
         MiniMaxH3DiTModel,
     )
 
-    assert MiniMaxH3DiTModel._repeated_blocks == ["MiniMaxH3DiTBlock"]
+    assert MiniMaxH3DiTModel._repeated_blocks == [
+        "MiniMaxH3DiTBlock",
+        "MiniMaxH3TokenRefinerBlock",
+    ]
     assert MiniMaxH3DiTModel._layerwise_offload_blocks_attrs == ["blocks"]
     assert MiniMaxH3DiTModel._cache_dit_adapter_config.block_forward_patterns["blocks"] == ForwardPattern.Pattern_3
     assert not MiniMaxH3DiTModel._cache_dit_adapter_config.has_separate_cfg
@@ -59,6 +62,27 @@ def test_packed_attention_is_a_regional_compile_boundary():
     )
 
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
+
+
+def test_time_embedder_caches_nonpersistent_frequency_buffer(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer_module
+
+    class FakeParallelLinear(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(transformer_module, "ColumnParallelLinear", FakeParallelLinear)
+    monkeypatch.setattr(transformer_module, "RowParallelLinear", FakeParallelLinear)
+    arch = transformer_module.MiniMaxH3DiTArchConfig(
+        timestep_input_dim=4,
+        time_embed_hidden_size=4,
+        time_embed_dim=4,
+    )
+
+    embedder = transformer_module.MiniMaxH3TimeEmbedder(arch, prefix="test")
+
+    assert "timestep_freqs" in dict(embedder.named_buffers())
+    assert "timestep_freqs" not in embedder.state_dict()
 
 
 @pytest.mark.parametrize(

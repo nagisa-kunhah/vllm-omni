@@ -253,6 +253,12 @@ class MiniMaxH3TimeEmbedder(nn.Module):
     ) -> None:
         super().__init__()
         self.frequency_embedding_size = arch.timestep_input_dim
+        half = self.frequency_embedding_size // 2
+        self.register_buffer(
+            "timestep_freqs",
+            torch.exp(-math.log(10000.0) * torch.arange(half, dtype=_FP32_DTYPE) / half),
+            persistent=False,
+        )
         self.proj_in = ColumnParallelLinear(
             arch.timestep_input_dim,
             arch.time_embed_hidden_size,
@@ -278,9 +284,7 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         The sinusoidal embedding stays fp32 throughout and concatenates cosine
         values before sine values.
         """
-        half = self.frequency_embedding_size // 2
-        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=_FP32_DTYPE, device=t.device) / half)
-        args = t.to(_FP32_DTYPE)[:, None] * freqs[None]
+        args = t.to(_FP32_DTYPE)[:, None] * self.timestep_freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         hidden, _ = self.proj_in(t_freq)
         hidden = nn.functional.silu(hidden)
@@ -778,7 +782,10 @@ class MiniMaxH3DiTModel(nn.Module):
         has_separate_cfg=False,
         check_forward_pattern=False,
     )
-    _repeated_blocks = ["MiniMaxH3DiTBlock"]
+    _repeated_blocks = [
+        "MiniMaxH3DiTBlock",
+        "MiniMaxH3TokenRefinerBlock",
+    ]
     _layerwise_offload_blocks_attrs = ["blocks"]
 
     @staticmethod
