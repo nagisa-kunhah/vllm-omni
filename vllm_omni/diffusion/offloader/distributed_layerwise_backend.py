@@ -1145,6 +1145,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Stream plan-declared encoder blocks on each rank without AllGather."""
         if plan is None or name not in plan.encoder_block_attrs:
             return False
+        # Online NVFP4 replaces each custom TP linear's BF16 Parameter with a
+        # registered Marlin state module during the encoder's explicit staged
+        # load. The generic block hooks snapshot BF16 parameters before that
+        # conversion and therefore cannot safely stream this representation.
+        # Keep the already-compressed encoder as one pipeline-managed stage:
+        # it is loaded for encode and returned to CPU before the DiT phase.
+        if getattr(module, "online_nvfp4", False):
+            logger.info(
+                "Skipping blockwise encoder offload for %s: online NVFP4 uses whole-encoder staged loading",
+                name,
+            )
+            return False
         if getattr(module, "_omni_layerwise_enabled", False):
             return True
 
