@@ -46,7 +46,7 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_aug_rows,
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
-from .encoder import MiniMaxH3Qwen3VLEncoder
+from .encoder import MiniMaxH3Qwen3VLEncoder, minimax_h3_text_encoder_quantization
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -343,6 +343,7 @@ class MiniMaxH3Pipeline(
             device=self.device,
             load_model=rank < text_encoder_tp_size,
             encoder_group=self.text_encoder_group,
+            online_nvfp4=minimax_h3_text_encoder_quantization(),
         )
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
