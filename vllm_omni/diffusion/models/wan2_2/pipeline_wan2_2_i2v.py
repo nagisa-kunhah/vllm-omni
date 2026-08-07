@@ -86,6 +86,32 @@ def get_wan22_i2v_post_process_func(
     return post_process_func
 
 
+def _normalize_i2v_last_image(
+    value: str | PIL.Image.Image | torch.Tensor | list[object] | None,
+) -> PIL.Image.Image | torch.Tensor | None:
+    """Normalize the optional I2V last-frame condition for batching."""
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        if not value:
+            return None
+        if len(value) != 1:
+            raise ValueError("I2V accepts at most one last_image.")
+        value = value[0]
+
+    if isinstance(value, str):
+        value = PIL.Image.open(value).convert("RGB")
+
+    if not isinstance(value, (PIL.Image.Image, torch.Tensor)):
+        raise TypeError(
+            f"Unsupported last_image format {value.__class__}. "
+            "Expected a file path, PIL.Image.Image, torch.Tensor, or None."
+        )
+
+    return value
+
+
 def get_wan22_i2v_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -95,8 +121,6 @@ def get_wan22_i2v_pre_process_func(
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-        last_image = multi_modal_data.get("last_image", None) if multi_modal_data is not None else None
-        request.batch_compatibility_key = ("wan22_i2v_last_image", last_image is not None)
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
         if "additional_information" not in prompt:
@@ -113,6 +137,9 @@ def get_wan22_i2v_pre_process_func(
                 """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
             )
         image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+        last_image = _normalize_i2v_last_image(multi_modal_data.get("last_image"))  # type: ignore[union-attr]
+        prompt["multi_modal_data"]["last_image"] = last_image  # type: ignore[index]
+        request.batch_compatibility_key = ("wan22_i2v_last_image", last_image is not None)
 
         # Calculate dimensions based on aspect ratio if not provided
         if request.sampling_params.height is None or request.sampling_params.width is None:

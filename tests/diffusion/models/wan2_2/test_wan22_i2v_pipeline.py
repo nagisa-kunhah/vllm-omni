@@ -89,6 +89,88 @@ def test_i2v_preprocess_requires_image_and_resizes_to_480p_aspect() -> None:
         preprocess(missing_image)
 
 
+def _make_i2v_preprocess_request(last_image):
+    return SimpleNamespace(
+        prompt={
+            "prompt": "p",
+            "multi_modal_data": {
+                "image": Image.new("RGB", (320, 160), "red"),
+                "last_image": last_image,
+            },
+        },
+        sampling_params=SimpleNamespace(height=16, width=16),
+    )
+
+
+def test_i2v_preprocess_treats_empty_last_image_list_as_absent() -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+
+    result = preprocess(_make_i2v_preprocess_request([]))
+
+    assert result.prompt["multi_modal_data"]["last_image"] is None
+    assert result.batch_compatibility_key == ("wan22_i2v_last_image", False)
+
+
+def test_i2v_preprocess_unwraps_single_last_image_list() -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+    last_image = Image.new("RGB", (16, 16), "blue")
+
+    result = preprocess(_make_i2v_preprocess_request([last_image]))
+
+    assert result.prompt["multi_modal_data"]["last_image"] is last_image
+    assert result.batch_compatibility_key == ("wan22_i2v_last_image", True)
+
+
+@pytest.mark.parametrize(
+    "last_image",
+    [
+        Image.new("RGB", (16, 16), "blue"),
+        torch.zeros(3, 16, 16),
+    ],
+)
+def test_i2v_preprocess_preserves_supported_last_image(last_image) -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+
+    result = preprocess(_make_i2v_preprocess_request(last_image))
+
+    assert result.prompt["multi_modal_data"]["last_image"] is last_image
+    assert result.batch_compatibility_key == ("wan22_i2v_last_image", True)
+
+
+def test_i2v_preprocess_loads_last_image_path(tmp_path) -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+    path = tmp_path / "last.png"
+    Image.new("RGB", (16, 16), "blue").save(path)
+
+    result = preprocess(_make_i2v_preprocess_request(str(path)))
+
+    last_image = result.prompt["multi_modal_data"]["last_image"]
+    assert isinstance(last_image, Image.Image)
+    assert last_image.mode == "RGB"
+    assert result.batch_compatibility_key == ("wan22_i2v_last_image", True)
+
+
+def test_i2v_preprocess_rejects_multiple_last_images() -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+
+    with pytest.raises(ValueError, match="at most one last_image"):
+        preprocess(
+            _make_i2v_preprocess_request(
+                [
+                    Image.new("RGB", (16, 16), "blue"),
+                    Image.new("RGB", (16, 16), "green"),
+                ]
+            )
+        )
+
+
+def test_i2v_preprocess_rejects_unsupported_last_image_type() -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+
+    with pytest.raises(TypeError, match="Unsupported last_image format"):
+        preprocess(_make_i2v_preprocess_request({"not": "an image"}))
+
+
 def test_i2v_diffuse_selects_stage_guidance_and_expands_timesteps() -> None:
     pipeline = _make_i2v_pipeline(expand_timesteps=True)
     latents = torch.zeros(1, 4, 2, 4, 4)
