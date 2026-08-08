@@ -326,6 +326,7 @@ def _verify_fused_shards_complete(
     details = "; ".join(f"{name}: {sources}" for name, sources in sorted(missing.items()))
     raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
 
+
 class MiniMaxH3Qwen3VLRowParallelLinear(_MiniMaxH3OnlineFP8Linear, nn.Module):
     def __init__(
         self,
@@ -800,9 +801,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             query_states = self.q_norm(packed_qkv[..., :q_local].view(hidden_shape)).transpose(1, 2)
             key_states = self.k_norm(packed_qkv[..., q_local : q_local + kv_local].view(hidden_shape)).transpose(1, 2)
             value_states = (
-                packed_qkv[..., q_local + kv_local : q_local + 2 * kv_local]
-                .view(hidden_shape)
-                .transpose(1, 2)
+                packed_qkv[..., q_local + kv_local : q_local + 2 * kv_local].view(hidden_shape).transpose(1, 2)
             )
         else:
             q_weight = self.qkv_proj.weight[0:q_local]
