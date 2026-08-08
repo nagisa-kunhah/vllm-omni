@@ -40,6 +40,7 @@ _DEPLOY_LAYOUTS = {
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
+    "minicpmo_4_5_cudagraph.yaml": ["0", "1", "1"],
 }
 
 
@@ -183,6 +184,16 @@ class TestDeployTopology:
                 0.55,
                 0.35,
             ]
+        elif filename == "minicpmo_4_5_cudagraph.yaml":
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [1, 1, 1]
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "video": {"count": 1, "num_frames": 32},
+            }
+            assert stages[0].yaml_engine_args["compilation_config"] == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+                "cudagraph_num_of_warmups": 2,
+            }
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
@@ -313,6 +324,9 @@ class TestCudaGraphDeployProfile:
             "cudagraph_mode": "FULL_DECODE_ONLY",
             "cudagraph_capture_sizes": [1],
             "cudagraph_num_of_warmups": 2,
+        }
+        assert stage0.model_config.attention_config == {
+            "flash_attn_max_num_splits_for_cuda_graph": 1,
         }
         assert stage1.model_config.enforce_eager is True
         assert stage1.model_config.compilation_config is None

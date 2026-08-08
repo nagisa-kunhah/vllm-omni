@@ -1,5 +1,6 @@
-# Opt-in MiniCPM-o 4.5 profile for validating the Stage 0 thinker decode
-# CUDA Graph independently from the Talker and Code2Wav stages.
+# Experimental validation profile for Stage 0 thinker decode CUDA Graph.
+# Graph capture is fixed at bs=1, so all stages are intentionally limited to
+# one concurrent sequence; do not use this profile for throughput validation.
 pipeline: minicpmo_4_5
 async_chunk: true
 
@@ -35,7 +36,9 @@ stages:
     max_num_batched_tokens: 16384
     devices: "0"
     limit_mm_per_prompt:
-      video: 1
+      video:
+        count: 1
+        num_frames: 32
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

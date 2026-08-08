@@ -3,6 +3,8 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 
 class _RecordingThinker(torch.nn.Module):
@@ -58,3 +60,39 @@ def test_thinker_forward_preserves_mrope_positions_for_decode_graph():
     assert wrapper.thinker.call["inputs_embeds"].data_ptr() == inputs_embeds.data_ptr()
     assert output.text_hidden_states.shape == (1, 4)
     assert output.multimodal_outputs["latent"] is output.text_hidden_states
+
+
+def test_thinker_make_omni_output_restores_cudagraph_replay_tuple():
+    wrapper = _make_wrapper()
+    text_hidden_states = torch.randn(1, 4)
+    multimodal_outputs = {"latent": text_hidden_states}
+    intermediate_tensors = object()
+    next_token_id = torch.tensor([7])
+
+    output = wrapper.make_omni_output(
+        (text_hidden_states, multimodal_outputs, intermediate_tensors, next_token_id)
+    )
+
+    assert isinstance(output, OmniOutput)
+    assert output.text_hidden_states is text_hidden_states
+    assert output.multimodal_outputs is multimodal_outputs
+    assert output.intermediate_tensors is intermediate_tensors
+    assert output.next_token_id is next_token_id
+
+
+def test_thinker_npu_preserves_batched_mrope_positions(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    wrapper = _make_wrapper()
+    input_ids = torch.tensor([[7, 8]])
+    # A genuine batched M-RoPE tensor: (batch, sequence, rope-axis).
+    # It must not be mistaken for an unbatched tensor that needs unwrapping.
+    positions = torch.tensor([[[1, 2, 3], [4, 5, 6]]])
+    inputs_embeds = torch.randn(1, 2, 4)
+
+    wrapper(
+        input_ids=input_ids,
+        positions=positions,
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert wrapper.thinker.call["positions"] is positions

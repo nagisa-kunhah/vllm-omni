@@ -528,7 +528,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and input_ids_added_batch_dim else input_ids
-                thinker_positions = positions[0] if positions.ndim > 1 else positions
+                thinker_positions = positions[0] if positions is not None and positions_added_batch_dim else positions
                 thinker_inputs_embeds = (
                     inputs_embeds[0] if inputs_embeds is not None and inputs_embeds_added_batch_dim else inputs_embeds
                 )
@@ -628,7 +628,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
     def make_omni_output(self, model_outputs, **kwargs):
-        if self.model_stage != "tts":
+        if self.model_stage == "llm":
+            if isinstance(model_outputs, OmniOutput):
+                return model_outputs
+            # vLLM's CUDA-graph weak-reference rebuild materializes NamedTuple
+            # outputs as ordinary tuples. Restore this stage's declared output
+            # type before the shared runner extracts inter-stage payloads.
+            if isinstance(model_outputs, tuple) and len(model_outputs) == len(OmniOutput._fields):
+                return OmniOutput(*model_outputs)
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
 
