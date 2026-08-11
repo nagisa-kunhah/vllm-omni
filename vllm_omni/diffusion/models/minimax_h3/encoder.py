@@ -43,21 +43,28 @@ from vllm.logger import init_logger
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
+# NVFP4 stores data in FP4 E2M1 (largest finite magnitude 6) and stores its
+# per-block scales in FP8 E4M3FN (largest finite magnitude 448). The global
+# scale maps the tensor amax into this two-level representable range.
+_NVFP4_E2M1_MAX = 6.0
+_NVFP4_BLOCK_SCALE_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+_NVFP4_GLOBAL_SCALE_DENOMINATOR = _NVFP4_E2M1_MAX * _NVFP4_BLOCK_SCALE_FP8_MAX
+
 logger = init_logger(__name__)
 
 _TEXT_ENCODER_QUANT_ENV = "VLLM_OMNI_H3_TEXT_ENCODER_QUANTIZATION"
 
 
-def minimax_h3_text_encoder_quantization() -> bool:
-    """Return whether opt-in online W4A16 NVFP4 is requested."""
+def minimax_h3_text_encoder_quantization_mode() -> str | None:
+    """Return the explicitly requested online NVFP4 mode, if any."""
     value = os.getenv(_TEXT_ENCODER_QUANT_ENV, "").strip().lower()
     if not value or value in {"none", "bf16"}:
-        return False
-    if value in {"online_nvfp4", "online_nvfp4_w4a16", "nvfp4_online"}:
-        return True
-    raise ValueError(
-        f"{_TEXT_ENCODER_QUANT_ENV} must be bf16 or online_nvfp4_w4a16; got {value!r}"
-    )
+        return None
+    if value == "online_nvfp4_w4a16":
+        return "w4a16"
+    if value == "online_nvfp4_w4a4":
+        return "w4a4"
+    raise ValueError(f"{_TEXT_ENCODER_QUANT_ENV} must be bf16, online_nvfp4_w4a16, or online_nvfp4_w4a4; got {value!r}")
 
 
 def _default_weight_loader(
@@ -74,20 +81,24 @@ def _tp_range(group: Any) -> tuple[int, int]:
 
 
 class _MiniMaxH3OnlineNvFp4Linear:
-    """Convert a CUDA-resident BF16 TP linear to ModelOpt W4A16 NVFP4.
+    """Convert a CUDA-resident BF16 TP linear to ModelOpt NVFP4.
 
     vLLM's ModelOpt method intentionally rejects dynamic conversion at its
     public checkpoint loader.  This experiment explicitly performs ModelOpt's
     in-memory packing at load time, then feeds those serialized tensors to the
-    same W4A16 Marlin method.  It neither reads an offline artifact nor uses
-    FP8 as a fallback.
+    corresponding vLLM NVFP4 method. It neither reads an offline artifact nor
+    uses FP8 as a fallback.
     """
 
     _online_nvfp4_method: Any | None
     _online_nvfp4_layer: nn.Module | None
 
-    def _init_online_nvfp4(self, enabled: bool) -> None:
-        self._online_nvfp4_enabled = enabled
+    def _init_online_nvfp4(self, mode: str | None) -> None:
+        if mode not in {None, "w4a16", "w4a4"}:
+            raise ValueError(f"unsupported MiniMax H3 online NVFP4 mode: {mode!r}")
+        self._online_nvfp4_mode = mode
+        self._online_nvfp4_enabled = mode is not None
+        self._online_nvfp4_input_calibrated = False
         self._online_nvfp4_method = None
         self._online_nvfp4_layer = None
 
@@ -107,22 +118,27 @@ class _MiniMaxH3OnlineNvFp4Linear:
             raise RuntimeError("MiniMax H3 online NVFP4 conversion requires CUDA-resident BF16 weights")
 
         from modelopt.torch.quantization.qtensor import NVFP4QTensor
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptNvFp4Config,
-            ModelOptNvFp4W4A16LinearMethod,
-        )
+        from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
+        from vllm.model_executor.kernels.linear.nvfp4.cutlass import CutlassNvFp4LinearKernel
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
         source_nbytes = self.weight.numel() * self.weight.element_size()
         packed, weight_scale, weight_scale_2 = NVFP4QTensor.quantize(self.weight.detach(), 16)
+        quant_method = "NVFP4" if self._online_nvfp4_mode == "w4a4" else "W4A16_NVFP4"
         config = ModelOptNvFp4Config(
-            quant_method="W4A16_NVFP4",
+            quant_method=quant_method,
             # This is an in-memory serialized representation created above;
             # the method otherwise correctly rejects unsupported dynamic I/O.
             is_checkpoint_nvfp4_serialized=True,
             exclude_modules=[],
             group_size=16,
         )
-        method = ModelOptNvFp4W4A16LinearMethod(config)
+        method = config.LinearMethodCls(config)
+        if self._online_nvfp4_mode == "w4a4":
+            # FlashInfer's preferred adapter JIT-compiles SM120 FP4 code. The
+            # CUDA 12.8 nvcc in the RTX 5090 test environment cannot compile
+            # compute_120f, while vLLM's CUTLASS op supports the GPU directly.
+            method.kernel = CutlassNvFp4LinearKernel(NvFp4LinearLayerConfig())
         layer = nn.Module()
         layer.params_dtype = torch.bfloat16
         method.create_weights(
@@ -139,6 +155,10 @@ class _MiniMaxH3OnlineNvFp4Linear:
         # ModelOpt's public quantizer returns a scalar global scale. vLLM's
         # fused QKV/gate-up loader stores one equal value per logical part.
         layer.weight_scale_2.data.copy_(weight_scale_2.reshape(1).repeat(len(output_partition_sizes)))
+        if self._online_nvfp4_mode == "w4a4":
+            # Offline W4A4 export supplies this from calibration data. Learn
+            # it from the first real BF16 activation in the online path.
+            layer.input_scale.data.fill_(1.0)
         method.process_weights_after_loading(layer)
         self._online_nvfp4_method = method
         self._online_nvfp4_layer = layer
@@ -146,9 +166,28 @@ class _MiniMaxH3OnlineNvFp4Linear:
         state_nbytes = sum(parameter.numel() * parameter.element_size() for parameter in layer.parameters())
         return source_nbytes, state_nbytes
 
+    def _calibrate_online_nvfp4_input(self, input_: torch.Tensor) -> None:
+        """Initialize a W4A4 activation global scale from real BF16 inputs."""
+        if self._online_nvfp4_mode != "w4a4" or self._online_nvfp4_input_calibrated:
+            return
+        assert self._online_nvfp4_layer is not None
+        layer = self._online_nvfp4_layer
+        # This maps global amax into the FP4 E2M1 × FP8 E4M3FN scale range.
+        # The CUTLASS kernel still performs blockwise dynamic FP4 quantization
+        # on every invocation.
+        amax = input_.detach().abs().amax().float()
+        scale = torch.clamp(
+            amax / _NVFP4_GLOBAL_SCALE_DENOMINATOR,
+            min=torch.finfo(torch.float32).tiny,
+        )
+        layer.input_global_scale_inv.data.copy_(scale.reciprocal())
+        layer.alpha.data.copy_(scale * layer.weight_global_scale)
+        self._online_nvfp4_input_calibrated = True
+
     def _linear(self, input_: torch.Tensor) -> torch.Tensor:
         if self._online_nvfp4_layer is None:
             return F.linear(input_, self.weight)
+        self._calibrate_online_nvfp4_input(input_)
         return self._online_nvfp4_method.apply(self._online_nvfp4_layer, input_)
 
 
@@ -215,7 +254,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn
         input_size: int,
         intermediate_size: int,
         dtype: torch.dtype,
-        online_nvfp4: bool = False,
+        online_nvfp4: str | None = None,
     ) -> None:
         super().__init__()
         self.group = group
@@ -263,7 +302,7 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn.Module):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
-        online_nvfp4: bool = False,
+        online_nvfp4: str | None = None,
     ) -> None:
         super().__init__()
         self.group = group
@@ -358,7 +397,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn.Module):
         output_size: int,
         dtype: torch.dtype,
         input_is_parallel: bool = True,
-        online_nvfp4: bool = False,
+        online_nvfp4: str | None = None,
     ) -> None:
         super().__init__()
         self.group = group
@@ -782,7 +821,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextAttention(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: str | None = None) -> None:
         super().__init__()
         self.group = group
         self.config = config
@@ -827,9 +866,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             query_states = self.q_norm(packed_qkv[..., :q_local].view(hidden_shape)).transpose(1, 2)
             key_states = self.k_norm(packed_qkv[..., q_local : q_local + kv_local].view(hidden_shape)).transpose(1, 2)
             value_states = (
-                packed_qkv[..., q_local + kv_local : q_local + 2 * kv_local]
-                .view(hidden_shape)
-                .transpose(1, 2)
+                packed_qkv[..., q_local + kv_local : q_local + 2 * kv_local].view(hidden_shape).transpose(1, 2)
             )
         else:
             q_weight = self.qkv_proj.weight[0:q_local]
@@ -862,7 +899,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextMLP(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: str | None = None) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -894,7 +931,7 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: str | None = None) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype, online_nvfp4=online_nvfp4)
@@ -929,7 +966,7 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         selected_layer: int,
         dtype: torch.dtype,
         *,
-        online_nvfp4: bool = False,
+        online_nvfp4: str | None = None,
     ) -> None:
         super().__init__()
         self.group = group
@@ -1110,7 +1147,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         device: torch.device,
         load_model: bool,
         encoder_group: Any | None = None,
-        online_nvfp4: bool = False,
+        online_nvfp4: str | None = None,
     ) -> None:
         super().__init__()
         self.device_target = device
@@ -1262,9 +1299,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             finished.synchronize()
             expected = MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER * 4
             if converted != expected:
-                raise RuntimeError(
-                    f"MiniMax H3 online NVFP4 converted {converted} TP linears; expected {expected}"
-                )
+                raise RuntimeError(f"MiniMax H3 online NVFP4 converted {converted} TP linears; expected {expected}")
             self._online_nvfp4_loaded = True
             # The BF16 source parameters were released by each linear, but
             # their blocks remain reserved in the CUDA caching allocator until
@@ -1272,13 +1307,17 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             # roughly the original text-linear footprint at process level.
             torch.accelerator.empty_cache()
             gib = 1024**3
+            mode_label = "W4A4_NVFP4" if self.online_nvfp4 == "w4a4" else "W4A16_NVFP4"
+            state_label = "post-CUTLASS state" if self.online_nvfp4 == "w4a4" else "post-Marlin state"
             logger.info(
-                "MiniMax H3 text encoder online W4A16_NVFP4 converted %d TP linears in %.3f ms: "
-                "%.2f GiB BF16 -> %.2f GiB post-Marlin state (%.2f GiB released)",
+                "MiniMax H3 text encoder online %s converted %d TP linears in %.3f ms: "
+                "%.2f GiB BF16 -> %.2f GiB %s (%.2f GiB released)",
+                mode_label,
                 converted,
                 started.elapsed_time(finished),
                 source_nbytes / gib,
                 state_nbytes / gib,
+                state_label,
                 (source_nbytes - state_nbytes) / gib,
             )
 
@@ -1521,4 +1560,4 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self.encode_ids(input_ids, **kwargs)
 
 
-__all__ = ["MiniMaxH3Qwen3VLEncoder", "minimax_h3_text_encoder_quantization"]
+__all__ = ["MiniMaxH3Qwen3VLEncoder", "minimax_h3_text_encoder_quantization_mode"]
