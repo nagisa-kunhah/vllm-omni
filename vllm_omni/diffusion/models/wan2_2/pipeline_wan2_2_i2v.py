@@ -501,12 +501,12 @@ class Wan22I2VPipeline(
                     logger.warning("Received multiple images for one I2V request; using only the first image.")
                 raw_image = raw_image[0]
             if isinstance(raw_image, str):
-                raw_image = PIL.Image.open(raw_image)
+                raw_image = PIL.Image.open(raw_image).convert("RGB")
             images.append(cast(PIL.Image.Image | torch.Tensor, raw_image))
 
             last_image = multi_modal_data.get("last_image")
             if isinstance(last_image, str):
-                last_image = PIL.Image.open(last_image)
+                last_image = PIL.Image.open(last_image).convert("RGB")
             last_images.append(cast(PIL.Image.Image | torch.Tensor | None, last_image))
         if any(image is not None for image in last_images) and not all(image is not None for image in last_images):
             raise ValueError("Cannot batch I2V requests with a mix of provided and missing last_image conditions.")
