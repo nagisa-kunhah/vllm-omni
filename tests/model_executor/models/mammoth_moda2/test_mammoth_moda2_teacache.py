@@ -280,6 +280,75 @@ def test_mammoth_moda2_dit_stage_rejects_unsupported_cache_backend(monkeypatch):
     get_cache_backend.assert_not_called()
 
 
+def test_mammoth_moda2_ar_stage_does_not_consume_diffusion_cache_config(monkeypatch):
+    get_cache_backend = Mock()
+    monkeypatch.setattr(mammoth_model_module, "get_cache_backend", get_cache_backend)
+    wrapper = object.__new__(MammothModa2ForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "ar"
+    wrapper.dit = None
+    wrapper.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            cache_backend="tea_cache",
+            cache_config={"rel_l1_thresh": 0.1},
+        )
+    )
+
+    wrapper._maybe_enable_dit_cache_backend()
+
+    get_cache_backend.assert_not_called()
+
+
+def test_mammoth_moda2_dit_stage_rejects_cache_config_without_backend(monkeypatch):
+    pipe = _build_pipeline(monkeypatch)
+    get_cache_backend = Mock()
+    monkeypatch.setattr(mammoth_model_module, "get_cache_backend", get_cache_backend)
+    wrapper = object.__new__(MammothModa2ForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "dit"
+    wrapper.dit = pipe
+    wrapper.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            cache_backend="none",
+            cache_config={"rel_l1_thresh": 0.1},
+        )
+    )
+
+    with pytest.raises(ValueError, match="cache_config requires cache_backend='tea_cache'"):
+        wrapper._maybe_enable_dit_cache_backend()
+
+    get_cache_backend.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("cache_config", "message"),
+    [
+        ("not-json", "valid JSON object"),
+        ("[]", "JSON object"),
+        ({"Fn_compute_blocks": 2}, "not valid for cache_backend='tea_cache'"),
+    ],
+)
+def test_mammoth_moda2_dit_stage_rejects_invalid_teacache_config(monkeypatch, cache_config, message):
+    pipe = _build_pipeline(monkeypatch)
+    get_cache_backend = Mock()
+    monkeypatch.setattr(mammoth_model_module, "get_cache_backend", get_cache_backend)
+    wrapper = object.__new__(MammothModa2ForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "dit"
+    wrapper.dit = pipe
+    wrapper.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            cache_backend="tea_cache",
+            cache_config=cache_config,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        wrapper._maybe_enable_dit_cache_backend()
+
+    get_cache_backend.assert_not_called()
+
+
 def test_mammoth_moda2_dit_stage_refreshes_cache_from_sampling_steps(monkeypatch):
     pipe = _build_pipeline(monkeypatch)
     fake_backend = SimpleNamespace(

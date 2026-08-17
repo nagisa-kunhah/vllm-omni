@@ -583,8 +583,6 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
-        "cache_backend",  # orch: inject into cache-capable stages; engine: enable stage cache
-        "cache_config",  # orch: normalize/inject defaults; engine: instantiate cache backend
     }
 )
 

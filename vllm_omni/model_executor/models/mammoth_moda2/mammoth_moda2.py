@@ -62,6 +62,8 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Confi
 
 logger = init_logger(__name__)
 
+_MAMMOTH_MODA2_TEACACHE_CONFIG_FIELDS = frozenset({"rel_l1_thresh", "coefficients"})
+
 
 def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
     """Accept both legacy flat metadata and the canonical nested payload."""
@@ -943,20 +945,32 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         model_config = self.vllm_config.model_config
         cache_backend_name = getattr(model_config, "cache_backend", None)
+        cache_config = getattr(model_config, "cache_config", None)
         if cache_backend_name in (None, "", "none"):
+            if cache_config is not None:
+                raise ValueError("MammothModa2 DiT cache_config requires cache_backend='tea_cache'.")
             return
         if cache_backend_name not in {"tea_cache"}:
             raise ValueError(f"MammothModa2 DiT only supports cache_backend='tea_cache'; got {cache_backend_name!r}.")
 
-        cache_config = getattr(model_config, "cache_config", None)
         if isinstance(cache_config, str):
             try:
                 cache_config = json.loads(cache_config)
-            except json.JSONDecodeError:
-                logger.warning("Invalid MammothModa2 DiT cache_config JSON, using defaults.")
-                cache_config = {}
+            except json.JSONDecodeError as exc:
+                raise ValueError("MammothModa2 DiT cache_config must be a valid JSON object.") from exc
         elif cache_config is None:
             cache_config = {}
+
+        if not isinstance(cache_config, Mapping):
+            raise ValueError("MammothModa2 DiT cache_config must be a JSON object or mapping.")
+        cache_config = dict(cache_config)
+
+        invalid_fields = set(cache_config) - _MAMMOTH_MODA2_TEACACHE_CONFIG_FIELDS
+        if invalid_fields:
+            invalid_list = ", ".join(sorted(invalid_fields))
+            raise ValueError(
+                f"MammothModa2 DiT cache config field(s) {invalid_list} are not valid for cache_backend='tea_cache'."
+            )
 
         cache_backend = get_cache_backend(cache_backend_name, cache_config)
         if cache_backend is None:
