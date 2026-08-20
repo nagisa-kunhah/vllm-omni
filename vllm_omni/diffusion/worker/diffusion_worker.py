@@ -1194,6 +1194,7 @@ class WorkerProc:
             )
             if not collect_rank_status:
                 raise
+            _cleanup_after_execution_error(e)
 
         if isinstance(result, bool):
             status["bool_result"] = result
