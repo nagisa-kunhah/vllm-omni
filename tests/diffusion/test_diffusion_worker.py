@@ -90,12 +90,12 @@ class TestDiffusionWorkerSleep:
         mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = initial_usage
-
         # Call sleep with level 1
         result = mock_gpu_worker.sleep(level=1)
 
         # Verify sleep was called with correct tags
         mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+        mock_gpu_worker.model_runner.pipeline.clear_audio_cuda_graph.assert_not_called()
         assert bool(result) is True
         # Verify buffers were NOT saved (level 1 doesn't save buffers)
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
@@ -130,12 +130,20 @@ class TestDiffusionWorkerSleep:
                 ("buffer2", mock_buffer2),
             ]
         )
+        mock_gpu_worker.model_runner.graph_runners = mocker.Mock()
+        events = []
+        mock_gpu_worker.model_runner.pipeline.clear_audio_cuda_graph.side_effect = lambda: events.append("audio")
+        mock_gpu_worker.model_runner.graph_runners.clear.side_effect = lambda: events.append("generic")
+        mock_allocator.sleep.side_effect = lambda **_kwargs: events.append("allocator")
 
         # Call sleep with level 2
         result = mock_gpu_worker.sleep(level=2)
 
         # Verify sleep was called with empty tags (offload all)
         mock_allocator.sleep.assert_called_once_with(offload_tags=tuple())
+        mock_gpu_worker.model_runner.pipeline.clear_audio_cuda_graph.assert_called_once_with()
+        mock_gpu_worker.model_runner.graph_runners.clear.assert_called_once_with()
+        assert events == ["audio", "generic", "allocator"]
         assert bool(result) is True
 
         # Verify buffers were saved
@@ -212,6 +220,7 @@ class TestDiffusionWorkerWakeUp:
 
         # Verify allocator.wake_up was called
         mock_allocator.wake_up.assert_called_once_with(["weights"])
+        mock_gpu_worker.model_runner.pipeline.clear_audio_cuda_graph.assert_not_called()
         assert bool(result) is True
 
     def test_wake_up_with_buffers(self, mocker: MockerFixture, mock_gpu_worker):
@@ -297,3 +306,32 @@ class TestDiffusionWorkerWakeUp:
         mock_buffer2.data.copy_.assert_not_called()
 
         assert result is True
+
+
+def test_audio_graph_cleanup_is_optional_for_custom_model_runner(mocker: MockerFixture):
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 0
+    worker.model_runner = mocker.Mock()
+    worker.model_runner.pipeline = mocker.Mock(spec=[])
+
+    worker._clear_audio_cuda_graph()
+
+
+def test_shutdown_clears_model_local_audio_graph_before_other_teardown(mocker: MockerFixture):
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 0
+    events = []
+    pipeline = mocker.Mock()
+    pipeline.clear_audio_cuda_graph.side_effect = lambda: events.append("graph")
+    manager = mocker.Mock()
+    manager.shutdown_prefetch.side_effect = lambda: events.append("kv")
+    worker.model_runner = mocker.Mock(pipeline=pipeline, kv_transfer_manager=manager)
+    destroy = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+        side_effect=lambda: events.append("distributed"),
+    )
+
+    worker.shutdown()
+
+    assert events == ["graph", "kv", "distributed"]
+    destroy.assert_called_once_with()
