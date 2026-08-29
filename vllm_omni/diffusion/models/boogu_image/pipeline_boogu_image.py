@@ -11,12 +11,11 @@ Ported from the upstream ``boogu`` package
   loaded from the checkpoint subfolders; transformer weights arrive later via
   ``weights_sources`` + ``load_weights``).
 - Upstream ``encode_instruction`` is exposed as ``encode_prompt`` (the
-  vLLM-Omni convention, also hooked by the prompt-embed cache); only the
-  text-to-image path is ported. Instruction rewriting, prompt tuning,
-  reference-image (TI2I/I2I) encoding, double guidance, and vision-token
-  stripping are not ported.
-- ``forward()`` (denoise loop + VAE decode) is intentionally not implemented
-  yet; it lands together with the post-process registration.
+  vLLM-Omni convention, also hooked by the prompt-embed cache).
+- Text-to-image and single-reference TI2I inference share one native pipeline;
+  CFG branches use vLLM-Omni's shared two-branch/N-branch parallel helpers.
+- Instruction rewriting, prompt tuning, and vision-token stripping are not
+  ported.
 """
 
 import json
@@ -36,6 +35,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -189,7 +189,7 @@ SYSTEM_PROMPT_4_T2I_UNIFIED = (
 )
 
 
-class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
+class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
     """Boogu-Image text-to-image and image-editing (TI2I) pipeline.
 
     Native vLLM-Omni implementation. A request with a reference image (edit /
@@ -299,8 +299,6 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
         if (parallel_config.sequence_parallel_size or 1) > 1:
             raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
-        if parallel_config.cfg_parallel_size > 1:
-            raise NotImplementedError("CFG parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
         if self.od_config.cache_backend not in (None, "", "none"):
@@ -562,6 +560,41 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             ref_image_hidden_states=ref_image_hidden_states,
         )
 
+    def predict_noise(self, **kwargs) -> torch.Tensor:
+        """Run one Boogu CFG branch through the native transformer."""
+        return self.predict(**kwargs)
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor],
+        true_cfg_scale: float | dict[str, float],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        """Combine Boogu Edit's positive, negative-with-ref, and uncond branches.
+
+        The three-branch order is ``[positive_with_reference,
+        negative_with_reference, negative_without_reference]``.  Preserve the
+        upstream double-guidance semantics exactly::
+
+            uncond
+            + image_scale * (negative_with_reference - uncond)
+            + text_scale * (positive_with_reference - negative_with_reference)
+        """
+        if len(predictions) != 3:
+            return super().combine_multi_branch_cfg_noise(predictions, true_cfg_scale, cfg_normalize)
+        if not isinstance(true_cfg_scale, dict):
+            raise TypeError("Boogu three-branch CFG requires text and image guidance scales.")
+
+        positive_with_reference, negative_with_reference, uncond = predictions
+        combined = (
+            uncond
+            + true_cfg_scale["image"] * (negative_with_reference - uncond)
+            + true_cfg_scale["text"] * (positive_with_reference - negative_with_reference)
+        )
+        if cfg_normalize:
+            combined = self.cfg_normalize_function(positive_with_reference, combined)
+        return combined
+
     def _encode_vae_image(self, img: torch.Tensor, generator=None) -> torch.Tensor:
         """Encode an image tensor into the VAE latent space (upstream ``encode_vae``).
 
@@ -722,71 +755,107 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         timesteps = self.scheduler.timesteps
         num_timesteps = len(timesteps)
 
-        # 5. Denoise loop with (sequential) classifier-free guidance. Reproduces
-        # the branch priority of upstream ``processing`` (double > text-only >
-        # image-only > t2i text). Reference latents are kept in the conditional
-        # (and, for text-only ti2i, the unconditional) predictions.
+        # 5. Denoise loop with shared sequential/parallel CFG execution.
+        # Reproduces the branch priority of upstream ``processing`` (double >
+        # text-only > image-only > t2i text). Reference latents stay attached
+        # to the same branches as in the original sequential implementation.
         with self.progress_bar(total=num_timesteps) as progress_bar:
             for i, t in enumerate(timesteps):
                 in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
                 text_gs = text_guidance_scale if in_cfg_range else 1.0
                 image_gs = image_guidance_scale if in_cfg_range else 1.0
 
-                model_pred = self.predict(
-                    t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_latents
+                positive_kwargs = dict(
+                    t=t,
+                    latents=latents,
+                    instruction_embeds=instruction_embeds,
+                    freqs_real=freqs_real,
+                    instruction_attention_mask=instruction_attention_mask,
+                    ref_image_hidden_states=ref_latents,
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
                     # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
-                    model_pred_drop_text = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_real,
-                        negative_instruction_attention_mask,
-                        ref_latents,
+                    negative_with_reference_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=ref_latents,
                     )
-                    model_pred_drop_all = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_real,
-                        negative_instruction_attention_mask,
-                        None,
+                    uncond_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=None,
                     )
-                    delta_text = model_pred - model_pred_drop_text
-                    delta_image = model_pred_drop_text - model_pred_drop_all
-                    model_pred = model_pred + (text_gs - 1) * delta_text + (image_gs - 1) * delta_image
+                    model_pred = self.predict_noise_with_multi_branch_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale={"text": text_gs, "image": image_gs},
+                        branches_kwargs=[positive_kwargs, negative_with_reference_kwargs, uncond_kwargs],
+                        cfg_normalize=False,
+                    )
                 elif task_type == "ti2i" and text_gs > 1.0:
                     # Text-only ti2i guidance: reference kept in the uncond pred.
-                    model_pred_drop_text = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_real,
-                        negative_instruction_attention_mask,
-                        ref_latents,
+                    negative_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=ref_latents,
                     )
-                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_text)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=text_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
-                    model_pred_drop_image = self.predict(
-                        t, latents, instruction_embeds, freqs_real, instruction_attention_mask, None
+                    negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=image_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
                     )
-                    model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
                 elif text_gs > 1.0:
                     # Text-to-image classifier-free guidance.
-                    model_pred_drop_all = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_real,
-                        negative_instruction_attention_mask,
-                        None,
+                    negative_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=None,
                     )
-                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_all)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=text_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
+                else:
+                    # CFG-off requests remain valid even if the server owns a
+                    # CFG process group: every rank evaluates only the positive
+                    # branch and no negative embeddings are required.
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=False,
+                        true_cfg_scale=1.0,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=None,
+                        cfg_normalize=False,
+                    )
 
-                latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                do_true_cfg = text_gs > 1.0 or (task_type == "ti2i" and image_gs > 1.0)
+                latents = self.scheduler_step_maybe_with_cfg(model_pred, t, latents, do_true_cfg=do_true_cfg)
                 latents = latents.to(dtype=instruction_embeds.dtype)
                 progress_bar.update()
 

@@ -21,6 +21,21 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 logger = init_logger(__name__)
 
 
+def _get_cfg_world_size_or_one() -> int:
+    """Return the CFG world size, defaulting to sequential execution.
+
+    Diffusion workers initialize the CFG process group even when its world
+    size is one.  Pipelines are also invoked directly by unit tests and some
+    offline integrations, though, where no distributed groups exist.  Treat
+    that case exactly like a one-rank CFG group instead of failing before the
+    sequential CFG path can run.
+    """
+    try:
+        return get_classifier_free_guidance_world_size()
+    except AssertionError:
+        return 1
+
+
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     """Normalize prediction to tuple form."""
     return pred if isinstance(pred, tuple) else (pred,)
@@ -106,7 +121,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
-            cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+            cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
 
             if cfg_parallel_ready:
                 cfg_group = get_cfg_group()
@@ -253,7 +268,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             n_branches = len(branches_kwargs)
-            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_world_size = _get_cfg_world_size_or_one()
             cfg_parallel_ready = cfg_world_size > 1
 
             if cfg_parallel_ready:
@@ -474,7 +489,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             True if CFG parallel configuration is valid, False otherwise
         """
-        if get_classifier_free_guidance_world_size() == 1:
+        if _get_cfg_world_size_or_one() == 1:
             return True
 
         if true_cfg_scale <= 1:
