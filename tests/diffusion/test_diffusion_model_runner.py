@@ -204,14 +204,32 @@ def test_ltx2_audio_graph_compile_failure_keeps_runner(monkeypatch, caplog):
     assert "continuing with the eager Transformer" in caplog.text
 
 
-def test_ltx2_audio_graph_clear_is_model_local_and_keeps_runner():
+def test_ltx2_audio_graph_is_exposed_through_generic_discovery():
     pipeline = _make_ltx2_graph_pipeline()
     runner = pipeline.audio_graph_runner
 
-    LTXAudioRuntime.clear_audio_cuda_graph(pipeline)
+    graph_runners = LTXAudioRuntime.get_runtime_graph_runners(pipeline)
 
-    runner.clear.assert_called_once_with()
-    assert pipeline.audio_graph_runner is runner
+    assert graph_runners == {"audio_transformer": runner}
+
+
+def test_runtime_graph_registry_can_clear_and_retain_or_remove_runners():
+    graph_runner = SimpleNamespace(clear=Mock())
+    pipeline = SimpleNamespace(get_runtime_graph_runners=lambda: {"test_graph": graph_runner})
+    model_runner = object.__new__(DiffusionModelRunner)
+    model_runner.pipeline = pipeline
+    model_runner.graph_runners = {}
+
+    DiffusionModelRunner._register_runtime_graph_runners(model_runner)
+    assert model_runner.graph_runners == {"test_graph": graph_runner}
+
+    DiffusionModelRunner.clear_graph_runners(model_runner, remove=False)
+    graph_runner.clear.assert_called_once_with()
+    assert model_runner.graph_runners == {"test_graph": graph_runner}
+
+    DiffusionModelRunner.clear_graph_runners(model_runner, remove=True)
+    assert graph_runner.clear.call_count == 2
+    assert model_runner.graph_runners == {}
 
 
 @pytest.mark.parametrize(

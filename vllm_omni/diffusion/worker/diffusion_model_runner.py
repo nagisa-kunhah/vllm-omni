@@ -43,7 +43,9 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
+    RuntimeGraphRunner,
     SupportsPromptUpdate,
+    SupportsRuntimeGraphRunners,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_prompt_update,
@@ -173,6 +175,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.cache_backend: Any | None = None
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
+        self.graph_runners: dict[str, RuntimeGraphRunner] = {}
         self.input_batch: InputBatch | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
@@ -254,6 +257,32 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_granularity,
             compile_dynamic,
         )
+
+    def _register_runtime_graph_runners(self) -> None:
+        """Discover graph runners without coupling the runner to a model family."""
+        self.clear_graph_runners(remove=True)
+        if not isinstance(self.pipeline, SupportsRuntimeGraphRunners):
+            return
+
+        discovered = self.pipeline.get_runtime_graph_runners()
+        for name, graph_runner in discovered.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError("Runtime graph runner names must be non-empty strings")
+            if not isinstance(graph_runner, RuntimeGraphRunner):
+                raise TypeError(f"Runtime graph runner {name!r} must provide clear()")
+        self.graph_runners.update(discovered)
+
+    def clear_graph_runners(self, *, remove: bool = False) -> None:
+        """Release captured graph state, optionally removing registered runners."""
+        graph_runners = getattr(self, "graph_runners", None)
+        if graph_runners is None:
+            self.graph_runners = {}
+            return
+
+        for graph_runner in tuple(graph_runners.values()):
+            graph_runner.clear()
+        if remove:
+            graph_runners.clear()
 
     def load_model(
         self,
@@ -385,6 +414,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
                     current_omni_platform.get_torch_device(),
                 )
+
+        self._register_runtime_graph_runners()
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

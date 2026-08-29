@@ -13,7 +13,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     import torch
 
@@ -99,6 +99,20 @@ class SupportsComponentDiscovery(Protocol):
     _encoder_modules: ClassVar[list[str]]
     _vae_modules: ClassVar[list[str]]
     _resident_modules: ClassVar[list[str]] = []
+
+
+@runtime_checkable
+class RuntimeGraphRunner(Protocol):
+    """Runtime-owned graph state that can be synchronously released."""
+
+    def clear(self) -> None: ...
+
+
+@runtime_checkable
+class SupportsRuntimeGraphRunners(Protocol):
+    """Declares runtime graph runners owned by a pipeline."""
+
+    def get_runtime_graph_runners(self) -> Mapping[str, RuntimeGraphRunner]: ...
 
 
 def supports_step_execution(pipeline: object) -> bool:

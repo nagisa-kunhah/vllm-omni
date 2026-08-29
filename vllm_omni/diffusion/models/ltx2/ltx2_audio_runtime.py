@@ -35,8 +35,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import (
+    RuntimeGraphRunner,
     SupportAudioOutput,
     SupportsComponentDiscovery,
+    SupportsRuntimeGraphRunners,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -232,6 +234,7 @@ class LTXAudioRuntime(
     ProgressBarMixin,
     SupportAudioOutput,
     SupportsComponentDiscovery,
+    SupportsRuntimeGraphRunners,
     DiffusionPipelineProfilerMixin,
 ):
     """Shared one-stage runtime for audio-only LTX generation."""
@@ -344,10 +347,11 @@ class LTXAudioRuntime(
             self._audio_cuda_graph_config.max_entries,
         )
 
-    def clear_audio_cuda_graph(self) -> None:
-        """Synchronously release captured audio graphs while retaining the runner."""
-        if self.audio_graph_runner is not None:
-            self.audio_graph_runner.clear()
+    def get_runtime_graph_runners(self) -> dict[str, RuntimeGraphRunner]:
+        """Return runtime graph state managed by the generic runner lifecycle."""
+        if self.audio_graph_runner is None:
+            return {}
+        return {"audio_transformer": self.audio_graph_runner}
 
     @property
     def guidance_scale(self):

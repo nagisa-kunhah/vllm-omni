@@ -94,6 +94,15 @@ def _cleanup_after_execution_error(exc: Exception) -> None:
         logger.warning("Failed to release device memory after an execution error", exc_info=True)
 
 
+def _clear_model_runner_graphs(model_runner: object | None, *, remove: bool) -> bool:
+    """Clear optional graph state exposed by a model runner."""
+    clear_graph_runners = getattr(model_runner, "clear_graph_runners", None)
+    if callable(clear_graph_runners):
+        clear_graph_runners(remove=remove)
+        return True
+    return False
+
+
 def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
@@ -717,9 +726,7 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
-            self._clear_audio_cuda_graph()
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
+            if _clear_model_runner_graphs(self.model_runner, remove=False):
                 logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
@@ -752,14 +759,6 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Sleep Level {level} completed (GPU was already empty).")
         logger.info(f"[Worker {self.rank}] Memory usage before sleep: {usage_before / GiB_bytes:.2f} GiB.")
         return usage_before
-
-    def _clear_audio_cuda_graph(self) -> None:
-        """Clear optional model-local audio graph state without runner assumptions."""
-        pipeline = getattr(self.model_runner, "pipeline", None)
-        clear_audio_cuda_graph = getattr(pipeline, "clear_audio_cuda_graph", None)
-        if callable(clear_audio_cuda_graph):
-            clear_audio_cuda_graph()
-            logger.info(f"[Worker {self.rank}] LTX2 audio CUDA Graph entries cleared.")
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         """
@@ -908,7 +907,7 @@ class DiffusionWorker:
         """Shutdown the worker and cleanup distributed environment."""
         try:
             if self.model_runner is not None:
-                self._clear_audio_cuda_graph()
+                _clear_model_runner_graphs(self.model_runner, remove=True)
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
                 try:
                     offload_backend = getattr(self.model_runner, "offload_backend", None)
@@ -932,7 +931,7 @@ class CustomPipelineWorkerExtension:
 
         # Clean up old pipeline
         if self.model_runner.pipeline is not None:
-            self._clear_audio_cuda_graph()
+            _clear_model_runner_graphs(self.model_runner, remove=True)
             del self.model_runner.pipeline
             gc.collect()
             torch.accelerator.empty_cache()

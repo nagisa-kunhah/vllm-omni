@@ -425,7 +425,7 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.re_init_pipeline(custom_args)
 
         # Verify cleanup was performed
-        mock_pipeline.clear_audio_cuda_graph.assert_called_once_with()
+        mock_model_runner.clear_graph_runners.assert_called_once_with(remove=True)
         mock_gc_collect.assert_called_once()
         mock_empty_cache.assert_called_once()
 
