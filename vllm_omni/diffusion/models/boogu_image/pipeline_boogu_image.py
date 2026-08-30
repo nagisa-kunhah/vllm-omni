@@ -564,22 +564,60 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         """Run one Boogu CFG branch through the native transformer."""
         return self.predict(**kwargs)
 
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
+        kwargs: dict | None = None,
+    ) -> torch.Tensor:
+        """Preserve Boogu's sequential two-branch CFG operation order."""
+        positive_items = positive_noise_pred if isinstance(positive_noise_pred, tuple) else (positive_noise_pred,)
+        negative_items = negative_noise_pred if isinstance(negative_noise_pred, tuple) else (negative_noise_pred,)
+        if len(positive_items) != 1 or len(negative_items) != 1:
+            raise ValueError("Boogu CFG expects exactly one prediction tensor per branch.")
+
+        positive = positive_items[0]
+        negative = negative_items[0]
+        combined = positive + (true_cfg_scale - 1) * (positive - negative)
+        if cfg_normalize:
+            combined = self.cfg_normalize_function(positive, combined)
+        return combined
+
     def combine_multi_branch_cfg_noise(
         self,
         predictions: list[torch.Tensor],
         true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool = False,
     ) -> torch.Tensor:
-        """Combine Boogu Edit's positive, negative-with-ref, and uncond branches.
+        """Combine Boogu CFG branches using the original operation order.
+
+        Although the usual two- and three-branch CFG formulas can be rewritten
+        algebraically, changing their floating-point operation order causes
+        small per-step differences that accumulate across the denoise loop.
+        Keep the sequential Boogu implementation's order so parallel branch
+        combination does not introduce an additional source of numeric drift.
+
+        The two-branch formula is::
+
+            positive + (scale - 1) * (positive - negative)
 
         The three-branch order is ``[positive_with_reference,
-        negative_with_reference, negative_without_reference]``.  Preserve the
-        upstream double-guidance semantics exactly::
+        negative_with_reference, negative_without_reference]`` and combines as::
 
-            uncond
-            + image_scale * (negative_with_reference - uncond)
-            + text_scale * (positive_with_reference - negative_with_reference)
+            positive_with_reference
+            + (text_scale - 1) * (positive_with_reference - negative_with_reference)
+            + (image_scale - 1) * (negative_with_reference - uncond)
         """
+        if len(predictions) == 2:
+            if not isinstance(true_cfg_scale, float):
+                raise TypeError("Boogu two-branch CFG requires a scalar guidance scale.")
+            positive, negative = predictions
+            combined = positive + (true_cfg_scale - 1) * (positive - negative)
+            if cfg_normalize:
+                combined = self.cfg_normalize_function(positive, combined)
+            return combined
         if len(predictions) != 3:
             return super().combine_multi_branch_cfg_noise(predictions, true_cfg_scale, cfg_normalize)
         if not isinstance(true_cfg_scale, dict):
@@ -587,9 +625,9 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
         positive_with_reference, negative_with_reference, uncond = predictions
         combined = (
-            uncond
-            + true_cfg_scale["image"] * (negative_with_reference - uncond)
-            + true_cfg_scale["text"] * (positive_with_reference - negative_with_reference)
+            positive_with_reference
+            + (true_cfg_scale["text"] - 1) * (positive_with_reference - negative_with_reference)
+            + (true_cfg_scale["image"] - 1) * (negative_with_reference - uncond)
         )
         if cfg_normalize:
             combined = self.cfg_normalize_function(positive_with_reference, combined)

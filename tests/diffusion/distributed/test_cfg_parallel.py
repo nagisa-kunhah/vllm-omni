@@ -396,6 +396,42 @@ def _build_pipeline_on_device(
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
+def test_cfg_defaults_to_sequential_without_initialized_group():
+    pipeline = _build_pipeline_on_device(
+        TestCFGPipeline,
+        hidden_dim=32,
+        model_seed=42,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1,
+        channels=4,
+        height=4,
+        width=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        input_seed=123,
+    )
+
+    with torch.no_grad():
+        positive = pipeline.predict_noise(**positive_kwargs)
+        negative = pipeline.predict_noise(**negative_kwargs)
+        actual = pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=5.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    expected = negative + 5.0 * (positive - negative)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 @pytest.mark.parametrize("extra_kwargs", [None, {"step_i": 1}])
