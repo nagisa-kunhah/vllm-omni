@@ -853,6 +853,39 @@ def test_build_ref_latents_expands_per_output_and_handles_none():
     assert ref_latents[2] is None and ref_latents[3] is None
 
 
+def test_vae_attention_context_is_noop_on_cpu():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    with BooguImagePipeline._vae_attention_context(torch.device("cpu")):
+        pass
+
+
+def test_vae_attention_context_prioritizes_efficient_cuda(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import pipeline_boogu_image
+
+    recorded = {}
+
+    def fake_sdpa_kernel(backends, *, set_priority):
+        recorded["backends"] = backends
+        recorded["set_priority"] = set_priority
+        return pipeline_boogu_image.nullcontext()
+
+    monkeypatch.setattr(pipeline_boogu_image, "sdpa_kernel", fake_sdpa_kernel)
+
+    with pipeline_boogu_image.BooguImagePipeline._vae_attention_context(torch.device("cuda")):
+        pass
+
+    assert recorded == {
+        "backends": [
+            pipeline_boogu_image.SDPBackend.EFFICIENT_ATTENTION,
+            pipeline_boogu_image.SDPBackend.MATH,
+        ],
+        "set_priority": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Editing / TI2I: forward CFG branch selection
 # ---------------------------------------------------------------------------

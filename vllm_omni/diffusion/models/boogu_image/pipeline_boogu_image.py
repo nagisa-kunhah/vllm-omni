@@ -21,6 +21,7 @@ Ported from the upstream ``boogu`` package
 import json
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import ClassVar, cast
 
 import PIL.Image
@@ -30,6 +31,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -640,12 +642,30 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         threads the request generator through so a fixed seed gives a
         reproducible reference latent.
         """
-        z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
+        with self._vae_attention_context(img.device):
+            z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
         if self.vae.config.shift_factor is not None:
             z0 = z0 - self.vae.config.shift_factor
         if self.vae.config.scaling_factor is not None:
             z0 = z0 * self.vae.config.scaling_factor
         return z0.to(dtype=self.vae.dtype)
+
+    @staticmethod
+    def _vae_attention_context(device: torch.device):
+        """Pin the VAE SDPA backend so worker topology cannot change results.
+
+        Boogu's float32 VAE attention can otherwise choose a different SDPA
+        backend in the in-process CFG=1 executor and the multi-process CFG>1
+        executor. The resulting small reference-latent differences accumulate
+        over the denoising loop. Prefer the default fast CUDA backend used by
+        Boogu and keep the math implementation as a portable fallback.
+        """
+        if device.type != "cuda":
+            return nullcontext()
+        return sdpa_kernel(
+            [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+            set_priority=True,
+        )
 
     def _build_ref_latents(
         self,
@@ -906,7 +926,8 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                 latents = latents / self.vae.config.scaling_factor
             if self.vae.config.shift_factor is not None:
                 latents = latents + self.vae.config.shift_factor
-            image = self.vae.decode(latents, return_dict=False)[0]
+            with self._vae_attention_context(latents.device):
+                image = self.vae.decode(latents, return_dict=False)[0]
             if (ori_height, ori_width) != (height, width):
                 image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
 
