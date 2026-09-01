@@ -658,7 +658,11 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         backend in the in-process CFG=1 executor and the multi-process CFG>1
         executor. The resulting small reference-latent differences accumulate
         over the denoising loop. Prefer the default fast CUDA backend used by
-        Boogu and keep the math implementation as a portable fallback.
+        Boogu and keep the math implementation as a CUDA fallback.
+
+        This pin is intentionally CUDA-only. CPU and vendor-specific accelerator
+        backends keep their platform defaults, so topology-independent VAE
+        parity is not guaranteed for those devices by this context.
         """
         if device.type != "cuda":
             return nullcontext()

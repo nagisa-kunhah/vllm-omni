@@ -222,7 +222,7 @@ curl -s http://localhost:8091/v1/chat/completions \
 - **CFG-size recommendations:**
 
   | Request mode | Scales | Predictions per step | Recommended CFG size |
-  |---|---|---:|---:|
+  | --- | --- | ---: | ---: |
   | Base T2I text guidance | `guidance_scale > 1`, no reference | 2 | 2 |
   | Edit text-only guidance | `guidance_scale > 1`, `guidance_scale_2 = 1` | 2 | 2 |
   | Edit image-only guidance | `guidance_scale = 1`, `guidance_scale_2 > 1` | 2 | 2 |
@@ -232,9 +232,9 @@ curl -s http://localhost:8091/v1/chat/completions \
   Double guidance preserves Boogu's original combination:
 
   ```text
-  pred = uncond
-       + image_scale * (negative_with_reference - uncond)
-       + text_scale  * (positive_with_reference - negative_with_reference)
+  pred = positive_with_reference
+       + (text_scale - 1) * (positive_with_reference - negative_with_reference)
+       + (image_scale - 1) * (negative_with_reference - uncond)
   ```
 - **Output resolution:** the output size follows the reference image (upstream
   `align_res`, on by default for a single reference), so `height`/`width` are

@@ -17,7 +17,12 @@ import torch
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed import parallel_state
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _dispatch_branches, _wrap
+from vllm_omni.diffusion.distributed.cfg_parallel import (
+    CFGParallelMixin,
+    _dispatch_branches,
+    _get_cfg_world_size_or_one,
+    _wrap,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_classifier_free_guidance_rank,
@@ -391,6 +396,32 @@ def _build_pipeline_on_device(
 # ---------------------------------------------------------------------------
 # CPU: mixin logic via mocked CFG groups (no GPU / no torch.distributed spawn)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_cfg_world_size_defaults_only_when_group_is_uninitialized(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(parallel_state, "_CFG", None)
+
+    assert not parallel_state.is_cfg_group_initialized()
+    assert _get_cfg_world_size_or_one() == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_cfg_world_size_does_not_swallow_initialized_group_errors(monkeypatch: pytest.MonkeyPatch):
+    class BrokenCfgGroup:
+        @property
+        def world_size(self) -> int:
+            raise AssertionError("CFG group is broken")
+
+    monkeypatch.setattr(parallel_state, "_CFG", BrokenCfgGroup())
+
+    assert parallel_state.is_cfg_group_initialized()
+    with pytest.raises(AssertionError, match="CFG group is broken"):
+        _get_cfg_world_size_or_one()
 
 
 @pytest.mark.core_model

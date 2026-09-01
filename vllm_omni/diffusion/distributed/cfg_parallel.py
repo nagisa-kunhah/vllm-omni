@@ -16,24 +16,24 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    is_cfg_group_initialized,
 )
 
 logger = init_logger(__name__)
 
 
 def _get_cfg_world_size_or_one() -> int:
-    """Return the CFG world size, defaulting to sequential execution.
+    """Return the CFG world size, defaulting only when no group exists.
 
     Diffusion workers initialize the CFG process group even when its world
     size is one.  Pipelines are also invoked directly by unit tests and some
-    offline integrations, though, where no distributed groups exist.  Treat
-    that case exactly like a one-rank CFG group instead of failing before the
-    sequential CFG path can run.
+    offline integrations, though, where no distributed groups exist. Treat
+    that explicit case like a one-rank CFG group. Errors from an existing CFG
+    coordinator must propagate instead of silently selecting sequential CFG.
     """
-    try:
-        return get_classifier_free_guidance_world_size()
-    except AssertionError:
+    if not is_cfg_group_initialized():
         return 1
+    return get_classifier_free_guidance_world_size()
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
