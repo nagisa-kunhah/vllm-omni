@@ -15,6 +15,7 @@ from vllm_omni.diffusion.cache.cachedit.config import (
 )
 from vllm_omni.diffusion.cache.cachedit.model_specific import (
     BagelCachedAdapter,
+    LTX2AudioCachedAdapter,
     SensenovaCachedAdapter,
 )
 from vllm_omni.diffusion.cache.cachedit.model_specific import (
@@ -34,6 +35,7 @@ __all__ = [
     "CacheDiTBackend",
     "CacheDiTConfig",
     "CacheDiTRequestSpec",
+    "LTX2AudioCachedAdapter",
     "RequestScopedCacheDiTRuntime",
     "SensenovaCachedAdapter",
     "cache_summary",

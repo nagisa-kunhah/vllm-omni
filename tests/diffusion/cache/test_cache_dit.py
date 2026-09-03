@@ -84,6 +84,7 @@ def test_cachedit_public_api_is_explicit():
         "CacheDiTBackend",
         "CacheDiTConfig",
         "CacheDiTRequestSpec",
+        "LTX2AudioCachedAdapter",
         "RequestScopedCacheDiTRuntime",
         "SensenovaCachedAdapter",
         "cache_summary",
