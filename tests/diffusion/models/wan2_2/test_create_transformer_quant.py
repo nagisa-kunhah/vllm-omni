@@ -301,6 +301,23 @@ def test_pipeline_create_transformer_does_not_overwrite_existing_od_config(monke
     assert od_config.quantization_config is existing
 
 
+def test_pipeline_create_transformer_resolves_component_config(monkeypatch):
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    FakeTransformer, captured = _make_fake_transformer()
+    monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
+    high = SimpleNamespace()
+    low = SimpleNamespace()
+    component_config = ComponentQuantizationConfig(
+        {"transformer": high, "transformer_2": low}
+    )
+    pipeline = _FakePipeline(SimpleNamespace(quantization_config=component_config))
+
+    pipeline._create_transformer(_MIN_CFG, component="transformer_2")
+
+    assert captured[0]["quant_config"] is low
+
+
 # ---------------------------------------------------------------------------
 # Wan22Pipeline._create_transformer — cascade contracts
 # ---------------------------------------------------------------------------

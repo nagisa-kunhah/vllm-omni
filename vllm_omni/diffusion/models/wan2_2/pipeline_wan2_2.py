@@ -450,13 +450,17 @@ class Wan22Pipeline(
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = self._create_transformer(transformer_config)
+            self.transformer = self._create_transformer(
+                transformer_config, component="transformer"
+            )
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            self.transformer_2 = self._create_transformer(
+                transformer_2_config, component="transformer_2"
+            )
         else:
             self.transformer_2 = None
 
@@ -494,9 +498,16 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+    def _create_transformer(
+        self, config: dict, component: str = "transformer"
+    ) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
+        from vllm_omni.quantization.component_config import (
+            resolve_component_quant_config,
+        )
+
         quant_config = getattr(self.od_config, "quantization_config", None)
+        quant_config = resolve_component_quant_config(quant_config, component)
         return create_transformer_from_config(config, quant_config=quant_config)
 
     @property
