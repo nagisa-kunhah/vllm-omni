@@ -15,12 +15,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
-from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import AutoModelForImageTextToText, AutoTokenizer, Gemma3ForConditionalGeneration
@@ -32,6 +30,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -50,6 +49,13 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .vae.decoder import (
+    LTX25_NATIVE_ARTIFACT_REVISION,
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+)
+from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
@@ -305,7 +311,7 @@ def resolve_ltx_artifact(
     # independently pinned artifact revision.
     revision = model_revision if model == repo_id else artifact_revision
     try:
-        return hf_hub_download(
+        return hf_api().hf_hub_download(
             repo_id=repo_id,
             filename=filename,
             revision=revision,
@@ -324,7 +330,7 @@ def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
-            "Install kernels==0.15.2, use a supported GPU, leave "
+            "Install kernels==0.16.1, use a supported GPU, leave "
             "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
@@ -377,7 +383,7 @@ def _load_ltx_metadata_json(model: str, filename: str, revision: str | None = No
             return {}
     else:
         try:
-            path = hf_hub_download(repo_id=model, filename=filename, revision=revision)
+            path = hf_api().hf_hub_download(repo_id=model, filename=filename, revision=revision)
         except Exception:
             return {}
     try:
@@ -555,7 +561,7 @@ def _detect_vocoder_output_sample_rate(model: str, revision: str | None = None) 
     vocoder_config_path = os.path.join(model, "vocoder", "config.json")
     if not os.path.exists(vocoder_config_path):
         try:
-            vocoder_config_path = hf_hub_download(model, "vocoder/config.json", revision=revision)
+            vocoder_config_path = hf_api().hf_hub_download(model, "vocoder/config.json", revision=revision)
         except Exception:
             return None
     try:
@@ -705,7 +711,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         revision=revision,
     )
     if profile.text_encoder_cls is None:
-        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
             profile.text_encoder_cls,
@@ -882,7 +888,7 @@ def load_transformer_config(
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"LTX transformer config not found: {config_path}")
     else:
-        config_path = hf_hub_download(
+        config_path = hf_api().hf_hub_download(
             repo_id=model_path,
             filename=f"{subfolder}/config.json",
             revision=revision,
