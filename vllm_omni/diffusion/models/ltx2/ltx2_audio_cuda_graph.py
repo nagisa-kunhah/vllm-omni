@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.distributed import get_tensor_model_parallel_world_size
+import torch.distributed as dist
+from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from .ltx2_audio_transformer import LTX2AudioStaticConditioning
 
@@ -64,14 +66,6 @@ class LTX2AudioGraphKey:
     has_audio_attention_mask: bool
     has_perturbation_mask: bool
     stg_blocks: tuple[int, ...] | None
-
-    @property
-    def audio_token_count(self) -> int:
-        return self.hidden_shape[1]
-
-    @property
-    def context_token_count(self) -> int:
-        return self.context_shape[1]
 
 
 @dataclass
@@ -152,7 +146,7 @@ class LTX2AudioCUDAGraphRunner:
     """Capture and replay complete LTX2 audio Transformer forwards.
 
     A runner is owned by one diffusion worker and is accessed serially by that
-    worker. Captures and replays use a runner-private shared graph pool.
+    worker. Captures and replays use the platform-global graph pool.
     Replay returns the graph's static output. Downstream consumers must enqueue
     their work on the same CUDA stream before the next replay overwrites it.
     Concurrent calls are unsupported because entries reuse mutable buffers.
@@ -177,7 +171,6 @@ class LTX2AudioCUDAGraphRunner:
         self.device = torch.device(device)
         self._cache: OrderedDict[LTX2AudioGraphKey, LTX2AudioGraphEntry] = OrderedDict()
         self._failed_keys: OrderedDict[LTX2AudioGraphKey, None] = OrderedDict()
-        self._pool: Any | None = None
         # In-memory observability counters for CUDA Graph usage and eager fallbacks.
         self._stats = {
             "calls": 0,
@@ -393,29 +386,6 @@ class LTX2AudioCUDAGraphRunner:
             kwargs["hidden_states"] = hidden_states.repeat((hidden_batch_repeats,) + (1,) * (hidden_states.ndim - 1))
         return self._call_transformer(**kwargs)
 
-    @contextmanager
-    def _tensor_parallel_capture_scope(self):
-        """Run TP graph capture on a dedicated CUDA stream.
-
-        Diffusion uses a lightweight TP coordinator without vLLM's custom
-        all-reduce communicator. NCCL collectives only require every rank to
-        enter graph capture on a non-default stream after its current work has
-        completed, so keep that setup local to the LTX2 audio graph path.
-        """
-        try:
-            tp_size = get_tensor_model_parallel_world_size()
-        except AssertionError:
-            tp_size = 1
-        if tp_size == 1:
-            yield
-            return
-
-        capture_stream = torch.cuda.Stream(device=self.device)
-        current_stream = torch.cuda.current_stream(self.device)
-        capture_stream.wait_stream(current_stream)
-        with torch.cuda.stream(capture_stream):
-            yield
-
     def _capture(self, *, hidden_batch_repeats: int = 1, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
         static_inputs = {
             name: _static_copy(value) if isinstance(value, torch.Tensor) else value for name, value in inputs.items()
@@ -429,27 +399,18 @@ class LTX2AudioCUDAGraphRunner:
             )
             _copy_repeated_batch_(static_hidden_states, hidden_states, hidden_batch_repeats)
             static_inputs["hidden_states"] = static_hidden_states
-        with self._tensor_parallel_capture_scope():
-            current_stream = torch.cuda.current_stream(self.device)
-            warmup_stream = torch.cuda.Stream(device=self.device)
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream), torch.no_grad():
-                initial_output = self._call_transformer(**static_inputs)
-            current_stream.wait_stream(warmup_stream)
-            torch.accelerator.synchronize(self.device)
-
-            if self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
+        with torch.no_grad(), graph_capture(device=self.device):
+            # Warm up lazy attention, compiled kernels, and NCCL state on the
+            # same distributed capture stream before capture begins.
+            initial_output = self._call_transformer(**static_inputs)
             graph = torch.cuda.CUDAGraph()
-            with (
-                torch.no_grad(),
-                torch.cuda.graph(
-                    graph,
-                    pool=self._pool,
-                    # This controls capture-time error detection only; it does not
-                    # bind the resulting graph to the capturing Python thread.
-                    capture_error_mode="thread_local",
-                ),
+            # torch.cuda.graph waits for pending warmup work before capture.
+            with torch.cuda.graph(
+                graph,
+                pool=current_platform.get_global_graph_pool(),
+                # This controls capture-time error detection only; it does not
+                # bind the resulting graph to the capturing Python thread.
+                capture_error_mode="thread_local",
             ):
                 static_output = self._call_transformer(**static_inputs)
         return (
@@ -468,6 +429,34 @@ class LTX2AudioCUDAGraphRunner:
             ),
             initial_output,
         )
+
+    @staticmethod
+    def _synchronize_capture_result(key: LTX2AudioGraphKey, capture_error: Exception | None) -> None:
+        """Keep capture success and failed-key state aligned across TP ranks."""
+        if not dist.is_available() or not dist.is_initialized():
+            if capture_error is not None:
+                raise capture_error
+            return
+
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            if capture_error is not None:
+                raise capture_error
+            return
+
+        local_status = (key, None if capture_error is None else f"{type(capture_error).__name__}: {capture_error}")
+        rank_statuses: list[tuple[LTX2AudioGraphKey, str | None] | None] = [None] * tp_group.world_size
+        dist.all_gather_object(rank_statuses, local_status, group=tp_group.cpu_group)
+
+        rank_keys = [status[0] for status in rank_statuses if status is not None]
+        if any(rank_key != key for rank_key in rank_keys):
+            raise RuntimeError(f"LTX2 audio CUDA Graph keys differ across TP ranks: {rank_keys}")
+
+        failures = [f"rank {rank}: {status[1]}" for rank, status in enumerate(rank_statuses) if status and status[1]]
+        if failures:
+            if capture_error is not None:
+                raise capture_error
+            raise RuntimeError("LTX2 audio CUDA Graph capture failed on " + "; ".join(failures))
 
     def _copy_and_replay(
         self,
@@ -609,11 +598,20 @@ class LTX2AudioCUDAGraphRunner:
                 hidden_batch_repeats=audio_hidden_states_repeats,
             )
 
+        captured: tuple[LTX2AudioGraphEntry, torch.Tensor] | None = None
+        capture_error: Exception | None = None
         try:
-            entry, initial_output = self._capture(
+            captured = self._capture(
                 **inputs,
                 hidden_batch_repeats=audio_hidden_states_repeats,
             )
+        except Exception as exc:
+            capture_error = exc
+
+        try:
+            self._synchronize_capture_result(key, capture_error)
+            assert captured is not None
+            entry, initial_output = captured
             entry.request_generation = self._active_request_generation
             self._stats["captures"] += 1
             self._cache[key] = entry
@@ -627,6 +625,7 @@ class LTX2AudioCUDAGraphRunner:
             # replay, so use the warmup result to avoid that redundant replay.
             return initial_output
         except Exception:
+            captured = None
             self._stats["capture_failures"] += 1
             self._failed_keys[key] = None
             self._failed_keys.move_to_end(key)
@@ -649,7 +648,6 @@ class LTX2AudioCUDAGraphRunner:
             torch.accelerator.synchronize(self.device)
         self._cache.clear()
         self._failed_keys.clear()
-        self._pool = None
         for name in self._stats:
             self._stats[name] = 0
         self.last_call_info = {}

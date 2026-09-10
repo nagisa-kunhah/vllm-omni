@@ -232,12 +232,6 @@ class LTX2AudioTransformerModel(nn.Module):
     _repeated_blocks = ["LTX2AudioTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
-    stacked_params_mapping = (
-        (".audio_attn1.to_qkv", ".audio_attn1.to_q", "q"),
-        (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
-        (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
-    )
-    packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
 
     @staticmethod
     def _build_sp_plan(rope_type: str) -> dict[str, Any]:
@@ -524,24 +518,13 @@ class LTX2AudioTransformerModel(nn.Module):
             return weight
 
         for name, weight in weights:
-            for packed_name, source_name, shard_id in self.stacked_params_mapping:
-                if source_name not in name:
-                    continue
-                target = name.replace(source_name, packed_name)
-                if target not in params:
-                    continue
-                param = params[target]
-                param.weight_loader(param, weight, shard_id)
-                loaded.add(target)
-                break
+            if name not in params:
+                continue
+            param = params[name]
+            loader = getattr(param, "weight_loader", None)
+            if loader is not None:
+                loader(param, weight)
             else:
-                if name not in params:
-                    continue
-                param = params[name]
-                loader = getattr(param, "weight_loader", None)
-                if loader is not None:
-                    loader(param, weight)
-                else:
-                    default_weight_loader(param, maybe_shard(weight, param))
-                loaded.add(name)
+                default_weight_loader(param, maybe_shard(weight, param))
+            loaded.add(name)
         return loaded

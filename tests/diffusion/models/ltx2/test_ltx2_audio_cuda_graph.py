@@ -10,8 +10,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import vllm.distributed.parallel_state as vllm_parallel_state
 from torch import nn
 
+import vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph as cuda_graph_module
+from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     LTX2AudioCUDAGraphConfig,
     LTX2AudioCUDAGraphRunner,
@@ -81,8 +84,6 @@ def test_graph_key_uses_structure_not_values():
     first = _cpu_inputs(mask=True, perturb=True)
     second = _cpu_inputs(mask=True, perturb=True)
     assert _key(first) == _key(second)
-    assert _key(first).audio_token_count == 3
-    assert _key(first).context_token_count == 2
 
 
 @pytest.mark.parametrize(
@@ -165,11 +166,155 @@ def test_incompatible_inputs_expand_hidden_batch_for_eager_fallback():
     assert runner.last_call_info["reason"] == "incompatible_inputs"
 
 
-def test_tp_capture_scope_uses_dedicated_stream(monkeypatch):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_capture_uses_distributed_context_and_global_pool(monkeypatch, tp_size):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    inputs = _cpu_inputs()
+    capture_inputs = {
+        "hidden_states": inputs["audio_hidden_states"],
+        "context": inputs["audio_encoder_hidden_states"],
+        "timestep": inputs["audio_timestep"],
+        "sigma": inputs["audio_sigma"],
+        "coords": inputs["audio_coords"],
+        "rotary_cos": None,
+        "rotary_sin": None,
+        "attention_mask": None,
+        "perturbation_mask": None,
+        "stg_blocks": None,
+    }
+    events = []
+    outputs = [inputs["audio_hidden_states"] + 1, inputs["audio_hidden_states"] + 2]
+    pool = object()
+    graph = object()
+    capture_stream = object()
+    created_streams = []
+
+    class CaptureGroup:
+        def __init__(self, name, world_size):
+            self.name = name
+            self.world_size = world_size
+
+        @contextmanager
+        def graph_capture(self, context):
+            events.append((f"{self.name}_enter", self.world_size, context.stream))
+            try:
+                yield context
+            finally:
+                events.append((f"{self.name}_exit", self.world_size, context.stream))
+
+    @contextmanager
+    def cuda_capture(actual_graph, *, pool, capture_error_mode):
+        events.append(("cuda_enter", actual_graph, pool, capture_error_mode))
+        try:
+            yield
+        finally:
+            events.append(("cuda_exit", actual_graph))
+
+    def call_transformer(**_kwargs):
+        events.append(("forward", len(outputs)))
+        return outputs.pop(0)
+
+    def make_stream(*, device):
+        created_streams.append(device)
+        return capture_stream
+
+    monkeypatch.setattr(vllm_parallel_state, "get_tp_group", lambda: CaptureGroup("tp", tp_size))
+    monkeypatch.setattr(vllm_parallel_state, "get_pp_group", lambda: CaptureGroup("pp", 1))
+    monkeypatch.setattr(cuda_graph_module, "graph_capture", vllm_parallel_state.graph_capture)
+    monkeypatch.setattr(cuda_graph_module.current_platform, "get_global_graph_pool", lambda: pool)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(torch.cuda, "graph", cuda_capture)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda *_args, **_kwargs: pytest.fail("warmup must not add a device-wide synchronization"),
+    )
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph_pool_handle",
+        lambda: pytest.fail("LTX2 must use the platform-global graph pool"),
+    )
+    monkeypatch.setattr(runner, "_call_transformer", call_transformer)
+
+    entry, initial_output = runner._capture(**capture_inputs)
+
+    assert initial_output is not entry.static_output
+    torch.testing.assert_close(initial_output, inputs["audio_hidden_states"] + 1)
+    torch.testing.assert_close(entry.static_output, inputs["audio_hidden_states"] + 2)
+    assert created_streams == [torch.device("cuda")]
+    assert events == [
+        ("tp_enter", tp_size, capture_stream),
+        ("pp_enter", 1, capture_stream),
+        ("forward", 2),
+        ("cuda_enter", graph, pool, "thread_local"),
+        ("forward", 1),
+        ("cuda_exit", graph),
+        ("pp_exit", 1, capture_stream),
+        ("tp_exit", tp_size, capture_stream),
+    ]
+
+
+def test_capture_context_exits_when_capture_raises(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    inputs = _cpu_inputs()
+    events = []
+
+    @contextmanager
+    def distributed_capture(*, device):
+        events.append("distributed_enter")
+        try:
+            yield SimpleNamespace(stream=object())
+        finally:
+            events.append("distributed_exit")
+
+    @contextmanager
+    def cuda_capture(*_args, **_kwargs):
+        events.append("cuda_enter")
+        try:
+            yield
+        finally:
+            events.append("cuda_exit")
+
+    calls = 0
+
+    def call_transformer(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("capture failed")
+        return inputs["audio_hidden_states"]
+
+    monkeypatch.setattr(cuda_graph_module, "graph_capture", distributed_capture)
+    monkeypatch.setattr(cuda_graph_module.current_platform, "get_global_graph_pool", object)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(torch.cuda, "graph", cuda_capture)
+    monkeypatch.setattr(runner, "_call_transformer", call_transformer)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        runner._capture(
+            hidden_states=inputs["audio_hidden_states"],
+            context=inputs["audio_encoder_hidden_states"],
+            timestep=inputs["audio_timestep"],
+            sigma=inputs["audio_sigma"],
+            coords=inputs["audio_coords"],
+            rotary_cos=None,
+            rotary_sin=None,
+            attention_mask=None,
+            perturbation_mask=None,
+            stg_blocks=None,
+        )
+
+    assert events == ["distributed_enter", "cuda_enter", "cuda_exit", "distributed_exit"]
+
+
+def test_diffusion_group_capture_hook_uses_shared_context_stream(monkeypatch):
+    coordinator = object.__new__(GroupCoordinator)
+    coordinator.device = torch.device("cuda")
     current_stream = object()
     capture_stream = SimpleNamespace(wait_stream_calls=[])
     capture_stream.wait_stream = capture_stream.wait_stream_calls.append
+    context = SimpleNamespace(stream=capture_stream)
     entered_streams = []
 
     @contextmanager
@@ -177,34 +322,19 @@ def test_tp_capture_scope_uses_dedicated_stream(monkeypatch):
         entered_streams.append(stream)
         yield
 
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.get_tensor_model_parallel_world_size",
-        lambda: 2,
-    )
-    monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: capture_stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: current_stream)
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
-
-    with runner._tensor_parallel_capture_scope():
-        assert entered_streams == [capture_stream]
-
-    assert capture_stream.wait_stream_calls == [current_stream]
-
-
-def test_tp1_capture_scope_does_not_create_stream(monkeypatch):
-    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
     monkeypatch.setattr(
         torch.cuda,
         "Stream",
-        lambda **_kwargs: pytest.fail("TP1 must not create a dedicated capture stream"),
+        lambda **_kwargs: pytest.fail("the shared graph capture context already owns the stream"),
     )
 
-    with runner._tensor_parallel_capture_scope():
-        pass
+    with coordinator.graph_capture(context) as returned_context:
+        assert returned_context is context
+
+    assert entered_streams == [capture_stream]
+    assert capture_stream.wait_stream_calls == [current_stream]
 
 
 def test_mock_cache_hit_lru_and_eviction(monkeypatch):
@@ -370,13 +500,63 @@ def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     assert stats["failed_key_count"] == 1
 
 
+def test_peer_capture_failure_prevents_local_cache_insertion(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    inputs = _cpu_inputs()
+    key = _key(inputs)
+    tp_group = SimpleNamespace(world_size=2, cpu_group=object())
+
+    monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        runner,
+        "_capture",
+        lambda **_kwargs: (SimpleNamespace(request_generation=None), inputs["audio_hidden_states"] + 2),
+    )
+    monkeypatch.setattr(cuda_graph_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(cuda_graph_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(cuda_graph_module, "get_tp_group", lambda: tp_group)
+
+    def gather(statuses, local_status, *, group):
+        assert group is tp_group.cpu_group
+        statuses[:] = [local_status, (key, "RuntimeError: peer capture failed")]
+
+    monkeypatch.setattr(cuda_graph_module.dist, "all_gather_object", gather)
+
+    output = runner(**inputs)
+
+    torch.testing.assert_close(output, inputs["audio_hidden_states"] + 1)
+    assert runner.last_call_info["reason"] == "capture_failure"
+    assert runner.stats_snapshot()["cache_size"] == 0
+    assert runner.stats_snapshot()["failed_key_count"] == 1
+
+
+def test_capture_result_rejects_different_tp_graph_keys(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    key = _key(_cpu_inputs(tokens=3))
+    peer_key = _key(_cpu_inputs(tokens=4))
+    tp_group = SimpleNamespace(world_size=2, cpu_group=object())
+
+    monkeypatch.setattr(cuda_graph_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(cuda_graph_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(cuda_graph_module, "get_tp_group", lambda: tp_group)
+
+    def gather(statuses, local_status, *, group):
+        assert group is tp_group.cpu_group
+        statuses[:] = [local_status, (peer_key, None)]
+
+    monkeypatch.setattr(cuda_graph_module.dist, "all_gather_object", gather)
+
+    with pytest.raises(RuntimeError, match="keys differ across TP ranks"):
+        runner._synchronize_capture_result(key, None)
+
+
 def test_clear_resets_lifecycle(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu")
-    runner._pool = object()
     runner._stats["calls"] = 2
     runner._failed_keys[_key(_cpu_inputs())] = None
     runner.clear()
-    assert runner._pool is None
+    assert not hasattr(runner, "_pool")
     assert runner.stats_snapshot()["calls"] == 0
     assert runner.stats_snapshot()["failed_key_count"] == 0
     assert runner.last_request_stats == {}
@@ -576,7 +756,7 @@ def test_cuda_graph_expands_cfg_hidden_batch_inside_static_buffer():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_private_pool_supports_two_serial_signatures():
+def test_cuda_global_pool_supports_two_serial_signatures():
     transformer = _TinyAudioTransformer().eval()
     runner = LTX2AudioCUDAGraphRunner(transformer, max_graphs=2)
     short = _cuda_inputs(tokens=3, value=1, mask=False, perturb=False)

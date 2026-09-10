@@ -97,6 +97,11 @@ def test_ltx_audio_transformer_declares_single_stream_cache_dit_pattern():
     assert config.check_forward_pattern is False
 
 
+def test_ltx_audio_transformer_does_not_advertise_packed_qkv():
+    assert not hasattr(LTX2AudioTransformerModel, "stacked_params_mapping")
+    assert not hasattr(LTX2AudioTransformerModel, "packed_modules_mapping")
+
+
 def test_ltx_audio_graph_compile_keeps_standard_norms_in_graph_idempotently():
     def rms_norm():
         return nn.RMSNorm(8, eps=1e-6, elementwise_affine=True)

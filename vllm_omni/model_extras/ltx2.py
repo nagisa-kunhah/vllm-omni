@@ -38,7 +38,6 @@ LTX_T2A_EXTRA_BODY_PARAMS = frozenset(
         "audio_cfg_guidance_scale",
         "audio_stg_scale",
         "audio_stg_guidance_scale",
-        "audio_modality_scale",
         "audio_rescale_scale",
         "audio_stg_blocks",
         "sigmas",
