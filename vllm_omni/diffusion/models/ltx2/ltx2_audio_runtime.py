@@ -56,7 +56,7 @@ from .ltx2_components import (
     resolve_ltx_component_profile,
 )
 from .ltx2_conditioning import LTXTextConditioningMixin
-from .ltx2_denoise import _official_ltx_sigmas
+from .ltx2_denoise import _official_ltx_sigmas, _set_scheduler_sigmas
 from .ltx2_guidance import (
     LTX_GUIDANCE_EXECUTOR,
     LTXGuidancePlan,
@@ -105,7 +105,11 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
             fall_back_to_pt=True,
             weight_name_patterns=(
                 "audio_*",
-                "transformer_blocks.*.audio_*",
+                "transformer_blocks.*.audio_attn1.*",
+                "transformer_blocks.*.audio_attn2.*",
+                "transformer_blocks.*.audio_ff.*",
+                "transformer_blocks.*.audio_prompt_scale_shift_table",
+                "transformer_blocks.*.audio_scale_shift_table",
             ),
         )
     ]
@@ -492,15 +496,6 @@ class LTXAudioRuntime(
         )
         return audio_latents, original_frames, padded_frames, latent_mel_bins
 
-    @staticmethod
-    def _set_audio_sigmas(scheduler, sigmas: torch.Tensor) -> torch.Tensor:
-        scheduler.sigmas = sigmas.to(torch.float32)
-        scheduler.timesteps = scheduler.sigmas[:-1] * scheduler.config.get("num_train_timesteps", 1000)
-        scheduler.num_inference_steps = len(scheduler.timesteps)
-        scheduler._step_index = None
-        scheduler._begin_index = None
-        return scheduler.timesteps
-
     def _run_audio_denoise(
         self,
         audio_latents: torch.Tensor,
@@ -523,7 +518,7 @@ class LTXAudioRuntime(
                 host_sigmas = torch.cat([host_sigmas, host_sigmas.new_zeros(1)])
             sigma_scalars = tuple(host_sigmas.tolist())
             sigmas = host_sigmas.to(self.device)
-        timesteps = self._set_audio_sigmas(audio_scheduler, sigmas)
+        timesteps = _set_scheduler_sigmas(audio_scheduler, sigmas)
         plan = self._guidance_plan
         audio_coords = self.transformer.audio_rope.prepare_audio_coords(
             audio_latents.shape[0],

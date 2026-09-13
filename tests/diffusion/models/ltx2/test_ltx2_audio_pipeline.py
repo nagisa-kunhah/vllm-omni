@@ -3,6 +3,7 @@
 
 """Unit tests for the unified LTX text-to-audio pipeline."""
 
+import fnmatch
 import json
 import math
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidancePlan, LTXGu
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_T2A_RECIPE,
     LTX23_T2A_RECIPE,
+    LTX25_DEFAULT_NEGATIVE_PROMPT,
     LTX25_T2A_RECIPE,
     resolve_ltx_pipeline_recipe,
 )
@@ -54,6 +56,11 @@ def test_ltx_t2a_uses_one_pipeline_with_version_specific_full_profiles(version, 
     assert not recipe.supports_cache_dit
     assert recipe.request_guidance.audio.modality_scale == 1.0
     assert LTXGuidancePlan.build(recipe.request_guidance).names == ("cond", "uncond", "ptb")
+
+
+def test_ltx2_and_ltx23_t2a_defaults_match_official_negative_prompt():
+    assert LTX2_T2A_RECIPE.negative_prompt == LTX25_DEFAULT_NEGATIVE_PROMPT
+    assert LTX23_T2A_RECIPE.negative_prompt == LTX25_DEFAULT_NEGATIVE_PROMPT
 
 
 def test_ltx_t2a_public_contract_is_audio_only():
@@ -549,7 +556,16 @@ def test_ltx_t2a_weight_source_filters_video_tensors_before_materialization(tmp_
 
     assert captured["weight_name_patterns"] == (
         "audio_*",
-        "transformer_blocks.*.audio_*",
+        "transformer_blocks.*.audio_attn1.*",
+        "transformer_blocks.*.audio_attn2.*",
+        "transformer_blocks.*.audio_ff.*",
+        "transformer_blocks.*.audio_prompt_scale_shift_table",
+        "transformer_blocks.*.audio_scale_shift_table",
+    )
+    patterns = captured["weight_name_patterns"]
+    assert any(fnmatch.fnmatchcase("transformer_blocks.0.audio_attn1.to_q.weight", pattern) for pattern in patterns)
+    assert not any(
+        fnmatch.fnmatchcase("transformer_blocks.0.audio_to_video_attn.to_q.weight", pattern) for pattern in patterns
     )
 
 

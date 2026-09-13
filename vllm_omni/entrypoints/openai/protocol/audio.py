@@ -404,21 +404,9 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         le=1000,
         description="Number of inference steps",
     )
-    audio_cfg_scale: float | None = Field(
+    extra_params: dict[str, Any] | None = Field(
         default=None,
-        description="LTX audio classifier-free guidance scale",
-    )
-    audio_stg_scale: float | None = Field(
-        default=None,
-        description="LTX audio spatio-temporal guidance scale",
-    )
-    audio_rescale_scale: float | None = Field(
-        default=None,
-        description="LTX audio guidance rescale scale",
-    )
-    sigmas: list[float] | None = Field(
-        default=None,
-        description="Custom LTX denoising sigma schedule",
+        description="Optional model-specific generation parameters",
     )
     seed: int | None = Field(
         default=None,
