@@ -65,6 +65,24 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert LTX2TextToAudioPipeline.dummy_run_num_frames == 9
 
 
+def test_ltx_t2a_setup_compile_prepares_norms_before_regional_compile(monkeypatch):
+    calls = []
+    transformer = SimpleNamespace(prepare_regional_compile=lambda: calls.append("prepare"))
+    pipe = object.__new__(LTX2TextToAudioPipeline)
+    object.__setattr__(pipe, "transformer", transformer)
+    object.__setattr__(pipe, "od_config", SimpleNamespace(diffusion_compile_dynamic=True))
+
+    def fake_compile(model, **kwargs):
+        calls.append((model, kwargs))
+        return "compiled"
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.ltx2.pipeline_ltx2_audio.regionally_compile", fake_compile)
+    pipe.setup_compile()
+
+    assert calls == ["prepare", (transformer, {"dynamic": True, "options": {"emulate_precision_casts": True}})]
+    assert pipe.transformer == "compiled"
+
+
 @pytest.mark.parametrize(
     "parallel_config",
     [
@@ -392,7 +410,11 @@ def test_ltx_t2a_foundation_rejects_distributed_execution(tp_size, sp_size):
         ),
     )
 
-    with pytest.raises(ValueError, match="requires tensor_parallel_size=1"):
+    with pytest.raises(
+        ValueError,
+        match=r"currently supports only tensor_parallel_size=1 and sequence_parallel_size=1; "
+        r"TP/SP execution is not supported for audio-only T2A",
+    ):
         LTX2TextToAudioPipeline(od_config=od_config)
 
 
