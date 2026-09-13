@@ -3,13 +3,14 @@
 
 """Unit tests for the independent LTX audio-only Transformer."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer, ltx2_transformer
+from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioStaticConditioning,
     LTX2AudioTransformerBlock,
@@ -20,17 +21,27 @@ from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransforme
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-@pytest.fixture(autouse=True)
-def _single_rank_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provide the TP metadata required by vLLM parallel linear layers."""
-    from vllm.model_executor import parameter
-    from vllm.model_executor.layers import linear
+@pytest.fixture(scope="module", autouse=True)
+def _init_tensor_parallel() -> None:
+    """Initialize and tear down the real single-rank vLLM TP group once."""
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
 
-    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(ltx2_transformer, "get_tensor_model_parallel_world_size", lambda: 1)
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29513")
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method="env://",
+        backend="gloo",
+    )
+    initialize_model_parallel(backend="gloo")
+    yield
+    cleanup_dist_env_and_memory()
 
 
 @pytest.mark.parametrize("audio_cross_attn_mod", [False, True])
