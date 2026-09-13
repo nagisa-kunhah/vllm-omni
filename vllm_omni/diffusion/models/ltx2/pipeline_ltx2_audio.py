@@ -5,6 +5,8 @@
 
 from typing import ClassVar
 
+from vllm_omni.diffusion.compile import regionally_compile
+
 from .ltx2_audio_runtime import LTXAudioRuntime
 from .ltx2_components import LTX2_T2A_COMPONENT_PROFILE
 from .ltx2_components import (
@@ -23,3 +25,12 @@ class LTX2TextToAudioPipeline(LTXAudioRuntime):
     _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
     _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
     _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
+
+    def setup_compile(self) -> None:
+        """Compile audio blocks without changing iterative BF16 numerics."""
+        self.transformer.prepare_regional_compile()
+        self.transformer = regionally_compile(
+            self.transformer,
+            dynamic=self.od_config.diffusion_compile_dynamic,
+            options={"emulate_precision_casts": True},
+        )
