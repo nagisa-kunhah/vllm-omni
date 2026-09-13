@@ -155,10 +155,12 @@ LTX25_FULL_RECIPE = LTXPipelineRecipe(
     ),
 )
 LTX2_T2A_RECIPE = LTXPipelineRecipe(
+    negative_prompt=LTX25_DEFAULT_NEGATIVE_PROMPT,
     phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(29)),),
 )
 LTX23_T2A_RECIPE = LTXPipelineRecipe(
     num_inference_steps=30,
+    negative_prompt=LTX25_DEFAULT_NEGATIVE_PROMPT,
     phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(28)),),
 )
 LTX25_T2A_RECIPE = LTXPipelineRecipe(

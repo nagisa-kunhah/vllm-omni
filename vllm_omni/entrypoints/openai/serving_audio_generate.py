@@ -17,6 +17,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateAudioGenerateRequest,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras.registry import get_extra_body_params
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -104,10 +105,17 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 )
             if request.num_frames is not None:
                 audio_extra_args["num_frames"] = request.num_frames
-            for name in ("audio_cfg_scale", "audio_stg_scale", "audio_rescale_scale", "sigmas"):
-                value = getattr(request, name)
-                if value is not None:
-                    audio_extra_args[name] = value
+            if request.extra_params:
+                conflicts = request.extra_params.keys() & audio_extra_args.keys()
+                if conflicts:
+                    names = ", ".join(sorted(conflicts))
+                    raise ValueError(f"Audio parameters were provided more than once: {names}")
+                registered = get_extra_body_params(self.engine_client.model_type)
+                unsupported = request.extra_params.keys() - registered
+                if unsupported:
+                    names = ", ".join(sorted(unsupported))
+                    raise ValueError(f"Unsupported model-specific audio parameters: {names}")
+                audio_extra_args.update(request.extra_params)
             sampling_params_list[0].extra_args = audio_extra_args
             if request.frame_rate is not None:
                 sampling_params_list[0].frame_rate = request.frame_rate

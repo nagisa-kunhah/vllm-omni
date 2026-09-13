@@ -205,20 +205,26 @@ class TestRequestValidation:
         assert req.num_frames == 121
         assert req.frame_rate == 24.0
 
-    def test_ltx_audio_tuning_fields_are_accepted(self):
+    def test_model_specific_audio_parameters_are_accepted(self):
         sigmas = [1.0, 0.5, 0.0]
         req = OpenAICreateAudioGenerateRequest(
             input="test",
-            audio_cfg_scale=7.0,
-            audio_stg_scale=0.0,
-            audio_rescale_scale=0.0,
-            sigmas=sigmas,
+            extra_params={
+                "audio_cfg_scale": 7.0,
+                "audio_stg_scale": 0.0,
+                "audio_rescale_scale": 0.0,
+                "audio_stg_blocks": [28],
+                "sigmas": sigmas,
+            },
         )
 
-        assert req.audio_cfg_scale == 7.0
-        assert req.audio_stg_scale == 0.0
-        assert req.audio_rescale_scale == 0.0
-        assert req.sigmas == sigmas
+        assert req.extra_params == {
+            "audio_cfg_scale": 7.0,
+            "audio_stg_scale": 0.0,
+            "audio_rescale_scale": 0.0,
+            "audio_stg_blocks": [28],
+            "sigmas": sigmas,
+        }
 
 
 # Constructor & Class Methods
@@ -357,16 +363,20 @@ class TestParameterWiring:
         assert sp.frame_rate == 24.0
 
     @pytest.mark.asyncio
-    async def test_ltx_audio_tuning_fields_are_forwarded(self, server_and_engine):
+    async def test_model_specific_audio_parameters_are_forwarded(self, server_and_engine):
         server, engine = server_and_engine
+        engine.model_type = "LTX2TextToAudioPipeline"
         sigmas = [1.0, 0.5, 0.0]
         req = OpenAICreateAudioGenerateRequest(
             input="test",
             num_frames=121,
-            audio_cfg_scale=7.0,
-            audio_stg_scale=0.0,
-            audio_rescale_scale=0.0,
-            sigmas=sigmas,
+            extra_params={
+                "audio_cfg_scale": 7.0,
+                "audio_stg_scale": 0.0,
+                "audio_rescale_scale": 0.0,
+                "audio_stg_blocks": [28],
+                "sigmas": sigmas,
+            },
         )
 
         await server.create_audio_generate(req)
@@ -377,8 +387,27 @@ class TestParameterWiring:
             "audio_cfg_scale": 7.0,
             "audio_stg_scale": 0.0,
             "audio_rescale_scale": 0.0,
+            "audio_stg_blocks": [28],
             "sigmas": sigmas,
         }
+
+    @pytest.mark.asyncio
+    async def test_unregistered_model_specific_parameter_is_rejected(self, server_and_engine):
+        server, _engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", extra_params={"unknown": 1})
+
+        response = await server.create_audio_generate(req)
+
+        assert "Unsupported model-specific audio parameters: unknown" in response.error.message
+
+    @pytest.mark.asyncio
+    async def test_duplicate_common_and_model_specific_parameter_is_rejected(self, server_and_engine):
+        server, _engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, extra_params={"num_frames": 97})
+
+        response = await server.create_audio_generate(req)
+
+        assert "Audio parameters were provided more than once: num_frames" in response.error.message
 
     @pytest.mark.asyncio
     async def test_audio_length_and_num_frames_are_both_forwarded(self, server_and_engine):
