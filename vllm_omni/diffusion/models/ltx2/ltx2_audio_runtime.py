@@ -86,6 +86,13 @@ _LTX_AUDIO_COMPONENT_SUBFOLDERS = (
 )
 
 
+def _drop_unused_video_connectors(connectors: LTX2TextConnectors) -> None:
+    """Remove per-modality video connectors from the audio-only runtime."""
+    if connectors.config.per_modality_projections:
+        connectors.video_text_proj_in = None
+        connectors.video_connector = None
+
+
 def initialize_audio_pipeline_components(pipeline, od_config) -> None:
     """Build an LTX graph containing no video Transformer or video VAE."""
     profile = pipeline.component_profile
@@ -153,7 +160,7 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
         revision=revision,
     )
     if profile.text_encoder_cls is None:
-        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
             profile.text_encoder_cls,
@@ -162,6 +169,7 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
             local_files_only=local_files_only,
             dtype=dtype,
             revision=revision,
+            prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
         )
     pipeline.connectors = _load_component(
         LTX2TextConnectors,
@@ -170,7 +178,9 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
         local_files_only=local_files_only,
         dtype=dtype,
         revision=revision,
+        prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
     )
+    _drop_unused_video_connectors(pipeline.connectors)
     _install_connector_attention(
         pipeline.connectors,
         preserve_learned_register_mask=profile.preserve_connector_attention_mask,
@@ -182,6 +192,7 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
         local_files_only=local_files_only,
         dtype=dtype,
         revision=revision,
+        prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
     )
     try:
         pipeline.vocoder = _load_component(
@@ -191,6 +202,7 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
             local_files_only=local_files_only,
             dtype=dtype,
             revision=revision,
+            prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
         )
     except (TypeError, OSError, ValueError):
         if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
@@ -202,6 +214,7 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
             local_files_only=local_files_only,
             dtype=dtype,
             revision=revision,
+            prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
         )
 
     transformer_config = load_transformer_config(
@@ -251,7 +264,6 @@ class LTXAudioRuntime(
     # smallest valid startup warmup shape.
     dummy_run_num_frames: ClassVar[int] = 9
     connector_batches_cfg = False
-    preserve_sp_padded_audio_duration = True
     _default_audio_resource_limits: ClassVar[LTX2AudioResourceLimits] = LTX2AudioResourceLimits()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -452,7 +464,7 @@ class LTXAudioRuntime(
         generator,
         latents,
     ):
-        return latent_ops.prepare_audio_latents(
+        audio_latents, num_frames, padded_num_frames = latent_ops.prepare_audio_latents(
             self,
             batch_size,
             num_channels_latents,
@@ -464,6 +476,9 @@ class LTXAudioRuntime(
             generator,
             latents,
         )
+        if padded_num_frames != num_frames:
+            raise RuntimeError("LTX audio padding requires sequence-parallel execution, which T2A does not support.")
+        return audio_latents, num_frames
 
     def _prepare_audio_state(self, inputs, prompt_context):
         limits = getattr(self, "_audio_resource_limits", self._default_audio_resource_limits)
@@ -483,7 +498,7 @@ class LTXAudioRuntime(
         limits.validate_latent_frames(requested_frames)
         num_mel_bins = self.audio_vae.config.mel_bins
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
-        audio_latents, original_frames, padded_frames = self.prepare_audio_latents(
+        audio_latents, audio_num_frames = self.prepare_audio_latents(
             prompt_context.batch_size * inputs.num_videos_per_prompt,
             self.audio_vae.config.latent_channels,
             requested_frames,
@@ -494,7 +509,7 @@ class LTXAudioRuntime(
             generator=inputs.generator,
             latents=inputs.audio_latents,
         )
-        return audio_latents, original_frames, padded_frames, latent_mel_bins
+        return audio_latents, audio_num_frames, latent_mel_bins
 
     def _run_audio_denoise(
         self,
@@ -502,8 +517,7 @@ class LTXAudioRuntime(
         prompt_context,
         inputs,
         *,
-        original_num_frames: int,
-        padded_num_frames: int,
+        audio_num_frames: int,
         request_sigmas: list[float] | None,
     ) -> torch.Tensor:
         audio_scheduler = copy.deepcopy(self.scheduler)
@@ -522,16 +536,8 @@ class LTXAudioRuntime(
         plan = self._guidance_plan
         audio_coords = self.transformer.audio_rope.prepare_audio_coords(
             audio_latents.shape[0],
-            padded_num_frames,
+            audio_num_frames,
             audio_latents.device,
-        )
-        audio_attention_mask = (
-            torch.arange(padded_num_frames, device=audio_latents.device)
-            .lt(original_num_frames)
-            .unsqueeze(0)
-            .expand(audio_latents.shape[0], -1)
-            if padded_num_frames > original_num_frames
-            else None
         )
         guidance_world_size = get_guidance_parallel_world_size()
         guidance_parallel_ready = self.do_guidance and guidance_world_size > 1
@@ -564,9 +570,6 @@ class LTXAudioRuntime(
             contexts.append(context)
         model_dtype = prompt_context.positive_connector_audio_prompt_embeds.dtype
         encoder_hidden_states = torch.cat(contexts)
-        model_audio_attention_mask = (
-            None if audio_attention_mask is None else _repeat_batch(audio_attention_mask, model_pass_count)
-        )
         model_audio_coords = _repeat_batch(audio_coords, model_pass_count)
         audio_static_conditioning = self.transformer.prepare_static_conditioning(
             encoder_hidden_states,
@@ -595,7 +598,6 @@ class LTXAudioRuntime(
                     audio_timestep=model_timestep,
                     audio_sigma=model_sigma,
                     audio_coords=model_audio_coords,
-                    audio_attention_mask=model_audio_attention_mask,
                     perturbation_mask=perturbation_mask,
                     stg_blocks=stg_blocks,
                     audio_static_conditioning=audio_static_conditioning,
@@ -618,7 +620,7 @@ class LTXAudioRuntime(
                     audio_scheduler.sigmas[index],
                     plan.spec.audio,
                     sigma_scalar=sigma_scalars[index],
-                    rescale_token_count=original_num_frames,
+                    rescale_token_count=audio_num_frames,
                 )
                 audio_latents = euler_step_from_velocity(
                     audio_latents,
@@ -626,7 +628,6 @@ class LTXAudioRuntime(
                     audio_scheduler.sigmas,
                     index,
                 )
-                audio_latents = latent_ops.clear_audio_padding(audio_latents, original_num_frames)
                 progress_bar.update()
         return audio_latents
 
@@ -638,7 +639,6 @@ class LTXAudioRuntime(
         audio_timestep: torch.Tensor,
         audio_sigma: torch.Tensor,
         audio_coords: torch.Tensor,
-        audio_attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
         stg_blocks,
         audio_static_conditioning: LTX2AudioStaticConditioning | None,
@@ -659,7 +659,7 @@ class LTXAudioRuntime(
             audio_timestep=audio_timestep,
             audio_sigma=audio_sigma,
             audio_coords=audio_coords,
-            audio_attention_mask=audio_attention_mask,
+            audio_attention_mask=None,
             attention_kwargs=attention_kwargs,
             **transformer_kwargs,
         )
@@ -679,7 +679,7 @@ class LTXAudioRuntime(
             num_videos_per_prompt=inputs.num_videos_per_prompt,
             max_sequence_length=inputs.max_sequence_length,
         )
-        audio_latents, original_frames, padded_frames, latent_mel_bins = self._prepare_audio_state(
+        audio_latents, audio_num_frames, latent_mel_bins = self._prepare_audio_state(
             inputs,
             prompt_context,
         )
@@ -688,15 +688,13 @@ class LTXAudioRuntime(
             audio_latents,
             prompt_context,
             inputs,
-            original_num_frames=original_frames,
-            padded_num_frames=padded_frames,
+            audio_num_frames=audio_num_frames,
             request_sigmas=request_sigmas,
         )
         if inputs.output_type == "latent":
             return DiffusionOutput(output=audio_latents)
         waveform = self._decode_audio_latents(
             audio_latents,
-            original_num_frames=original_frames,
             latent_mel_bins=latent_mel_bins,
         )
         return DiffusionOutput(output=waveform)
@@ -705,11 +703,9 @@ class LTXAudioRuntime(
         self,
         audio_latents,
         *,
-        original_num_frames: int,
         latent_mel_bins: int,
     ):
         """Undo audio packing/normalization and synthesize the waveform."""
-        audio_latents = latent_ops.unpad_audio_latents(audio_latents, original_num_frames)
         audio_latents = latent_ops.denormalize_audio_latents(
             audio_latents,
             self.audio_vae.latents_mean,

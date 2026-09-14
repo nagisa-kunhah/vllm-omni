@@ -6,7 +6,9 @@ Example script for text-to-audio generation with diffusion audio models.
 
 This script supports:
   * Stable Audio Open (`stabilityai/stable-audio-open-1.0`) — text-to-audio.
-  * LTX-2.5 (`Lightricks/LTX-2.5-Diffusers`) — text-to-audio with
+  * LTX-2 (`Lightricks/LTX-2`), LTX-2.3
+    (`diffusers/LTX-2.3-Diffusers`), and LTX-2.5
+    (`Lightricks/LTX-2.5-Diffusers`) with
     `--model-class-name LTX2TextToAudioPipeline`.
 
 Model-specific generation knobs can be passed via `--extra-body` and are
