@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.models.ltx2 import ltx2_latents
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime import LTXAudioRuntime
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_T2A_COMPONENT_PROFILE,
@@ -21,7 +22,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     get_ltx2_audio_post_process_func,
     resolve_ltx_component_profile,
 )
-from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidancePlan, LTXGuidanceSpec
+from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidancePlan
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_T2A_RECIPE,
     LTX23_T2A_RECIPE,
@@ -329,13 +330,21 @@ def test_ltx_t2a_runtime_rejects_requested_duration_above_limit():
         LTX2AudioResourceLimits().validate_requested_duration(20.11)
 
 
-def test_ltx_t2a_duration_limit_below_minimum_clock_rejects_minimum_shape():
-    with pytest.raises(ValueError, match="max_duration_seconds"):
-        LTX2AudioResourceLimits(max_duration_seconds=0.1).validate_resolved_duration(
-            num_frames=9,
-            frame_rate=24.0,
-            expected_frame_rate=24.0,
-        )
+def test_ltx_t2a_duration_limit_applies_before_grid_alignment():
+    limits = LTX2AudioResourceLimits()
+    num_frames = resolve_ltx_audio_num_frames(
+        audio_length=20.1,
+        num_frames=None,
+        frame_rate=24.0,
+        default_num_frames=121,
+    )
+
+    limits.validate_requested_duration(20.1)
+    assert limits.validate_resolved_duration(
+        num_frames=num_frames,
+        frame_rate=24.0,
+        expected_frame_rate=24.0,
+    ) == pytest.approx(20.375)
 
 
 def test_ltx_t2a_default_resource_limits_accept_twenty_second_boundary():
@@ -356,7 +365,7 @@ def test_ltx_t2a_default_resource_limits_accept_twenty_second_boundary():
     limits.validate_latent_frames(512)
     with pytest.raises(ValueError, match="max_duration_seconds"):
         limits.validate_resolved_duration(
-            num_frames=num_frames + 8,
+            num_frames=num_frames + 16,
             frame_rate=24.0,
             expected_frame_rate=24.0,
         )
@@ -474,9 +483,9 @@ def test_ltx_t2a_decode_uses_only_audio_vae_and_vocoder():
     pipe.audio_vae = AudioVAE()
     pipe.vocoder = lambda mel: mel * 3
     pipe.audio_vae_mel_compression_ratio = 2
-    packed = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
+    packed = torch.arange(16, dtype=torch.float32).reshape(1, 2, 8)
 
-    waveform = pipe._decode_audio_latents(packed, original_num_frames=2, latent_mel_bins=4)
+    waveform = pipe._decode_audio_latents(packed, latent_mel_bins=4)
 
     assert waveform.shape == (1, 2, 2, 4)
     assert not hasattr(pipe, "vae")
@@ -510,7 +519,7 @@ def test_ltx_t2a_decode_runs_bwe_vocoder_in_fp32_and_restores_dtype():
     pipe.vocoder = BWEVocoder()
     packed = torch.arange(16, dtype=torch.bfloat16).reshape(1, 2, 8)
 
-    waveform = pipe._decode_audio_latents(packed, original_num_frames=2, latent_mel_bins=4)
+    waveform = pipe._decode_audio_latents(packed, latent_mel_bins=4)
 
     assert pipe.vocoder.input_dtype == torch.float32
     assert waveform.dtype == torch.bfloat16
@@ -657,103 +666,105 @@ def test_ltx25_t2a_overrides_shared_distilled_scheduler_before_validation(tmp_pa
     assert tokenizer_loaded
 
 
-@pytest.mark.parametrize("request_sigmas", ([1.0, 0.5, 0.0], None))
-def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypatch, request_sigmas):
-    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime, ltx2_guidance
-    from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
+def test_ltx_t2a_component_cache_healing_stays_audio_only(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
 
-    calls = []
-    conditioning_preparations = []
-    perturbation_builds = 0
-    sigma_scalars = []
-    original_build_perturbation_kwargs = ltx2_audio_runtime.build_perturbation_kwargs
-    original_velocity_from_x0 = ltx2_guidance.velocity_from_x0
+    prefetch_lists = []
 
-    def count_perturbation_builds(*args, **kwargs):
-        nonlocal perturbation_builds
-        perturbation_builds += 1
-        return original_build_perturbation_kwargs(*args, **kwargs)
-
-    def track_sigma_scalar(sample, x0, sigma, *, sigma_scalar=None):
-        sigma_scalars.append(sigma_scalar)
-        return original_velocity_from_x0(sample, x0, sigma, sigma_scalar=sigma_scalar)
-
-    class Rope:
-        @staticmethod
-        def prepare_audio_coords(batch_size, num_frames, device):
-            return torch.zeros(batch_size, 1, num_frames, 2, device=device)
-
-    class Transformer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.audio_rope = Rope()
-
-        def forward(self, **kwargs):
-            calls.append(kwargs)
-            return torch.zeros_like(kwargs["audio_hidden_states"])
-
-        def prepare_static_conditioning(self, context, coords, *, hidden_dtype):
-            conditioning = LTX2AudioStaticConditioning(
-                encoder_hidden_states=context,
-                rotary_emb=(
-                    coords.to(hidden_dtype),
-                    coords.to(hidden_dtype),
-                ),
-            )
-            conditioning_preparations.append(conditioning)
-            return conditioning
-
-    class Progress:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def update(self):
+    class Source:
+        def __init__(self, **_kwargs):
             pass
 
+    class Scheduler:
+        config = {"use_dynamic_shifting": True, "shift_terminal": None}
+
+    connector = SimpleNamespace(config=SimpleNamespace(per_modality_projections=False))
+    audio_vae = SimpleNamespace(
+        mel_compression_ratio=4,
+        temporal_compression_ratio=8,
+        config=SimpleNamespace(sample_rate=24000, mel_hop_length=256),
+    )
+
+    def load_component(_cls, _model, subfolder, **kwargs):
+        prefetch_lists.append(kwargs["prefetch_list"])
+        return {
+            "text_encoder": SimpleNamespace(config=SimpleNamespace(max_position_embeddings=1024)),
+            "connectors": connector,
+            "audio_vae": audio_vae,
+            "vocoder": SimpleNamespace(),
+        }[subfolder]
+
+    monkeypatch.setattr(ltx2_audio_runtime.DiffusersPipelineLoader, "ComponentSource", Source)
+    monkeypatch.setattr(ltx2_audio_runtime, "prefetch_subfolders", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ltx2_audio_runtime.FlowMatchEulerDiscreteScheduler,
+        "from_pretrained",
+        lambda *_args, **_kwargs: Scheduler(),
+    )
+    monkeypatch.setattr(
+        ltx2_audio_runtime.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(model_max_length=1024),
+    )
+    monkeypatch.setattr(ltx2_audio_runtime, "_load_component", load_component)
+    monkeypatch.setattr(ltx2_audio_runtime, "_install_connector_attention", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ltx2_audio_runtime, "load_transformer_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        ltx2_audio_runtime,
+        "create_audio_transformer_from_config",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(ltx2_audio_runtime, "_place_aux_components", lambda _pipe: None)
+
+    pipe = SimpleNamespace(
+        component_profile=LTX2_T2A_COMPONENT_PROFILE,
+        pipeline_kind="text_to_audio",
+    )
+    od_config = SimpleNamespace(model=str(tmp_path), revision=None, dtype=torch.float32)
+
+    ltx2_audio_runtime.initialize_audio_pipeline_components(pipe, od_config)
+
+    assert prefetch_lists
+    assert all(value == ltx2_audio_runtime._LTX_AUDIO_COMPONENT_SUBFOLDERS for value in prefetch_lists)
+
+
+def test_ltx_t2a_prepare_latents_rejects_sp_padding(monkeypatch):
     pipe = object.__new__(LTXAudioRuntime)
     torch.nn.Module.__init__(pipe)
-    pipe.device = torch.device("cpu")
-    pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=1))
-    pipe.scheduler = SimpleNamespace(config={"num_train_timesteps": 1000})
-    pipe.transformer = Transformer()
-    pipe._guidance_plan = LTXGuidancePlan.build(LTXGuidanceSpec.positive_only())
-    pipe._interrupt = False
-    pipe.progress_bar = lambda **_kwargs: Progress()
-    monkeypatch.setattr(ltx2_audio_runtime, "get_guidance_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(ltx2_audio_runtime, "build_perturbation_kwargs", count_perturbation_builds)
-    monkeypatch.setattr(ltx2_guidance, "velocity_from_x0", track_sigma_scalar)
-    prompt_context = SimpleNamespace(
-        positive_connector_audio_prompt_embeds=torch.zeros(1, 2, 4),
-        negative_connector_audio_prompt_embeds=None,
-    )
-    inputs = SimpleNamespace(num_inference_steps=2)
-    latents = torch.ones(1, 3, 4)
-
-    result = pipe._run_audio_denoise(
-        latents,
-        prompt_context,
-        inputs,
-        original_num_frames=2,
-        padded_num_frames=3,
-        request_sigmas=request_sigmas,
+    monkeypatch.setattr(
+        ltx2_latents,
+        "prepare_audio_latents",
+        lambda *_args, **_kwargs: (torch.zeros(1, 3, 4), 2, 3),
     )
 
-    assert len(calls) == 2
-    assert len(conditioning_preparations) == 1
-    assert calls[0]["audio_static_conditioning"] is conditioning_preparations[0]
-    assert calls[1]["audio_static_conditioning"] is conditioning_preparations[0]
-    assert perturbation_builds == 1
-    assert len(sigma_scalars) == 2
-    assert all(isinstance(value, float) for value in sigma_scalars)
-    if request_sigmas is not None:
-        assert sigma_scalars == [1.0, 0.5]
-    assert calls[0]["audio_encoder_hidden_states"] is calls[1]["audio_encoder_hidden_states"]
-    assert calls[0]["audio_coords"] is calls[1]["audio_coords"]
-    assert calls[0]["audio_attention_mask"] is calls[1]["audio_attention_mask"]
-    assert not {"hidden_states", "encoder_hidden_states", "video_coords"} & calls[0].keys()
-    torch.testing.assert_close(calls[0]["audio_attention_mask"], torch.tensor([[True, True, False]]))
-    torch.testing.assert_close(result[:, :2], latents[:, :2])
-    torch.testing.assert_close(result[:, 2:], torch.zeros_like(result[:, 2:]))
+    with pytest.raises(RuntimeError, match="requires sequence-parallel execution"):
+        pipe.prepare_audio_latents(
+            1,
+            4,
+            2,
+            8,
+            noise_scale=0.0,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=None,
+            latents=None,
+        )
+
+
+def test_ltx25_t2a_drops_unused_video_connector_modules():
+    from vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime import _drop_unused_video_connectors
+
+    connectors = SimpleNamespace(
+        config=SimpleNamespace(per_modality_projections=True),
+        video_text_proj_in=object(),
+        video_connector=object(),
+        audio_text_proj_in=object(),
+        audio_connector=object(),
+    )
+    audio_modules = (connectors.audio_text_proj_in, connectors.audio_connector)
+
+    _drop_unused_video_connectors(connectors)
+
+    assert connectors.video_text_proj_in is None
+    assert connectors.video_connector is None
+    assert (connectors.audio_text_proj_in, connectors.audio_connector) == audio_modules

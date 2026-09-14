@@ -57,7 +57,7 @@ LTXCheckpointKind = Literal["distilled", "regular"]
 
 @dataclass(frozen=True)
 class LTX2AudioResourceLimits:
-    """Deployment bounds applied before LTX text-to-audio allocations."""
+    """Request bounds, allowing only the required causal-grid round-up."""
 
     max_duration_seconds: float = 20.1
     max_latent_frames: int = 512
@@ -113,15 +113,19 @@ class LTX2AudioResourceLimits:
         if not math.isfinite(duration_s) or duration_s <= 0:
             raise ValueError("LTX text-to-audio resolved duration must be finite and positive.")
 
-        if duration_s > self.max_duration_seconds:
+        max_target_frames = self.max_duration_seconds * frame_rate
+        max_intervals = max(1, math.ceil((max_target_frames - 1) / 8))
+        max_resolved_frames = max_intervals * 8 + 1
+        if num_frames > max_resolved_frames:
             raise ValueError(
-                "LTX text-to-audio resolved duration exceeds the deployment limit: "
-                f"{duration_s:.6g}s ({num_frames} frames) exceeds "
-                f"max_duration_seconds={self.max_duration_seconds:g}."
+                "LTX text-to-audio resolved duration exceeds the request limit after causal-grid alignment: "
+                f"got {num_frames} frames, maximum is {max_resolved_frames} frames "
+                f"for max_duration_seconds={self.max_duration_seconds:g}."
             )
         return duration_s
 
     def validate_requested_duration(self, duration_s: float) -> None:
+        """Validate the user-requested duration before causal-grid alignment."""
         if not math.isfinite(duration_s) or duration_s <= 0:
             raise ValueError("LTX text-to-audio requested duration must be finite and positive.")
         if duration_s > self.max_duration_seconds:
