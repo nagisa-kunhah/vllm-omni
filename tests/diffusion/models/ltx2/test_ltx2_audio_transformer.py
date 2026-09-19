@@ -10,6 +10,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioStaticConditioning,
@@ -17,8 +19,6 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioTransformerModel,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformerBlock
-from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
