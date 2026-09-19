@@ -48,6 +48,7 @@ from .ltx2_components import (
     LTXComponentProfile,
     _install_connector_attention,
     _load_component,
+    _load_ltx_vocoder,
     _place_aux_components,
     create_audio_transformer_from_config,
     detect_ltx_model_version,
@@ -194,28 +195,14 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
         revision=revision,
         prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
     )
-    try:
-        pipeline.vocoder = _load_component(
-            profile.vocoder_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-            prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
-        )
-    except (TypeError, OSError, ValueError):
-        if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
-            raise
-        pipeline.vocoder = _load_component(
-            profile.vocoder_fallback_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-            prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
-        )
+    pipeline.vocoder = _load_ltx_vocoder(
+        profile,
+        model,
+        local_files_only=local_files_only,
+        dtype=dtype,
+        revision=revision,
+        prefetch_list=_LTX_AUDIO_COMPONENT_SUBFOLDERS,
+    )
 
     transformer_config = load_transformer_config(
         model,
