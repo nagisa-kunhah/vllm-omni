@@ -676,7 +676,7 @@ def test_ltx_t2a_component_cache_healing_stays_audio_only(tmp_path, monkeypatch)
             pass
 
     class Scheduler:
-        config = {"use_dynamic_shifting": True, "shift_terminal": None}
+        config = {"use_dynamic_shifting": True, "shift_terminal": 0.1}
 
     connector = SimpleNamespace(config=SimpleNamespace(per_modality_projections=False))
     audio_vae = SimpleNamespace(
