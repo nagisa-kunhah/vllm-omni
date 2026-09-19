@@ -190,6 +190,43 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
     )
 
 
+def test_ltx_vocoder_loader_uses_profile_fallback(monkeypatch):
+    class PrimaryVocoder:
+        pass
+
+    class FallbackVocoder:
+        pass
+
+    profile = replace(
+        LTX25_FULL_COMPONENT_PROFILE,
+        vocoder_cls=PrimaryVocoder,
+        vocoder_fallback_cls=FallbackVocoder,
+    )
+    calls: list[tuple[object, str, str, dict[str, Any]]] = []
+
+    def fake_load_component(component_cls, model, subfolder, **kwargs):
+        calls.append((component_cls, model, subfolder, kwargs))
+        if component_cls is PrimaryVocoder:
+            raise OSError("BWE vocoder config is unavailable")
+        return "fallback-vocoder"
+
+    monkeypatch.setattr(ltx2_components, "_load_component", fake_load_component)
+
+    result = ltx2_components._load_ltx_vocoder(
+        profile,
+        "org/ltx",
+        local_files_only=True,
+        dtype=torch.bfloat16,
+        revision="pinned",
+        prefetch_list=("audio_vae", "vocoder"),
+    )
+
+    assert result == "fallback-vocoder"
+    assert [call[0] for call in calls] == [PrimaryVocoder, FallbackVocoder]
+    assert all(call[1:3] == ("org/ltx", "vocoder") for call in calls)
+    assert all(call[3]["prefetch_list"] == ("audio_vae", "vocoder") for call in calls)
+
+
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
     calls: dict[str, Any] = {"components": []}

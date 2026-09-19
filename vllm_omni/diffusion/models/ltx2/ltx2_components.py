@@ -631,6 +631,31 @@ def _load_component(
     )
 
 
+def _load_ltx_vocoder(
+    profile: LTXComponentProfile,
+    model: str,
+    *,
+    local_files_only: bool,
+    dtype: torch.dtype,
+    revision: str | None,
+    prefetch_list: tuple[str, ...] = _LTX_COMPONENT_SUBFOLDERS,
+) -> Any:
+    """Load the profile's BWE vocoder, with the legacy-vocoder fallback."""
+    component_kwargs = {
+        "local_files_only": local_files_only,
+        "dtype": dtype,
+        "revision": revision,
+        "prefetch_list": prefetch_list,
+    }
+    try:
+        return _load_component(profile.vocoder_cls, model, "vocoder", **component_kwargs)
+    except (TypeError, OSError, ValueError):
+        fallback_cls = profile.vocoder_fallback_cls
+        if fallback_cls is None or fallback_cls is profile.vocoder_cls:
+            raise
+        return _load_component(fallback_cls, model, "vocoder", **component_kwargs)
+
+
 def _load_ltx25_native_diffusion_decoder(
     model: str,
     *,
@@ -764,26 +789,13 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
-    try:
-        pipeline.vocoder = _load_component(
-            profile.vocoder_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
-    except (TypeError, OSError, ValueError):
-        if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
-            raise
-        pipeline.vocoder = _load_component(
-            profile.vocoder_fallback_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
+    pipeline.vocoder = _load_ltx_vocoder(
+        profile,
+        model,
+        local_files_only=local_files_only,
+        dtype=dtype,
+        revision=revision,
+    )
 
     if "latent_upsampler" in profile.resident_modules:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
