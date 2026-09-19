@@ -17,6 +17,8 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioTransformerModel,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformerBlock
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -30,18 +32,26 @@ def _init_tensor_parallel() -> None:
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29513")
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        local_rank=0,
-        distributed_init_method="env://",
-        backend="gloo",
+    cpu_config = OmniDiffusionConfig.from_kwargs(
+        model="ltx2-audio-transformer-unit-test",
+        dtype=torch.float32,
+        diffusion_attention_backend="TORCH_SDPA",
     )
-    initialize_model_parallel(backend="gloo")
-    yield
-    cleanup_dist_env_and_memory()
+    with set_current_diffusion_config(cpu_config):
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29513")
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="env://",
+            backend="gloo",
+        )
+        initialize_model_parallel(backend="gloo")
+        try:
+            yield
+        finally:
+            cleanup_dist_env_and_memory()
 
 
 @pytest.mark.parametrize("audio_cross_attn_mod", [False, True])
