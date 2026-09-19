@@ -97,9 +97,7 @@ def _restore_ltx_bwe_resampler_filter(vocoder: nn.Module) -> None:
     expected_kernel_size = 2 * width * ratio + 1
     if kernel_size != expected_kernel_size:
         return
-    time_axis = (
-        torch.arange(kernel_size, device=current_filter.device, dtype=torch.float32) / ratio - width
-    ) * rolloff
+    time_axis = (torch.arange(kernel_size, device=current_filter.device, dtype=torch.float32) / ratio - width) * rolloff
     time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
     window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
     filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
