@@ -16,7 +16,7 @@ from vllm.config.load import LoadConfig
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -209,7 +209,7 @@ def _run_latent_parity_comparison(
     input_image: Image.Image,
 ) -> dict[str, float]:
     pipeline_cls = _joy_image_edit_pipeline_cls()
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     diffusers_pipe = None
     try:
         diffusers_pipe = pipeline_cls.from_pretrained(
@@ -279,9 +279,9 @@ def _run_latent_parity_comparison(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     vllm_pipe = None
     try:
         from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
@@ -310,7 +310,7 @@ def _run_latent_parity_comparison(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
     return _latent_metrics(vllm_latents, diffusers_latents)
 
@@ -322,7 +322,7 @@ def _run_diffusers_joy_image_edit(
     output_path: Path,
 ) -> Image.Image:
     pipeline_cls = _joy_image_edit_pipeline_cls()
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe = None
     try:
         pipe = pipeline_cls.from_pretrained(
@@ -354,7 +354,7 @@ def _run_diffusers_joy_image_edit(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 @pytest.mark.benchmark

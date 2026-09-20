@@ -55,14 +55,20 @@ def _torch_sdpa_diffusion_config():
     )
 
 
-def _make_joy_attention(*, dtype: torch.dtype = torch.float32) -> JoyImageAttention:
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Keep tiny model tests independent of the platform default backend."""
     with set_current_diffusion_config(_torch_sdpa_diffusion_config()):
-        attention = JoyImageAttention(
-            dim=32,
-            num_attention_heads=4,
-            attention_head_dim=8,
-            prefix="double_blocks.0.attn",
-        )
+        yield
+
+
+def _make_joy_attention(*, dtype: torch.dtype = torch.float32) -> JoyImageAttention:
+    attention = JoyImageAttention(
+        dim=32,
+        num_attention_heads=4,
+        attention_head_dim=8,
+        prefix="double_blocks.0.attn",
+    )
     return attention.to(dtype=dtype)
 
 

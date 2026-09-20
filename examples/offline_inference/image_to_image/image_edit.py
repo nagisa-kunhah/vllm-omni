@@ -537,6 +537,18 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Overall pipeline initialization timeout in seconds.",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Per-stage initialization timeout in seconds.",
+    )
     return parser.parse_args()
 
 
