@@ -912,8 +912,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         nested_image_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
         if self.gen_image_condition_refiner is not None:
             image_embeds = self.gen_image_condition_refiner(cond.image_embeds, ~cond.image_mask.bool())
+            image_mask = torch.ones(
+                image_embeds.shape[:2],
+                dtype=torch.bool,
+                device=image_embeds.device,
+            )
             prompt_embeds = torch.cat([cond.text_embeds, image_embeds], dim=1)
-            prompt_attention_mask = torch.cat([cond.text_mask, cond.image_mask], dim=1)
+            prompt_attention_mask = torch.cat([cond.text_mask, image_mask], dim=1)
             ar_image_embeds = None
             ar_image_attention_mask = None
         elif nested_image_embedder is not None:

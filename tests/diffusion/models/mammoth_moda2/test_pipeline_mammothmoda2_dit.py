@@ -344,6 +344,21 @@ class _FakeTransformer(nn.Module):
         return torch.zeros_like(hidden_states)
 
 
+class _FakeImageRefiner(nn.Module):
+    def __init__(self, num_queries: int) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.num_queries = num_queries
+
+    def forward(self, image_embeds, attention_mask):
+        assert attention_mask.shape == image_embeds.shape[:2]
+        return image_embeds.new_zeros(
+            image_embeds.shape[0],
+            self.num_queries,
+            image_embeds.shape[-1],
+        )
+
+
 @dataclass
 class _FakeVaeConfig:
     scaling_factor: float | None = None
@@ -1083,6 +1098,37 @@ def test_step_protocol_matches_request_mode() -> None:
 
     torch.testing.assert_close(step_output.output, request_output.output)
     assert state.step_index == 2
+
+
+def test_refiner_output_uses_query_length_mask_in_request_and_step_modes() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = _FakeImageRefiner(num_queries=3)
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    batch = _batch(
+        sampling=OmniDiffusionSamplingParams(
+            height=32,
+            width=48,
+            seed=42,
+            guidance_scale=1.0,
+            num_inference_steps=1,
+        )
+    )
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        assert len(pipeline.forward(batch)) == 1
+        state = pipeline.prepare_encode(_step_state(batch))
+
+    assert state.prompt_embeds is not None
+    assert state.prompt_embeds_mask is not None
+    assert state.prompt_embeds.shape[1] == 5
+    assert state.prompt_embeds_mask.shape == state.prompt_embeds.shape[:2]
+    assert state.prompt_embeds_mask.all()
 
 
 def test_step_protocol_keeps_request_schedulers_and_progress_independent() -> None:
