@@ -587,7 +587,7 @@ class TestTeaCacheBackend:
         transformer_arg, config_arg = mock_apply_hook.call_args.args
         assert transformer_arg is mock_pipeline.gen_transformer
         assert config_arg.transformer_type == "MammothModa2Transformer2DModel"
-        assert config_arg.rel_l1_thresh == 0.1
+        assert config_arg.rel_l1_thresh == 0.075
         assert mock_pipeline.transformer is mock_pipeline.gen_transformer
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
