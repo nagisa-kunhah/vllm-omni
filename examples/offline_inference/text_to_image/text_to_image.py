@@ -58,6 +58,7 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+parse_custom_pipeline_args = functools.partial(parse_json_object, flag_name="--custom-pipeline-args")
 
 
 def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -525,6 +526,16 @@ def main():
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
+    elif cache_backend == "tea_cache":
+        # TeaCache configuration
+        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
+        cache_config = {
+            # TeaCache parameters [tea_cache only]
+            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
+            # Note: coefficients will use model-specific defaults based on model_type
+            #       (e.g., QwenImagePipeline or FluxPipeline)
+        }
+
     profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization
