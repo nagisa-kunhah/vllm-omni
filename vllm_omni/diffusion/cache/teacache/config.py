@@ -86,11 +86,11 @@ _MODEL_COEFFICIENTS = {
     # MammothModa2 DiT coefficients fitted from full-compute traces
     # at 1024x1024 with 50 denoising steps.
     "MammothModa2Transformer2DModel": [
-        -972.2069838924724,
-        493.79503932912513,
-        -70.34862994412688,
-        6.022465398842022,
-        -0.05835138201804357,
+        -1761.242764481119,
+        859.398730831851,
+        -126.78044436937441,
+        9.16173963457422,
+        -0.1102826051200547,
     ],
     # MiniMax-H3 FL2VA coefficients.
     "MiniMaxH3DiTModel": [
@@ -104,7 +104,7 @@ _MODEL_COEFFICIENTS = {
 
 _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
-    "MammothModa2Transformer2DModel": 0.1,
+    "MammothModa2Transformer2DModel": 0.075,
     "MiniMaxH3DiTModel": 0.17,
 }
 

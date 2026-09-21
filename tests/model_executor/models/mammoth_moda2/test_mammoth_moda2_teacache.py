@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import extract_mammoth_moda2_context
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as mammoth_pipeline_module
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
@@ -13,6 +14,19 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.cpu]
+
+
+def test_mammoth_moda2_calibrated_teacache_defaults():
+    config = TeaCacheConfig(transformer_type="MammothModa2Transformer2DModel")
+
+    assert config.rel_l1_thresh == 0.075
+    assert config.coefficients == [
+        -1761.242764481119,
+        859.398730831851,
+        -126.78044436937441,
+        9.16173963457422,
+        -0.1102826051200547,
+    ]
 
 
 class _FakeScheduler:
