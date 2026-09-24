@@ -214,10 +214,9 @@ class DuplexSessionManager:
 
         async def run_ordered() -> None:
             if predecessor is not None:
-                try:
-                    await predecessor
-                except BaseException:
-                    pass
+                # A predecessor's failure/cancellation must not poison the queue.
+                # Cancelling this task still cancels the gather and propagates.
+                await asyncio.gather(predecessor, return_exceptions=True)
             await operation()
 
         task = asyncio.create_task(run_ordered(), name=name)
@@ -604,9 +603,12 @@ class DuplexSessionManager:
         The session keeps its admission slot (``_closing``) until stage cleanup
         succeeded; a failed cleanup is retried by the reaper. For an explicit
         close the ``session.closed`` event is emitted only after the cleanup
-        attempt, so a client that sees it can open a replacement session at
-        once (the runner used to emit it before the stage requests were
-        aborted, which let a prompt reopen hit ``resource_exhausted``).
+        attempt, in a ``finally``, including when the cleanup failed (the
+        runner used to emit it before the stage requests were aborted). A
+        client that sees the event can normally open a replacement session
+        right away, but after a failed cleanup the slot is still held until
+        the reaper succeeds, so a prompt reopen can be refused with
+        ``resource_exhausted``.
         """
         session = runner.session
         submitted = tuple(session.resource_request_ids(submitted=True))

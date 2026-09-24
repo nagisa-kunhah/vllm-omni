@@ -56,6 +56,8 @@ EXCLUDED_MODELS = [
     "BooguImageTurboPipeline",
     "LancePipeline",
     "MingImagePipeline",
+    "MingImageDiffusionPipeline",
+    "MingImageLayeredDiffusionPipeline",
     "InternVLAA1Pipeline",
     "StableDiffusion3Pipeline",
     "HunyuanImage3ForCausalMM",
