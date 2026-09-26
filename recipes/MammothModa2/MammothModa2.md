@@ -173,7 +173,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 ```
 
 The bundled TeaCache coefficients were fitted from MammothModa2 full-compute
-traces. MammothModa2 uses the model-specific default `rel_l1_thresh=0.1`,
+traces. MammothModa2 uses the model-specific default `rel_l1_thresh=0.075`,
 selected for the evaluated 1024x1024, 50-step configuration.
 
 The model-specific keys are declared in
