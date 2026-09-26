@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.cache.cachedit import RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import extract_mammoth_moda2_context
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as mammoth_pipeline_module
@@ -71,6 +72,8 @@ def _build_pipeline(monkeypatch):
     pipe.gen_image_condition_refiner = None
     pipe.gen_freqs_cis = []
     pipe._llm_hidden_size = 8
+    pipe._cache_dit_config = None
+    pipe._cache_dit_runtime = RequestScopedCacheDiTRuntime(pipe)
     pipe.config = SimpleNamespace(
         llm_config=SimpleNamespace(gen_vocab_start_index=100),
         image_token_id=900,
