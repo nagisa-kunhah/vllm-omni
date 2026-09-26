@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
@@ -38,6 +39,7 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_zimage_context,
 )
 from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
@@ -45,6 +47,7 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
     Transformer2DModel as MammothModa2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
 from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
 pytestmark = [pytest.mark.core_model]
@@ -235,6 +238,43 @@ class TestMammothModa2Extractor(BaseExtractorTest):
 
         with pytest.raises(ValueError, match="teacache_branch"):
             mammoth_module(**sample_inputs, teacache_branch="bad")
+
+    @pytest.mark.parametrize("change_shape", [False, True], ids=["same_shape", "different_shape"])
+    @torch.no_grad()
+    def test_backend_refresh_clears_both_branches(self, mammoth_module, sample_inputs, monkeypatch, change_shape):
+        pipeline = MammothModa2DiTPipeline.__new__(MammothModa2DiTPipeline)
+        nn.Module.__init__(pipeline)
+        pipeline.gen_transformer = mammoth_module
+        # Zero coefficients guarantee cache hits after each branch's first call.
+        backend = TeaCacheBackend(DiffusionCacheConfig(coefficients=[0, 0, 0, 0, 0]))
+        backend.enable(pipeline)
+        apply_layers = Mock(wraps=mammoth_module._apply_transformer_layers)
+        monkeypatch.setattr(mammoth_module, "_apply_transformer_layers", apply_layers)
+
+        for branch in ("positive", "negative"):
+            mammoth_module(**sample_inputs, teacache_branch=branch)
+            mammoth_module(**sample_inputs, teacache_branch=branch)
+        assert apply_layers.call_count == 2
+
+        next_inputs = dict(sample_inputs)
+        next_inputs["hidden_states"] = torch.randn(1, 4, 4, 6 if change_shape else 4)
+        text_length = 5 if change_shape else 3
+        next_inputs["text_hidden_states"] = torch.randn(1, text_length, 8)
+        next_inputs["text_attention_mask"] = torch.ones(1, text_length, dtype=torch.bool)
+        # Compute an uncached reference through the original model forward.
+        expected = MammothModa2Transformer2DModel.forward(mammoth_module, **next_inputs)
+        apply_layers.reset_mock()
+
+        backend.refresh(pipeline, num_inference_steps=4)
+
+        for count, branch in enumerate(("positive", "negative"), start=1):
+            actual = mammoth_module(**next_inputs, teacache_branch=branch)
+            assert apply_layers.call_count == count
+            torch.testing.assert_close(actual, expected)
+            # Refresh must preserve caching for subsequent steps of request B.
+            cached = mammoth_module(**next_inputs, teacache_branch=branch)
+            assert apply_layers.call_count == count
+            torch.testing.assert_close(cached, expected)
 
     def test_forced_full_compute_matches_original_forward(self, mammoth_module, sample_inputs, monkeypatch):
         with torch.no_grad():
