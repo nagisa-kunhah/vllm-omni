@@ -1052,7 +1052,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             freqs_cis=self.gen_freqs_cis,
         )
         scale = model_pred.new_tensor(guidance_scales).view(batch_size, 1, 1, 1)
-        blended = model_pred_uncond + scale * (model_pred - model_pred_uncond)
+        blended = torch.lerp(model_pred_uncond, model_pred, scale)
         if all(active_cfg):
             return blended
         active_tensor = torch.tensor(
