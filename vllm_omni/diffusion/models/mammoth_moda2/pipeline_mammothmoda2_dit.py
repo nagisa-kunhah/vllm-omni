@@ -494,16 +494,23 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
     def _parse_request(self, req: DiffusionRequestBatch, index: int = 0) -> _MammothRequest:
         request = req.requests[index]
-        request_id = request.request_id
         prompt = request.prompt if isinstance(request.prompt, dict) else {}
-        sampling = request.sampling_params
+        return self._parse_request_inputs(prompt, request.sampling_params, request.request_id, index)
+
+    def _parse_request_inputs(
+        self,
+        prompt: dict,
+        sampling: OmniDiffusionSamplingParams | None,
+        request_id: str,
+        index: int = 0,
+    ) -> _MammothRequest:
         if sampling is not None and getattr(sampling, "num_outputs_per_prompt", 1) != 1:
             raise ValueError(
                 f"MammothModa2 requires num_outputs_per_prompt == 1, got {sampling.num_outputs_per_prompt} "
                 f"for request {request_id}"
             )
         info = prompt.get("additional_information")
-        if request.is_dummy_run():
+        if OmniDiffusionRequest.is_dummy_run_request_id(request_id):
             gen_start = 152064
             if hasattr(self, "config") and hasattr(self.config, "llm_config") and self.config.llm_config is not None:
                 val = getattr(self.config.llm_config, "gen_vocab_start_index", None)
@@ -889,12 +896,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
     def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
         del kwargs
-        request = OmniDiffusionRequest(
-            prompt=state.prompt,
-            sampling_params=state.sampling,
-            request_id=state.request_id,
-        )
-        spec = self._parse_request(DiffusionRequestBatch([request]), 0)
+        prompt = state.prompt if isinstance(state.prompt, dict) else {}
+        spec = self._parse_request_inputs(prompt, state.sampling, state.request_id)
         text_cond, image_cond = self._split_request_conditions(spec)
 
         model_device = next(self.parameters()).device
