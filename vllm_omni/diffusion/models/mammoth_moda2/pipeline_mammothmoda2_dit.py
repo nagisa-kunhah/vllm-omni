@@ -949,24 +949,21 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         vae_scale_factor = 16
         latent_channels = int(self.gen_transformer.config.in_channels)
+        generators = self._make_latent_generators([spec], model_device)
+        generator = generators[0]
+        generator_device = generator.device if hasattr(generator, "device") else model_device
         latent_shape = (
             1,
             latent_channels,
             2 * spec.height // vae_scale_factor,
             2 * spec.width // vae_scale_factor,
         )
-        generators = self._make_latent_generators([spec], model_device)
-        if generators is None:
-            latents = randn_tensor(latent_shape, device=model_device, dtype=target_dtype)
-        else:
-            generator = generators[0]
-            generator_device = generator.device if hasattr(generator, "device") else model_device
-            latents = randn_tensor(
-                latent_shape,
-                generator=generator,
-                device=generator_device,
-                dtype=target_dtype,
-            ).to(device=model_device)
+        latents = randn_tensor(
+            latent_shape,
+            generator=generator,
+            device=generator_device,
+            dtype=target_dtype,
+        ).to(device=model_device)
 
         scheduler = FlowMatchEulerDiscreteScheduler()
         scheduler.set_timesteps(
