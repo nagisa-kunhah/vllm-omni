@@ -1100,6 +1100,54 @@ def test_step_protocol_matches_request_mode() -> None:
     assert state.step_index == 2
 
 
+@pytest.mark.parametrize(
+    ("sampling", "extra_info", "expected_guidance"),
+    [
+        (OmniDiffusionSamplingParams(num_inference_steps=2), {}, 9.0),
+        (OmniDiffusionSamplingParams(num_inference_steps=2), {"text_guidance_scale": [3.5]}, 3.5),
+    ],
+)
+def test_step_protocol_resolves_guidance_like_request_mode(
+    sampling: OmniDiffusionSamplingParams,
+    extra_info: dict,
+    expected_guidance: float,
+) -> None:
+    """Guidance from defaults or additional_information must survive step mode.
+
+    prepare_encode() must parse the already-initialized step state directly
+    instead of re-wrapping its sampling params in a fresh OmniDiffusionRequest,
+    whose __post_init__ promotes the auto-filled 1.0 guidance_scale to an
+    explicitly-provided value and silently disables model-default CFG.
+    """
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    batch = _batch(sampling=sampling)
+    batch.prompts[0]["additional_information"].update(extra_info)
+    assert sampling.guidance_scale_provided is False
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.zeros(shape, dtype=kwargs["dtype"])),
+    ):
+        request_spec = pipeline._parse_request(batch)
+        request_output = pipeline.forward(batch)[0]
+        state = pipeline.prepare_encode(_step_state(batch))
+        while not state.denoise_completed:
+            noise_pred = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
+            pipeline.step_scheduler(state, noise_pred)
+        step_output = pipeline.post_decode(state)
+
+    assert request_spec.text_guidance_scale == expected_guidance
+    assert state.extra["mammoth_text_guidance_scale"] == expected_guidance
+    assert (state.negative_prompt_embeds is not None) == (expected_guidance > 1.0)
+    assert sampling.guidance_scale_provided is False
+    torch.testing.assert_close(step_output.output, request_output.output)
+
+
 def test_refiner_output_uses_query_length_mask_in_request_and_step_modes() -> None:
     pipeline = _pipeline_shell()
     pipeline.gen_transformer = _FakeTransformer()
