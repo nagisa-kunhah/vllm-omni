@@ -937,15 +937,14 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             ar_image_embeds = None
             ar_image_attention_mask = None
 
-        negative_prompt_embeds = None
-        negative_prompt_attention_mask = None
-        if spec.text_guidance_scale > 1.0:
-            negative_prompt_embeds = prompt_embeds.new_zeros((1, 0, int(prompt_embeds.shape[-1])))
-            negative_prompt_attention_mask = torch.zeros(
-                (1, 0),
-                dtype=torch.bool,
-                device=model_device,
-            )
+        # InputBatch requires consistent negative fields for CFG and non-CFG requests.
+        # denoise_step decides whether the current batch needs an unconditional pass.
+        negative_prompt_embeds = prompt_embeds.new_zeros((1, 0, int(prompt_embeds.shape[-1])))
+        negative_prompt_attention_mask = torch.zeros(
+            (1, 0),
+            dtype=torch.bool,
+            device=model_device,
+        )
 
         vae_scale_factor = 16
         latent_channels = int(self.gen_transformer.config.in_channels)
@@ -982,8 +981,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         state.scheduler = scheduler
         state.do_true_cfg = False
         state.txt_seq_lens = [int(prompt_embeds.shape[1])]
-        if negative_prompt_embeds is not None:
-            state.negative_txt_seq_lens = [0]
+        state.negative_txt_seq_lens = [0]
         state.extra.update(
             {
                 "mammoth_ar_image_embeds": ar_image_embeds,
