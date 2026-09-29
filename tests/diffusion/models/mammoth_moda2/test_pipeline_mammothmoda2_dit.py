@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     get_mammoth_moda2_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -1101,6 +1102,61 @@ def test_step_protocol_matches_request_mode() -> None:
 
 
 @pytest.mark.parametrize(
+    ("guidance_scales", "expected_predictions", "expected_calls"),
+    [
+        ((1.0, 4.0), (2.0, 5.0), 2),
+        ((4.0, 1.0), (5.0, 2.0), 2),
+        ((1.0, 1.0), (2.0, 2.0), 1),
+    ],
+)
+def test_step_batch_handles_cfg_and_non_cfg_requests(
+    guidance_scales: tuple[float, float],
+    expected_predictions: tuple[float, float],
+    expected_calls: int,
+) -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    config = _od_config()
+    config.step_execution = True
+    pre_process = get_mammoth_moda2_pre_process_func(config)
+    scheduler = StepScheduler()
+    requests = [
+        pre_process(
+            _batch(
+                request_id=f"cfg-{index}",
+                sampling=OmniDiffusionSamplingParams(
+                    height=32,
+                    width=48,
+                    seed=index,
+                    guidance_scale=4.0,
+                    num_inference_steps=2,
+                    extra_args={"text_guidance_scale": scale},
+                ),
+            ).requests[0]
+        )
+        for index, scale in enumerate(guidance_scales)
+    ]
+    assert scheduler._build_sampling_params_key(requests[0]) == scheduler._build_sampling_params_key(requests[1])
+
+    def predict(*, hidden_states, text_hidden_states, **kwargs):
+        return torch.full_like(hidden_states, 2.0 if text_hidden_states.shape[1] else 1.0)
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", side_effect=lambda: _FakeScheduler()),
+        patch.object(pipeline.gen_transformer, "forward", side_effect=predict) as transformer_forward,
+    ):
+        states = [pipeline.prepare_encode(_step_state(DiffusionRequestBatch([request]))) for request in requests]
+        predictions = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    for prediction, expected in zip(predictions, expected_predictions):
+        torch.testing.assert_close(prediction, torch.full_like(prediction, expected))
+    assert transformer_forward.call_count == expected_calls
+
+
+@pytest.mark.parametrize(
     ("sampling", "extra_info", "expected_guidance"),
     [
         (OmniDiffusionSamplingParams(num_inference_steps=2), {}, 9.0),
@@ -1143,7 +1199,7 @@ def test_step_protocol_resolves_guidance_like_request_mode(
 
     assert request_spec.text_guidance_scale == expected_guidance
     assert state.extra["mammoth_text_guidance_scale"] == expected_guidance
-    assert (state.negative_prompt_embeds is not None) == (expected_guidance > 1.0)
+    assert state.negative_prompt_embeds is not None
     assert sampling.guidance_scale_provided is False
     torch.testing.assert_close(step_output.output, request_output.output)
 
