@@ -1281,3 +1281,106 @@ def test_step_protocol_keeps_request_schedulers_and_progress_independent() -> No
     assert short.denoise_completed
     assert not long.denoise_completed
     assert short.step_index == long.step_index == 1
+
+
+class _InputDependentTransformer(_FakeTransformer):
+    """Expose dropped masks, timesteps, conditioning and latent rows in outputs."""
+
+    def forward(self, *, hidden_states, timestep, text_hidden_states, text_attention_mask, **kwargs):
+        self.calls += 1
+        conditioning = (text_hidden_states * text_attention_mask.unsqueeze(-1)).sum(dim=(1, 2)) / 100
+        return hidden_states * 0.125 + timestep[:, None, None, None] + conditioning[:, None, None, None]
+
+
+def _step_test_pipeline() -> MammothModa2DiTPipeline:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _InputDependentTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    return pipeline
+
+
+def _step_test_request(request_id: str, *, seed: int = 11, steps: int = 4, text_tokens: int = 2):
+    return _batch(
+        request_id=request_id,
+        prompt={
+            "prompt": "",
+            "additional_information": {
+                "full_hidden_states": torch.arange((text_tokens + 2) * 8, dtype=torch.float32).reshape(-1, 8) / 10,
+                "full_token_ids": [10] * text_tokens + [100, 101],
+                "answer_start_index": text_tokens,
+            },
+        },
+        sampling=OmniDiffusionSamplingParams(
+            height=32,
+            width=48,
+            seed=seed,
+            guidance_scale=4.0,
+            num_inference_steps=steps,
+            extra_args={"cfg_range": [0.25, 0.75]},
+        ),
+    )
+
+
+def test_step_protocol_seed_conditioning_and_request_parity() -> None:
+    pipeline = _step_test_pipeline()
+    outputs = []
+    for seed, text_tokens in ((11, 2), (11, 2), (12, 2), (11, 5)):
+        batch = _step_test_request("solo", seed=seed, text_tokens=text_tokens)
+        state = pipeline.prepare_encode(_step_state(batch))
+        expected_noise = torch.randn(state.latents.shape, generator=torch.Generator().manual_seed(seed))
+        torch.testing.assert_close(state.latents, expected_noise, rtol=0, atol=0)
+        while not state.denoise_completed:
+            prediction = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
+            pipeline.step_scheduler(state, prediction)
+        output = pipeline.post_decode(state).output
+        reference = pipeline.forward(batch)[0].output
+        torch.testing.assert_close(output, reference)
+        outputs.append(output)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    assert not torch.allclose(outputs[0], outputs[2])
+    assert not torch.allclose(outputs[0], outputs[3])
+
+
+def test_step_protocol_handles_arrival_reordering_and_retirement() -> None:
+    pipeline = _step_test_pipeline()
+    long = pipeline.prepare_encode(_step_state(_step_test_request("long")))
+    solo_long = pipeline.prepare_encode(_step_state(_step_test_request("solo-long")))
+    solo_short = pipeline.prepare_encode(_step_state(_step_test_request("solo-short", seed=22, steps=2, text_tokens=5)))
+    short = None
+    cached_batch = None
+    completed = {}
+    retired_latents = None
+
+    # Match runner ordering: newly admitted requests precede existing requests.
+    for tick in range(4):
+        if tick == 1:
+            short = pipeline.prepare_encode(_step_state(_step_test_request("short", seed=22, steps=2, text_tokens=5)))
+            assert short.scheduler is not long.scheduler
+        active = [short, long] if tick in (1, 2) else [long]
+        references = [solo_short, solo_long] if tick in (1, 2) else [solo_long]
+        cached_batch = InputBatch.make_batch(active, cached_batch=cached_batch)
+        if tick == 1:
+            assert long.current_timestep != short.current_timestep
+            assert cached_batch.prompt_embeds_mask.sum(dim=1).tolist() == [7, 4]
+        predictions = pipeline.denoise_step(cached_batch, states=active)
+        for index, (state, reference) in enumerate(zip(active, references)):
+            solo_prediction = pipeline.denoise_step(InputBatch.make_batch([reference]), states=[reference])
+            torch.testing.assert_close(predictions[index : index + 1], solo_prediction)
+            pipeline.step_scheduler(state, predictions[index : index + 1])
+            pipeline.step_scheduler(reference, solo_prediction)
+            torch.testing.assert_close(state.latents, reference.latents)
+            assert state.step_index == reference.step_index == state.scheduler.step_index
+            if state.denoise_completed:
+                completed[state.request_id] = pipeline.post_decode(state).output
+                torch.testing.assert_close(completed[state.request_id], pipeline.post_decode(reference).output)
+        if tick == 2:
+            assert short.denoise_completed and not long.denoise_completed
+            assert list(completed) == ["short"]
+            retired_latents = short.latents.clone()
+
+    assert list(completed) == ["short", "long"]
+    assert (short.step_index, long.step_index) == (2, 4)
+    torch.testing.assert_close(short.latents, retired_latents, rtol=0, atol=0)
+    assert not torch.allclose(completed["short"], completed["long"])
