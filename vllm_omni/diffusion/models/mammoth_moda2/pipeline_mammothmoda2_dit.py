@@ -678,20 +678,22 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             generators.append(gen)
         return generators
 
-    def _denoise_group(
-        self,
-        specs: list[_MammothRequest],
-        conds: list[_RequestConditioning],
-        model_device: torch.device,
-    ) -> list[torch.Tensor]:
-        batch = len(specs)
-        height = specs[0].height
-        width = specs[0].width
-        num_inference_steps = specs[0].num_inference_steps
-        target_dtype = conds[0].text_embeds.dtype
+    def _model_device_and_dtype(self) -> tuple[torch.device, torch.dtype]:
+        model_device = next(self.parameters()).device
+        if self.gen_image_condition_refiner is not None:
+            return model_device, next(self.gen_image_condition_refiner.parameters()).dtype
+        return model_device, next(self.gen_transformer.parameters()).dtype
 
-        # Conditioning collation. Token order is text-then-image per request,
-        # so concatenate first and right-pad the combined sequence.
+    def _collate_conditioning(
+        self,
+        conds: list[_RequestConditioning],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Collate per-request conditions into transformer inputs.
+
+        Returns ``(prompt_embeds, prompt_attention_mask, ar_image_embeds,
+        ar_image_attention_mask)``. Token order is text-then-image per request,
+        so concatenate first and right-pad the combined sequence.
+        """
         nested_image_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
         if self.gen_image_condition_refiner is not None:
             image_embeds, image_mask = _pad_cond_sequence(
@@ -714,9 +716,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 seq_embeds.append(torch.cat([c.text_embeds, cur_img_embed], dim=1))
                 seq_masks.append(torch.cat([c.text_mask, cur_img_mask], dim=1))
             prompt_embeds, prompt_attention_mask = _pad_cond_sequence(seq_embeds, seq_masks)
-            ar_image_embeds = None
-            ar_image_attention_mask = None
-        elif nested_image_embedder is not None:
+            return prompt_embeds, prompt_attention_mask, None, None
+        if nested_image_embedder is not None:
             prompt_embeds, prompt_attention_mask = _pad_cond_sequence(
                 [c.text_embeds for c in conds],
                 [c.text_mask for c in conds],
@@ -725,13 +726,60 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 [c.image_embeds for c in conds],
                 [c.image_mask for c in conds],
             )
-        else:
-            prompt_embeds, prompt_attention_mask = _pad_cond_sequence(
-                [torch.cat([c.text_embeds, c.image_embeds], dim=1) for c in conds],
-                [torch.cat([c.text_mask, c.image_mask], dim=1) for c in conds],
-            )
-            ar_image_embeds = None
-            ar_image_attention_mask = None
+            return prompt_embeds, prompt_attention_mask, ar_image_embeds, ar_image_attention_mask
+        prompt_embeds, prompt_attention_mask = _pad_cond_sequence(
+            [torch.cat([c.text_embeds, c.image_embeds], dim=1) for c in conds],
+            [torch.cat([c.text_mask, c.image_mask], dim=1) for c in conds],
+        )
+        return prompt_embeds, prompt_attention_mask, None, None
+
+    def _init_latents(
+        self,
+        specs: list[_MammothRequest],
+        height: int,
+        width: int,
+        model_device: torch.device,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        vae_scale_factor = 16
+        latent_channels = int(self.gen_transformer.config.in_channels)
+        shape = (len(specs), latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
+        single_shape = (1, *shape[1:])
+        generators = self._make_latent_generators(specs, model_device)
+        if generators is None:
+            return randn_tensor(shape, device=model_device, dtype=target_dtype)
+        noise_list = []
+        for gen in generators:
+            gen_device = gen.device if hasattr(gen, "device") else model_device
+            n = randn_tensor(single_shape, generator=gen, device=gen_device, dtype=target_dtype)
+            noise_list.append(n.to(device=model_device))
+        return torch.cat(noise_list, dim=0)
+
+    @staticmethod
+    def _make_scheduler(num_inference_steps: int, latents: torch.Tensor) -> FlowMatchEulerDiscreteScheduler:
+        scheduler = FlowMatchEulerDiscreteScheduler()
+        scheduler.set_timesteps(
+            num_inference_steps=num_inference_steps,
+            device=latents.device,
+            num_tokens=latents.shape[-2] * latents.shape[-1],
+        )
+        return scheduler
+
+    def _denoise_group(
+        self,
+        specs: list[_MammothRequest],
+        conds: list[_RequestConditioning],
+        model_device: torch.device,
+    ) -> list[torch.Tensor]:
+        batch = len(specs)
+        height = specs[0].height
+        width = specs[0].width
+        num_inference_steps = specs[0].num_inference_steps
+        target_dtype = conds[0].text_embeds.dtype
+
+        prompt_embeds, prompt_attention_mask, ar_image_embeds, ar_image_attention_mask = self._collate_conditioning(
+            conds
+        )
 
         # Empty unconditional prompt for classifier-free guidance, shared by
         # all rows; rows that never take the CFG branch select their cond
@@ -752,27 +800,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 device=model_device,
             )
 
-        vae_scale_factor = 16
-        latent_channels = int(self.gen_transformer.config.in_channels)
-        shape = (batch, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
-        single_shape = (1, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
-        generators = self._make_latent_generators(specs, model_device)
-        if generators is not None:
-            noise_list = []
-            for gen in generators:
-                gen_device = gen.device if hasattr(gen, "device") else model_device
-                n = randn_tensor(single_shape, generator=gen, device=gen_device, dtype=target_dtype)
-                noise_list.append(n.to(device=model_device))
-            latents = torch.cat(noise_list, dim=0)
-        else:
-            latents = randn_tensor(shape, device=model_device, dtype=target_dtype)
-
-        scheduler = FlowMatchEulerDiscreteScheduler()
-        scheduler.set_timesteps(
-            num_inference_steps=num_inference_steps,
-            device=model_device,
-            num_tokens=latents.shape[-2] * latents.shape[-1],
-        )
+        latents = self._init_latents(specs, height, width, model_device, target_dtype)
+        scheduler = self._make_scheduler(num_inference_steps, latents)
 
         scale_vec = torch.tensor(
             [s.text_guidance_scale for s in specs],
@@ -869,12 +898,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         # requests fail fast instead of surfacing device/dtype errors.
         raw_conds = [self._split_request_conditions(spec) for spec in specs]
 
-        model_device = next(self.parameters()).device
-        if self.gen_image_condition_refiner is not None:
-            target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
-        else:
-            target_dtype = next(self.gen_transformer.parameters()).dtype
-
+        model_device, target_dtype = self._model_device_and_dtype()
         conds = [
             self._build_conditioning(text_cond, image_cond, model_device, target_dtype)
             for text_cond, image_cond in raw_conds
@@ -904,40 +928,11 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         spec = self._parse_request_inputs(prompt, state.sampling, state.request_id)
         text_cond, image_cond = self._split_request_conditions(spec)
 
-        model_device = next(self.parameters()).device
-        if self.gen_image_condition_refiner is not None:
-            target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
-        else:
-            target_dtype = next(self.gen_transformer.parameters()).dtype
-        cond = self._build_conditioning(
-            text_cond,
-            image_cond,
-            model_device,
-            target_dtype,
+        model_device, target_dtype = self._model_device_and_dtype()
+        cond = self._build_conditioning(text_cond, image_cond, model_device, target_dtype)
+        prompt_embeds, prompt_attention_mask, ar_image_embeds, ar_image_attention_mask = self._collate_conditioning(
+            [cond]
         )
-
-        nested_image_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
-        if self.gen_image_condition_refiner is not None:
-            image_embeds = self.gen_image_condition_refiner(cond.image_embeds, ~cond.image_mask.bool())
-            image_mask = torch.ones(
-                image_embeds.shape[:2],
-                dtype=torch.bool,
-                device=image_embeds.device,
-            )
-            prompt_embeds = torch.cat([cond.text_embeds, image_embeds], dim=1)
-            prompt_attention_mask = torch.cat([cond.text_mask, image_mask], dim=1)
-            ar_image_embeds = None
-            ar_image_attention_mask = None
-        elif nested_image_embedder is not None:
-            prompt_embeds = cond.text_embeds
-            prompt_attention_mask = cond.text_mask
-            ar_image_embeds = cond.image_embeds
-            ar_image_attention_mask = cond.image_mask
-        else:
-            prompt_embeds = torch.cat([cond.text_embeds, cond.image_embeds], dim=1)
-            prompt_attention_mask = torch.cat([cond.text_mask, cond.image_mask], dim=1)
-            ar_image_embeds = None
-            ar_image_attention_mask = None
 
         # InputBatch requires consistent negative fields for CFG and non-CFG requests.
         # denoise_step decides whether the current batch needs an unconditional pass.
@@ -948,30 +943,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             device=model_device,
         )
 
-        vae_scale_factor = 16
-        latent_channels = int(self.gen_transformer.config.in_channels)
-        generators = self._make_latent_generators([spec], model_device)
-        generator = generators[0]
-        generator_device = generator.device if hasattr(generator, "device") else model_device
-        latent_shape = (
-            1,
-            latent_channels,
-            2 * spec.height // vae_scale_factor,
-            2 * spec.width // vae_scale_factor,
-        )
-        latents = randn_tensor(
-            latent_shape,
-            generator=generator,
-            device=generator_device,
-            dtype=target_dtype,
-        ).to(device=model_device)
-
-        scheduler = FlowMatchEulerDiscreteScheduler()
-        scheduler.set_timesteps(
-            num_inference_steps=spec.num_inference_steps,
-            device=model_device,
-            num_tokens=latents.shape[-2] * latents.shape[-1],
-        )
+        latents = self._init_latents([spec], spec.height, spec.width, model_device, target_dtype)
+        scheduler = self._make_scheduler(spec.num_inference_steps, latents)
 
         state.prompt_embeds = prompt_embeds
         state.prompt_embeds_mask = prompt_attention_mask
