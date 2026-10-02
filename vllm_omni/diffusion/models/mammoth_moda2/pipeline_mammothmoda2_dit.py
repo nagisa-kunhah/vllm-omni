@@ -296,6 +296,8 @@ def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig | None = N
         height, width, num_inference_steps = _validate_request_for_admission(
             request, od_config=od_config, gen_vocab_start_index=gen_vocab_start_index
         )
+        # Scheduler admission and output metrics must use the model's resolved step count.
+        request.sampling_params.num_inference_steps = num_inference_steps
         if step_execution:
             request.batch_compatibility_key = ("mammoth_moda2_dit", height, width)
         else:

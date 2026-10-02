@@ -1068,6 +1068,43 @@ def _step_state(batch: DiffusionRequestBatch) -> StepRequestState:
     )
 
 
+@pytest.mark.parametrize("step_execution", [False, True])
+@pytest.mark.parametrize(
+    ("standard_steps", "extra_args", "extra_info", "expected_steps"),
+    [
+        (None, {}, {}, 50),
+        (None, {"num_inference_steps": 30}, {}, 30),
+        (50, {"num_inference_steps": 30}, {}, 30),
+        (None, {}, {"num_inference_steps": [20]}, 20),
+        (10, {}, {"num_inference_steps": [20]}, 10),
+    ],
+)
+def test_pre_process_normalizes_steps_before_scheduler_admission(
+    step_execution: bool,
+    standard_steps: int | None,
+    extra_args: dict,
+    extra_info: dict,
+    expected_steps: int,
+) -> None:
+    config = _od_config()
+    config.step_execution = step_execution
+    request = _batch(
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=standard_steps, extra_args=extra_args),
+    ).requests[0]
+    request.prompt["additional_information"].update(extra_info)
+    request = get_mammoth_moda2_pre_process_func(config)(request)
+
+    assert request.sampling_params.num_inference_steps == expected_steps
+    parsed = _pipeline_shell()._parse_request(DiffusionRequestBatch([request]))
+    assert parsed.num_inference_steps == expected_steps
+    if step_execution:
+        scheduler = StepScheduler()
+        assert scheduler.add_request(request) == request.request_id
+        assert scheduler._request_progress[request.request_id].total_steps == expected_steps
+    else:
+        assert request.batch_compatibility_key[-1] == expected_steps
+
+
 def test_step_protocol_matches_request_mode() -> None:
     pipeline = _pipeline_shell()
     pipeline.gen_transformer = _FakeTransformer()
