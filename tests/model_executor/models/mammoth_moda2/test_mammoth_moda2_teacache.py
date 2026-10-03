@@ -8,6 +8,7 @@ from torch import nn
 from vllm_omni.diffusion.cache.cachedit import RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import extract_mammoth_moda2_context
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as mammoth_pipeline_module
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -56,6 +57,7 @@ class _FakeTransformer(nn.Module):
 class _FakeVAE(nn.Module):
     def __init__(self):
         super().__init__()
+        self.param = nn.Parameter(torch.zeros(()))
         self.config = SimpleNamespace(scaling_factor=None, shift_factor=None)
 
     def decode(self, latents, return_dict=False):  # noqa: ARG002
@@ -64,6 +66,11 @@ class _FakeVAE(nn.Module):
 
 def _build_pipeline(monkeypatch):
     monkeypatch.setattr(mammoth_pipeline_module, "FlowMatchEulerDiscreteScheduler", _FakeScheduler)
+    monkeypatch.setattr(
+        mammoth_pipeline_module,
+        "randn_tensor",
+        lambda shape, *, device, dtype, generator=None: torch.zeros(shape, device=device, dtype=dtype),
+    )
 
     pipe = MammothModa2DiTPipeline.__new__(MammothModa2DiTPipeline)
     nn.Module.__init__(pipe)
@@ -84,7 +91,7 @@ def _build_pipeline(monkeypatch):
     return pipe
 
 
-def _run_pipeline(pipe, *, text_guidance_scale, cfg_range, num_inference_steps=4):
+def _run_pipeline(pipe, *, text_guidance_scale, cfg_range, num_inference_steps=4, num_requests=1):
     request = OmniDiffusionRequest(
         request_id="req-teacache",
         prompt={
@@ -105,14 +112,27 @@ def _run_pipeline(pipe, *, text_guidance_scale, cfg_range, num_inference_steps=4
             extra_args={"cfg_range": cfg_range},
         ),
     )
-    pipe(DiffusionRequestBatch([request]))
+    requests = [
+        OmniDiffusionRequest(
+            request_id=f"req-teacache-{i}",
+            prompt=request.prompt,
+            sampling_params=request.sampling_params,
+        )
+        for i in range(num_requests)
+    ]
+    outputs = pipe(DiffusionRequestBatch(requests))
+    assert isinstance(outputs, list)
+    assert len(outputs) == num_requests
+    assert all(isinstance(output, DiffusionOutput) and output.output.shape == (1, 4, 4, 4) for output in outputs)
+    assert all(call["timestep"].shape == (num_requests,) for call in pipe.gen_transformer.calls)
     return pipe.gen_transformer.branches
 
 
-def test_mammoth_moda2_non_cfg_passes_positive_teacache_branch(monkeypatch):
+@pytest.mark.parametrize("num_requests", [1, 2])
+def test_mammoth_moda2_non_cfg_passes_positive_teacache_branch(monkeypatch, num_requests):
     pipe = _build_pipeline(monkeypatch)
 
-    branches = _run_pipeline(pipe, text_guidance_scale=1.0, cfg_range=[0.0, 1.0])
+    branches = _run_pipeline(pipe, text_guidance_scale=1.0, cfg_range=[0.0, 1.0], num_requests=num_requests)
 
     assert branches == ["positive", "positive", "positive", "positive"]
 
@@ -137,10 +157,11 @@ def test_mammoth_moda2_dev_forwards_ar_image_conditioning_to_positive_branch(mon
     assert torch.equal(call["ar_image_attention_mask"], torch.ones(1, 1, dtype=torch.bool))
 
 
-def test_mammoth_moda2_cfg_passes_positive_then_negative_teacache_branch(monkeypatch):
+@pytest.mark.parametrize("num_requests", [1, 2])
+def test_mammoth_moda2_cfg_passes_positive_then_negative_teacache_branch(monkeypatch, num_requests):
     pipe = _build_pipeline(monkeypatch)
 
-    branches = _run_pipeline(pipe, text_guidance_scale=4.0, cfg_range=[0.0, 1.0])
+    branches = _run_pipeline(pipe, text_guidance_scale=4.0, cfg_range=[0.0, 1.0], num_requests=num_requests)
 
     assert branches == [
         "positive",
@@ -154,10 +175,11 @@ def test_mammoth_moda2_cfg_passes_positive_then_negative_teacache_branch(monkeyp
     ]
 
 
-def test_mammoth_moda2_cfg_range_only_uses_negative_inside_range(monkeypatch):
+@pytest.mark.parametrize("num_requests", [1, 2])
+def test_mammoth_moda2_cfg_range_only_uses_negative_inside_range(monkeypatch, num_requests):
     pipe = _build_pipeline(monkeypatch)
 
-    branches = _run_pipeline(pipe, text_guidance_scale=4.0, cfg_range=[0.5, 1.0])
+    branches = _run_pipeline(pipe, text_guidance_scale=4.0, cfg_range=[0.5, 1.0], num_requests=num_requests)
 
     assert branches == [
         "positive",

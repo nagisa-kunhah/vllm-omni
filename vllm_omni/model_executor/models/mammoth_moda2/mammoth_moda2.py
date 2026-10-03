@@ -15,6 +15,7 @@ from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProce
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -62,6 +63,8 @@ from vllm.transformers_utils.config import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
+
+logger = init_logger(__name__)
 
 
 def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:

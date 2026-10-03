@@ -39,7 +39,8 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_zimage_context,
 )
 from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
-from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
@@ -154,18 +155,24 @@ class TestMammothModa2Extractor(BaseExtractorTest):
 
     @pytest.fixture
     def mammoth_module(self):
-        return MammothModa2Transformer2DModel(
-            patch_size=2,
-            in_channels=4,
-            hidden_size=16,
-            num_layers=2,
-            num_refiner_layers=1,
-            num_attention_heads=2,
-            num_kv_heads=1,
-            axes_dim_rope=(2, 2, 4),
-            axes_lens=(16, 16, 16),
-            text_feat_dim=8,
+        # These tests run on CPU even when the host has CUDA available.
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+            parallel_config=SimpleNamespace(ring_degree=1),
         )
+        with set_current_diffusion_config(od_config):
+            yield MammothModa2Transformer2DModel(
+                patch_size=2,
+                in_channels=4,
+                hidden_size=16,
+                num_layers=2,
+                num_refiner_layers=1,
+                num_attention_heads=2,
+                num_kv_heads=1,
+                axes_dim_rope=(2, 2, 4),
+                axes_lens=(16, 16, 16),
+                text_feat_dim=8,
+            )
 
     def get_module(self, mammoth_module):
         return mammoth_module
