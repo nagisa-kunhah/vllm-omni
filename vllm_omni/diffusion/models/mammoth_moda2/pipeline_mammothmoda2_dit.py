@@ -952,6 +952,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         state.negative_prompt_embeds_mask = negative_prompt_attention_mask
         state.latents = latents
         state.timesteps = scheduler.timesteps
+        # Mid-denoise resume (sampling_params.step_index > 0) is not supported;
+        # like other step pipelines, encoding always restarts from step 0.
         state.step_index = 0
         state.scheduler = scheduler
         state.do_true_cfg = False
