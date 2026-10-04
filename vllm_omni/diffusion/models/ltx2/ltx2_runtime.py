@@ -86,6 +86,11 @@ def _restore_ltx_bwe_resampler_filter(vocoder: nn.Module) -> None:
     kernel_size = getattr(resampler, "kernel_size", None)
     if not isinstance(current_filter, torch.Tensor) or not isinstance(ratio, int) or not isinstance(kernel_size, int):
         return
+    # Any dtype or device cast replaces the buffer, so an identical tensor is
+    # still the unrounded FP32 filter from the previous decode. A dtype check
+    # alone would accept a BF16-rounded filter that was later cast to FP32.
+    if current_filter is getattr(resampler, "_ltx_restored_filter", None):
+        return
 
     # ``filter`` is deliberately non-persistent, so loading the component with
     # BF16 also casts this analytically constructed buffer. The official
@@ -102,6 +107,7 @@ def _restore_ltx_bwe_resampler_filter(vocoder: nn.Module) -> None:
     window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
     filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
     resampler.filter = filter_value
+    resampler._ltx_restored_filter = filter_value
 
 
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
