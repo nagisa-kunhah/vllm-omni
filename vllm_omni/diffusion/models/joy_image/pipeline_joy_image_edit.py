@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Hugging Face Diffusers commit
 # 23ba73e1d2079c4b89959484ed0ca1c22e7ef998:
 # src/diffusers/pipelines/joyimage/pipeline_joyimage_edit.py
@@ -44,6 +44,11 @@ from vllm_omni.diffusion.models.joy_image.cfg_parallel import (
 from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
     JoyImageEditTransformer3DModel,
     _raise_if_unsupported_tensor_parallel,
+)
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    offload_enabled,
+    resolve_offload_strategy,
 )
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -148,17 +153,13 @@ def _get_transformer_config_kwargs_from_od_config(
 def _should_defer_component_device_placement(
     od_config: OmniDiffusionConfig,
 ) -> bool:
-    return bool(
-        getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-    )
+    return offload_enabled(od_config)
 
 
 def _uses_model_level_cpu_offload(
     od_config: OmniDiffusionConfig,
 ) -> bool:
-    return bool(
-        getattr(od_config, "enable_cpu_offload", False) and not getattr(od_config, "enable_layerwise_offload", False)
-    )
+    return resolve_offload_strategy(od_config) is OffloadStrategy.MODEL_LEVEL
 
 
 def _raise_if_unsupported_hsdp(od_config: OmniDiffusionConfig) -> None:

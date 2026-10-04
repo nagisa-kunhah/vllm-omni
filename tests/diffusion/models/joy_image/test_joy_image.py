@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -235,13 +235,13 @@ class _TinyJoyLayerwisePipeline(torch.nn.Module):
             num_layers=2,
             num_attention_heads=4,
             patch_size=(1, 2, 2),
-        )
+        ).to(device=device, dtype=torch.bfloat16)
         self.vae = torch.nn.Linear(1, 1)
         self.cleanup_mode = cleanup_mode
 
     def encode_prompt(self, *args, **kwargs):
         return (
-            torch.zeros(1, 5, 16, device=self.device),
+            torch.zeros(1, 5, 16, device=self.device, dtype=torch.bfloat16),
             torch.ones(1, 5, dtype=torch.long, device=self.device),
         )
 
@@ -252,7 +252,7 @@ class _TinyJoyLayerwisePipeline(torch.nn.Module):
         )
 
     def _prepare_latents(self, **kwargs):
-        latents = torch.randn(1, 2, 4, 1, 4, 4, device=self.device)
+        latents = torch.randn(1, 2, 4, 1, 4, 4, device=self.device, dtype=torch.bfloat16)
         return latents, latents[:, :1].clone()
 
     def diffuse(self, **kwargs):
@@ -1124,9 +1124,9 @@ def test_transformer_shape_and_masked_forward():
         num_layers=1,
         num_attention_heads=4,
         patch_size=(1, 2, 2),
-    ).to(device=device)
-    hidden_states = torch.randn(2, 2, 4, 1, 4, 4, device=device)
-    encoder_hidden_states = torch.randn(2, 5, 16, device=device)
+    ).to(device=device, dtype=torch.bfloat16)
+    hidden_states = torch.randn(2, 2, 4, 1, 4, 4, device=device, dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(2, 5, 16, device=device, dtype=torch.bfloat16)
     encoder_hidden_states_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], device=device)
 
     output = transformer(
