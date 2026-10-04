@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 import requests
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 
@@ -30,12 +29,6 @@ SAMPLE_RATE = 48_000
 EXPECTED_SAMPLE_COUNT = 96_480
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
-
-
-@pytest.fixture(scope="module", autouse=True)
-def require_ltx25_model_access() -> None:
-    if not os.path.isdir(MODEL):
-        skip_if_gated_repo_inaccessible(MODEL, revision=MODEL_REVISION or None, filename="model_index.json")
 
 
 def _server() -> OmniServerParams:

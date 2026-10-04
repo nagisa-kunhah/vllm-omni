@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_test
 
 DEFAULT_MODEL = "Lightricks/LTX-2.5-Diffusers"
@@ -26,12 +25,6 @@ REQUESTED_DURATION_S = 2.0
 EXPECTED_SAMPLE_COUNT = 96_480
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
-
-
-@pytest.fixture(scope="module", autouse=True)
-def require_ltx25_model_access() -> None:
-    if not os.path.isdir(MODEL):
-        skip_if_gated_repo_inaccessible(MODEL, filename="model_index.json")
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)

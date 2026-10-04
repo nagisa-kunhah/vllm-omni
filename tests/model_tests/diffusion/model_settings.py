@@ -67,6 +67,7 @@ DIFFUSION_TEST_SETTINGS = {
         model="Lightricks/LTX-2",
         builder=diff_model_builders.tiny_ltx2_audio_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_AUDIO],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
         check_multi_output=False,
         check_determinism=False,
     ),

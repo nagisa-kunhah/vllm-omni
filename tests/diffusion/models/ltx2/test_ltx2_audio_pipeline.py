@@ -667,7 +667,7 @@ def test_ltx25_t2a_overrides_shared_distilled_scheduler_before_validation(tmp_pa
 
 
 def test_ltx_t2a_component_cache_healing_stays_audio_only(tmp_path, monkeypatch):
-    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime, ltx2_components
 
     prefetch_lists = []
 
@@ -707,6 +707,8 @@ def test_ltx_t2a_component_cache_healing_stays_audio_only(tmp_path, monkeypatch)
         lambda *_args, **_kwargs: SimpleNamespace(model_max_length=1024),
     )
     monkeypatch.setattr(ltx2_audio_runtime, "_load_component", load_component)
+    # The vocoder is loaded through ltx2_components._load_ltx_vocoder.
+    monkeypatch.setattr(ltx2_components, "_load_component", load_component)
     monkeypatch.setattr(ltx2_audio_runtime, "_install_connector_attention", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(ltx2_audio_runtime, "load_transformer_config", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
