@@ -354,13 +354,15 @@ def run_and_validate_online_text_to_audio_request(server: OmniServer, client: On
     """Run and validate a text-to-audio request through the OpenAI endpoint."""
     responses = client.send_audio_generate_http_request(
         {
-            "model": server.model,
-            "input": PROMPT,
-            "response_format": "wav",
-            "num_frames": 9,
-            "frame_rate": 24.0,
-            "num_inference_steps": 2,
-            "seed": 42,
+            "json": {
+                "model": server.model,
+                "input": PROMPT,
+                "response_format": "wav",
+                "num_frames": 9,
+                "frame_rate": 24.0,
+                "num_inference_steps": 2,
+                "seed": 42,
+            }
         }
     )
     assert len(responses) == 1

@@ -54,6 +54,20 @@ def _init_tensor_parallel() -> None:
             cleanup_dist_env_and_memory()
 
 
+@pytest.fixture(autouse=True)
+def _force_default_gemm(monkeypatch):
+    """Force CPU-compatible GEMM dispatch for tests using CPU tensors.
+
+    vLLM's dispatch_unquantized_gemm() selects the backend by platform, not by
+    tensor device; CPU test tensors can crash on non-default backends."""
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda *_args, **_kwargs: default_unquantized_gemm,
+    )
+
+
 @pytest.mark.parametrize("audio_cross_attn_mod", [False, True])
 @pytest.mark.parametrize("use_stg_mask", [False, True])
 def test_ltx_audio_block_matches_full_transformer_audio_branch(audio_cross_attn_mod, use_stg_mask):
