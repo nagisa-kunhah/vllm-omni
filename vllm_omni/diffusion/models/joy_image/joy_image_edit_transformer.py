@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright 2025 The JoyImage Team and The HuggingFace Team
 # Adapted from Hugging Face Diffusers commit
 # 23ba73e1d2079c4b89959484ed0ca1c22e7ef998:
