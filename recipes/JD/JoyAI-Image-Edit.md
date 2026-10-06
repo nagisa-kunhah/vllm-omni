@@ -211,6 +211,8 @@ is omitted, the JoyAI pipeline uses the same `4.0` default.
 - Single prompt only: batched prompt requests are rejected.
 - HSDP is not supported yet. Starting with HSDP enabled raises a `ValueError`
   before the generic HSDP setup reaches the transformer.
+- Tensor Parallelism is not supported yet. Keep `tensor_parallel_size=1`;
+  larger values raise a `ValueError` during pipeline initialization.
 - LoRA is not included for this JoyAI pipeline.
 - Cache-DiT and TeaCache are not included for this JoyAI pipeline. Do not treat
   the generic image-to-image cache flags as validated JoyAI acceleration knobs.
