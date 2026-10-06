@@ -85,9 +85,8 @@ EOF
 curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: application/json"   -d @request.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
 
-For JoyAI-Image-Edit, set classifier-free guidance with `true_cfg_scale`
-or `cfg_scale` in `extra_body`; `guidance_scale` is accepted only as a
-Diffusers compatibility alias when `true_cfg_scale` is not also set.
+For JoyAI-Image-Edit, set classifier-free guidance with `guidance_scale`
+in `extra_body` (default: `4.0`). Values at or below `1.0` disable CFG.
 
 ### Method 2: Using OpenAI Python SDK
 

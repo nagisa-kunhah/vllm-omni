@@ -37,9 +37,11 @@ python image_edit.py \
   --height 1024 \
   --width 1024 \
   --num-inference-steps 50 \
-  --cfg-scale 4.0 \
+  --guidance-scale 4.0 \
   --output output_joyai_edit.png
 ```
+
+Set `--guidance-scale` explicitly for JoyAI; the shared CLI defaults to `1.0`, which disables CFG.
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 

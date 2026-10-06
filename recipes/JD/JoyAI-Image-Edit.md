@@ -123,7 +123,7 @@ curl -s http://localhost:8092/v1/chat/completions \
       height: 1024,
       width: 1024,
       num_inference_steps: 30,
-      true_cfg_scale: 4.0,
+      guidance_scale: 4.0,
       seed: 0
     }
   }')" \
@@ -152,7 +152,7 @@ python examples/offline_inference/image_to_image/image_edit.py \
   --height 1024 \
   --width 1024 \
   --num-inference-steps 30 \
-  --cfg-scale 4.0 \
+  --guidance-scale 4.0 \
   --seed 0 \
   --enforce-eager \
   --init-timeout 1200 \
@@ -195,14 +195,14 @@ denoising.
 
 #### Guidance Parameters
 
-Use `true_cfg_scale` or `cfg_scale` for JoyAI classifier-free guidance. The
-server accepts `guidance_scale` only as a Diffusers compatibility alias when
-`true_cfg_scale` is not also set. If both are provided with different values,
-the request is rejected.
+Use `guidance_scale` for JoyAI classifier-free guidance, matching Diffusers.
+The pipeline defaults to `4.0` when the parameter is omitted. Values greater
+than `1.0` enable CFG; an omitted negative prompt is treated as an empty string.
+Values at or below `1.0` disable CFG.
 
-CFG is active only when the effective true CFG scale is greater than 1 and a
-negative prompt is present. The offline CLI maps `--cfg-scale` to Joy's true CFG
-scale.
+For the offline example, pass `--guidance-scale 4.0` explicitly: the shared
+`image_edit.py` CLI defaults to `1.0`. JoyAI does not use `true_cfg_scale` or
+`--cfg-scale` to control guidance.
 
 #### Known Limitations
 

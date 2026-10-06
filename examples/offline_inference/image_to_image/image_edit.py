@@ -47,7 +47,7 @@ Usage (JoyAI-Image-Edit, single image):
         --height 1024 \
         --width 1024 \
         --num-inference-steps 50 \
-        --cfg-scale 4.0 \
+        --guidance-scale 4.0 \
         --output output_joyai_edit.png
 
     Note: JoyAI-Image-Edit snaps requested dimensions to the nearest supported

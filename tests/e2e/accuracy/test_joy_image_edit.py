@@ -34,7 +34,7 @@ NEGATIVE_PROMPT = ""
 WIDTH = 1024
 HEIGHT = 1024
 NUM_INFERENCE_STEPS = 20
-TRUE_CFG_SCALE = 4.0
+GUIDANCE_SCALE = 4.0
 SEED = 42
 SSIM_THRESHOLD = 0.90
 PSNR_THRESHOLD = 25.0
@@ -135,7 +135,7 @@ def _run_vllm_omni_joy_image_edit(
                 "response_format": "b64_json",
                 "negative_prompt": NEGATIVE_PROMPT,
                 "num_inference_steps": NUM_INFERENCE_STEPS,
-                "true_cfg_scale": TRUE_CFG_SCALE,
+                "guidance_scale": GUIDANCE_SCALE,
                 "seed": SEED,
             },
             files=[("image", ("input.png", pil_to_png_bytes(input_image), "image/png"))],
@@ -163,7 +163,8 @@ class _JoyImageEditRequest:
             height=HEIGHT,
             width=WIDTH,
             num_inference_steps=NUM_INFERENCE_STEPS,
-            true_cfg_scale=TRUE_CFG_SCALE,
+            guidance_scale=GUIDANCE_SCALE,
+            guidance_scale_provided=True,
             seed=SEED,
         )
         self.request_id = "joy-image-edit-latent-parity"
@@ -256,7 +257,7 @@ def _run_latent_parity_comparison(
             height=HEIGHT,
             width=WIDTH,
             num_inference_steps=NUM_INFERENCE_STEPS,
-            guidance_scale=TRUE_CFG_SCALE,
+            guidance_scale=GUIDANCE_SCALE,
             latents=fixed_latents,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
@@ -339,7 +340,7 @@ def _run_diffusers_joy_image_edit(
             height=HEIGHT,
             width=WIDTH,
             num_inference_steps=NUM_INFERENCE_STEPS,
-            guidance_scale=TRUE_CFG_SCALE,
+            guidance_scale=GUIDANCE_SCALE,
             generator=generator,
         )
         output_image = result.images[0].convert("RGB")

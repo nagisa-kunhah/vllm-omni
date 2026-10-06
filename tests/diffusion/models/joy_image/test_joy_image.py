@@ -157,12 +157,12 @@ def _write_model_configs(tmp_path):
 
 
 def _make_params(**overrides):
-    guidance_scale = overrides.pop("guidance_scale", 0.0)
+    guidance_scale = overrides.pop("guidance_scale", None)
     values = {
         "height": None,
         "width": None,
-        "guidance_scale": guidance_scale or 1.0,
-        "guidance_scale_provided": bool(guidance_scale),
+        "guidance_scale": guidance_scale if guidance_scale is not None else 1.0,
+        "guidance_scale_provided": guidance_scale is not None,
         "true_cfg_scale": None,
         "num_outputs_per_prompt": 1,
         "num_inference_steps": None,
@@ -245,12 +245,6 @@ class _TinyJoyLayerwisePipeline(torch.nn.Module):
             torch.ones(1, 5, dtype=torch.long, device=self.device),
         )
 
-    def resolve_effective_true_cfg_scale(self, req, default_true_cfg_scale=4.0):
-        return JoyImageEditPipeline.resolve_effective_true_cfg_scale(
-            req,
-            default_true_cfg_scale=default_true_cfg_scale,
-        )
-
     def _prepare_latents(self, **kwargs):
         latents = torch.randn(1, 2, 4, 1, 4, 4, device=self.device, dtype=torch.bfloat16)
         return latents, latents[:, :1].clone()
@@ -280,7 +274,7 @@ def _make_layerwise_forward_request(*, dummy: bool = False):
                 "width": 16,
             },
         },
-        params=_make_params(true_cfg_scale=1.0, num_inference_steps=1),
+        params=_make_params(guidance_scale=1.0, num_inference_steps=1),
     )
     request.is_dummy_run = lambda: dummy
     return request
@@ -756,24 +750,6 @@ def test_preprocess_maps_explicit_size_to_nearest_diffusers_bucket(tmp_path):
 
     assert request.sampling_params.height == 1024
     assert request.sampling_params.width == 1024
-
-
-def test_guidance_scale_alias_only_when_true_cfg_absent():
-    request = _make_request(params=_make_params(guidance_scale=3.5))
-    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(request) == 3.5
-
-    canonical = _make_request(params=_make_params(true_cfg_scale=4.0))
-    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(canonical) == 4.0
-
-    default_guidance = _make_request(params=_make_params(guidance_scale=1.0, true_cfg_scale=4.0))
-    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(default_guidance) == 4.0
-
-    matching = _make_request(params=_make_params(guidance_scale=4.0, true_cfg_scale=4.0))
-    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(matching) == 4.0
-
-    conflict = _make_request(params=_make_params(guidance_scale=3.0, true_cfg_scale=4.0))
-    with pytest.raises(ValueError, match="compatibility alias"):
-        JoyImageEditPipeline.resolve_effective_true_cfg_scale(conflict)
 
 
 def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
@@ -1365,7 +1341,18 @@ def test_diffuse_restores_reference_slots_each_step():
     assert torch.equal(result[:, -1:], torch.full((1, 1, 4, 1, 2, 2), 2.0))
 
 
-def test_forward_synthesizes_empty_negative_prompt_for_cfg():
+@pytest.mark.parametrize(
+    "params_kwargs, expected_scale",
+    [
+        ({}, 4.0),
+        ({"guidance_scale": 2.0}, 2.0),
+        ({"guidance_scale": 1.0}, 1.0),
+        ({"guidance_scale": 0.0}, 0.0),
+        ({"true_cfg_scale": 8.0}, 4.0),
+        ({"guidance_scale": 2.0, "true_cfg_scale": 8.0}, 2.0),
+    ],
+)
+def test_forward_uses_guidance_scale_for_cfg(params_kwargs, expected_scale):
     class FakeScheduler:
         def set_timesteps(self, num_inference_steps, device):
             self.num_inference_steps = num_inference_steps
@@ -1407,15 +1394,16 @@ def test_forward_synthesizes_empty_negative_prompt_for_cfg():
                 "width": 16,
             },
         },
-        params=_make_params(true_cfg_scale=2.0),
+        params=_make_params(**params_kwargs),
     )
 
     output = JoyImageEditPipeline.forward(pipeline, request)
 
     assert output.output.shape == (1, 3, 2, 2)
-    assert encode_calls == ["make it brighter", ""]
-    assert diffuse_calls[0]["do_true_cfg"] is True
-    assert diffuse_calls[0]["true_cfg_scale"] == 2.0
+    expected_cfg = expected_scale > 1.0
+    assert encode_calls == (["make it brighter", ""] if expected_cfg else ["make it brighter"])
+    assert diffuse_calls[0]["do_true_cfg"] is expected_cfg
+    assert diffuse_calls[0]["true_cfg_scale"] == expected_scale
 
 
 def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
@@ -1472,7 +1460,7 @@ def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):
                 "width": 16,
             },
         },
-        params=_make_params(true_cfg_scale=1.0),
+        params=_make_params(guidance_scale=1.0),
     )
     request.request_id = DUMMY_DIFFUSION_REQUEST_ID
     request.is_dummy_run = lambda: True

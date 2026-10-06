@@ -468,29 +468,6 @@ class JoyImageEditPipeline(
         )
 
     @staticmethod
-    def resolve_effective_true_cfg_scale(
-        req: OmniDiffusionRequest,
-        default_true_cfg_scale: float = 4.0,
-    ) -> float:
-        sampling_params = req.sampling_params
-        true_cfg_scale = sampling_params.true_cfg_scale
-        guidance_provided = sampling_params.guidance_scale_provided
-        guidance_scale = sampling_params.guidance_scale
-        if true_cfg_scale is None:
-            return float(guidance_scale if guidance_provided else default_true_cfg_scale)
-        guidance_is_disabled_default = math.isclose(float(guidance_scale), 1.0)
-        if (
-            guidance_provided
-            and not guidance_is_disabled_default
-            and not math.isclose(float(guidance_scale), float(true_cfg_scale))
-        ):
-            raise ValueError(
-                "JoyAI-Image-Edit treats `guidance_scale` as a Diffusers compatibility alias for "
-                "`true_cfg_scale`. Provide only one value, or provide matching values."
-            )
-        return float(true_cfg_scale)
-
-    @staticmethod
     def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> list[torch.Tensor]:
         bool_mask = mask.bool()
         valid_lengths = bool_mask.sum(dim=1)
@@ -827,9 +804,9 @@ class JoyImageEditPipeline(
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = max(req.sampling_params.num_outputs_per_prompt, 1)
-        true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
+        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else 4.0
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
-        do_true_cfg = true_cfg_scale > 1.0
+        do_true_cfg = guidance_scale > 1.0
 
         self._current_timestep = None
         self._interrupt = False
@@ -887,7 +864,7 @@ class JoyImageEditPipeline(
             negative_prompt_embeds_mask=negative_prompt_embeds_mask,
             timesteps=self.scheduler.timesteps,
             do_true_cfg=do_true_cfg,
-            true_cfg_scale=true_cfg_scale,
+            true_cfg_scale=guidance_scale,
             cfg_normalize=True,
         )
         if output_type == "latent" or req.is_dummy_run():
