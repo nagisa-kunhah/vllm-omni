@@ -357,7 +357,7 @@ def _run_diffusers_joy_image_edit(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
     _joy_image_edit_pipeline_cls()
     model = _model_name()
