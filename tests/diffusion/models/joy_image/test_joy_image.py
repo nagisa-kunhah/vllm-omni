@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     _should_defer_component_device_placement,
     _uses_model_level_cpu_offload,
     get_joy_image_edit_pre_process_func,
+    retrieve_timesteps,
 )
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
@@ -166,6 +167,11 @@ def _make_params(**overrides):
         "true_cfg_scale": None,
         "num_outputs_per_prompt": 1,
         "num_inference_steps": None,
+        "timesteps": None,
+        "sigmas": None,
+        "max_sequence_length": None,
+        "latents": None,
+        "output_type": None,
         "generator": None,
         "seed": None,
         "cfg_normalize": False,
@@ -1455,6 +1461,108 @@ def test_forward_uses_guidance_scale_for_cfg(params_kwargs, expected_scale):
     assert encode_calls == (["make it brighter", ""] if expected_cfg else ["make it brighter"])
     assert diffuse_calls[0]["do_true_cfg"] is expected_cfg
     assert diffuse_calls[0]["true_cfg_scale"] == expected_scale
+
+
+@pytest.mark.parametrize(
+    "schedule_kwargs, expected_timesteps",
+    [
+        ({"timesteps": torch.tensor([9, 4])}, torch.tensor([9.0, 4.0])),
+        ({"sigmas": [1.0, 0.5]}, torch.tensor([1000.0, 500.0])),
+    ],
+)
+def test_forward_uses_request_sampling_parameters(schedule_kwargs, expected_timesteps):
+    class FakeScheduler:
+        def set_timesteps(self, num_inference_steps=None, device=None, timesteps=None, sigmas=None):
+            if timesteps is not None:
+                self.timesteps = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
+            elif sigmas is not None:
+                self.timesteps = torch.as_tensor(sigmas, device=device) * 1000
+            else:
+                self.timesteps = torch.arange(num_inference_steps, device=device, dtype=torch.float32)
+
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.latent_channels = 4
+    pipeline.tokenizer_max_length = JOY_MAX_IMAGE_SEQ_LEN
+    pipeline.scheduler = FakeScheduler()
+    encode_calls = []
+    prepare_calls = []
+    diffuse_calls = []
+
+    def encode_prompt(prompt, image, **kwargs):
+        encode_calls.append(kwargs)
+        return torch.zeros(1, 3, 4), torch.ones(1, 3, dtype=torch.long)
+
+    def prepare_latents(**kwargs):
+        prepare_calls.append(kwargs)
+        reference = torch.ones(1, 1, 4, 1, 2, 2)
+        return torch.cat([reference, kwargs["latents"]], dim=1), reference
+
+    def diffuse(**kwargs):
+        diffuse_calls.append(kwargs)
+        return kwargs["latents"]
+
+    pipeline.encode_prompt = encode_prompt
+    pipeline._prepare_latents = prepare_latents
+    pipeline.diffuse = diffuse
+    pipeline._decode_latents = lambda _latents: pytest.fail("latent output must not be decoded")
+
+    request_latents = torch.full((1, 1, 4, 1, 2, 2), 3.0)
+    params = _make_params(
+        guidance_scale=1.0,
+        latents=request_latents,
+        output_type="latent",
+        max_sequence_length=123,
+        **schedule_kwargs,
+    )
+    request = _make_request(
+        prompt={
+            "prompt": "make it brighter",
+            "additional_information": {
+                "image_tensor": torch.zeros(1, 3, 1, 16, 16),
+                "prompt_image": Image.new("RGB", (16, 16)),
+                "height": 16,
+                "width": 16,
+            },
+        },
+        params=params,
+    )
+
+    output = JoyImageEditPipeline.forward(pipeline, request)
+
+    assert encode_calls[0]["max_sequence_length"] == 123
+    assert prepare_calls[0]["latents"] is request_latents
+    torch.testing.assert_close(diffuse_calls[0]["timesteps"], expected_timesteps)
+    assert diffuse_calls[0]["cfg_normalize"] is True
+    torch.testing.assert_close(output.output, request_latents[:, 0])
+
+
+def test_retrieve_timesteps_rejects_conflicting_custom_schedules():
+    scheduler = SimpleNamespace(set_timesteps=lambda **_kwargs: None)
+
+    with pytest.raises(ValueError, match="Only one"):
+        retrieve_timesteps(scheduler, timesteps=[9], sigmas=[1.0])
+
+
+def test_forward_rejects_unsupported_output_type():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    torch.nn.Module.__init__(pipeline)
+    request = _make_request(
+        prompt={
+            "prompt": "make it brighter",
+            "additional_information": {
+                "image_tensor": torch.zeros(1, 3, 1, 16, 16),
+                "prompt_image": Image.new("RGB", (16, 16)),
+                "height": 16,
+                "width": 16,
+            },
+        },
+        params=_make_params(output_type="np"),
+    )
+
+    with pytest.raises(ValueError, match="only `pil` and `latent`"):
+        JoyImageEditPipeline.forward(pipeline, request)
 
 
 def test_forward_skips_decode_for_dummy_warmup_request(monkeypatch):

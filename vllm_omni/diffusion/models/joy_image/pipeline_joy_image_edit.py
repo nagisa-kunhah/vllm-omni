@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 from collections.abc import Callable
@@ -348,6 +349,32 @@ def retrieve_latents(encoder_output: Any, generator: torch.Generator | None = No
     raise AttributeError("Could not access latents of provided VAE encoder output.")
 
 
+def retrieve_timesteps(
+    scheduler: Any,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | torch.Tensor | None = None,
+    sigmas: list[float] | None = None,
+) -> tuple[torch.Tensor, int]:
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be provided.")
+
+    parameters = inspect.signature(scheduler.set_timesteps).parameters
+    if timesteps is not None:
+        if "timesteps" not in parameters:
+            raise ValueError(f"{scheduler.__class__.__name__} does not support custom `timesteps`.")
+        scheduler.set_timesteps(timesteps=timesteps, device=device)
+    elif sigmas is not None:
+        if "sigmas" not in parameters:
+            raise ValueError(f"{scheduler.__class__.__name__} does not support custom `sigmas`.")
+        scheduler.set_timesteps(sigmas=sigmas, device=device)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device)
+
+    resolved_timesteps = scheduler.timesteps
+    return resolved_timesteps, len(resolved_timesteps)
+
+
 class JoyImageEditPipeline(
     nn.Module,
     SupportImageInput,
@@ -540,6 +567,7 @@ class JoyImageEditPipeline(
         prompt: str | list[str],
         image: PIL.Image.Image | list[PIL.Image.Image],
         dtype: torch.dtype | None = None,
+        max_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dtype = dtype or self.text_encoder.dtype
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
@@ -558,7 +586,7 @@ class JoyImageEditPipeline(
         split_hidden_states = [item[self.prompt_template_encode_start_idx :] for item in split_hidden_states]
         prompt_embeds, prompt_mask = self._pad_prompt_embeds(
             split_hidden_states,
-            self.tokenizer_max_length,
+            self.tokenizer_max_length if max_sequence_length is None else max_sequence_length,
         )
         return prompt_embeds.to(dtype=dtype, device=self.device), prompt_mask.to(device=self.device)
 
@@ -599,6 +627,7 @@ class JoyImageEditPipeline(
         num_images_per_prompt: int,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
+        max_sequence_length: int | None = None,
         embeds_name: str = "prompt_embeds",
         mask_name: str = "prompt_embeds_mask",
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -607,6 +636,7 @@ class JoyImageEditPipeline(
             prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
                 prompt_list,
                 image,
+                max_sequence_length=max_sequence_length,
             )
         if prompt_embeds_mask is None:
             raise ValueError(f"{mask_name} must be provided with {embeds_name}.")
@@ -616,6 +646,11 @@ class JoyImageEditPipeline(
             embeds_name=embeds_name,
             mask_name=mask_name,
         )
+        if max_sequence_length is not None:
+            if max_sequence_length <= 0:
+                raise ValueError("max_sequence_length must be greater than 0.")
+            prompt_embeds = prompt_embeds[:, -max_sequence_length:]
+            prompt_embeds_mask = prompt_embeds_mask[:, -max_sequence_length:]
         prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
         prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
         return prompt_embeds, prompt_embeds_mask
@@ -803,9 +838,21 @@ class JoyImageEditPipeline(
             raise ValueError("JoyImageEditPipeline requires preprocessed image information in the request.")
 
         num_inference_steps = req.sampling_params.num_inference_steps or 50
+        timesteps = req.sampling_params.timesteps
+        sigmas = req.sampling_params.sigmas
+        tokenizer_max_length = getattr(self, "tokenizer_max_length", JOY_MAX_IMAGE_SEQ_LEN)
+        max_sequence_length = (
+            tokenizer_max_length
+            if req.sampling_params.max_sequence_length is None
+            else req.sampling_params.max_sequence_length
+        )
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = max(req.sampling_params.num_outputs_per_prompt, 1)
         true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
+        latents = req.sampling_params.latents if req.sampling_params.latents is not None else latents
+        output_type = req.sampling_params.output_type or output_type or "pil"
+        if output_type not in {"pil", "latent"}:
+            raise ValueError("JoyImageEditPipeline supports only `pil` and `latent` output types.")
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
         do_true_cfg = true_cfg_scale > 1.0
 
@@ -820,6 +867,7 @@ class JoyImageEditPipeline(
             num_images_per_prompt=num_images_per_prompt,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
+            max_sequence_length=max_sequence_length,
         )
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
@@ -828,6 +876,7 @@ class JoyImageEditPipeline(
                 num_images_per_prompt=num_images_per_prompt,
                 prompt_embeds=negative_prompt_embeds,
                 prompt_embeds_mask=negative_prompt_embeds_mask,
+                max_sequence_length=max_sequence_length,
                 embeds_name="negative_prompt_embeds",
                 mask_name="negative_prompt_embeds_mask",
             )
@@ -853,7 +902,13 @@ class JoyImageEditPipeline(
             latents=latents,
         )
         # Step 4: build the scheduler timestep/sigma schedule.
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps, _ = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            timesteps=timesteps,
+            sigmas=sigmas,
+        )
         # Step 5: run the DiT denoising loop. The reference image latents stay
         # fixed while the target noise latent is updated each scheduler step.
         latents = self.diffuse(
@@ -863,9 +918,10 @@ class JoyImageEditPipeline(
             prompt_embeds_mask=prompt_embeds_mask,
             negative_prompt_embeds=negative_prompt_embeds,
             negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-            timesteps=self.scheduler.timesteps,
+            timesteps=timesteps,
             do_true_cfg=do_true_cfg,
             true_cfg_scale=true_cfg_scale,
+            # JoyImage's upstream pipeline always applies CFG norm rescaling.
             cfg_normalize=True,
         )
         if output_type == "latent" or req.is_dummy_run():
