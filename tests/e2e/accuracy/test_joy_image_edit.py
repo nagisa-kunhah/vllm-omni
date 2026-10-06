@@ -42,8 +42,6 @@ SERVER_ARGS = [
     "--num-gpus",
     "1",
     "--enforce-eager",
-    "--stage-init-timeout",
-    "900",
     "--init-timeout",
     "1200",
 ]

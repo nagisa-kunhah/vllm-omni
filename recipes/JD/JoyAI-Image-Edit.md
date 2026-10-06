@@ -63,8 +63,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 vllm serve jdopensource/JoyAI-Image-Edit-Diffusers \
   --omni \
   --port 8092 \
-  --init-timeout 1200 \
-  --stage-init-timeout 900
+  --init-timeout 1200
 ```
 
 The server is ready when the log shows `Application startup complete.`
@@ -81,7 +80,6 @@ vllm serve jdopensource/JoyAI-Image-Edit-Diffusers \
   --omni \
   --port 8092 \
   --init-timeout 1200 \
-  --stage-init-timeout 900 \
   --enable-cpu-offload
 ```
 
@@ -93,7 +91,6 @@ vllm serve jdopensource/JoyAI-Image-Edit-Diffusers \
   --omni \
   --port 8092 \
   --init-timeout 1200 \
-  --stage-init-timeout 900 \
   --enable-layerwise-offload
 ```
 
@@ -159,7 +156,6 @@ python examples/offline_inference/image_to_image/image_edit.py \
   --seed 0 \
   --enforce-eager \
   --init-timeout 1200 \
-  --stage-init-timeout 900 \
   --output /tmp/joyai_image_edit_plate_offline.png
 ```
 

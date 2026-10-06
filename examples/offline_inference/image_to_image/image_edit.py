@@ -537,6 +537,12 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Overall pipeline initialization timeout in seconds.",
+    )
     return parser.parse_args()
 
 
@@ -608,7 +614,6 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
         init_timeout=args.init_timeout,
-        stage_init_timeout=args.stage_init_timeout,
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
