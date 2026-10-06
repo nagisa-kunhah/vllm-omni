@@ -804,9 +804,9 @@ class JoyImageEditPipeline(
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = max(req.sampling_params.num_outputs_per_prompt, 1)
-        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else 4.0
+        true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
-        do_true_cfg = guidance_scale > 1.0
+        do_true_cfg = true_cfg_scale > 1.0
 
         self._current_timestep = None
         self._interrupt = False
@@ -864,7 +864,7 @@ class JoyImageEditPipeline(
             negative_prompt_embeds_mask=negative_prompt_embeds_mask,
             timesteps=self.scheduler.timesteps,
             do_true_cfg=do_true_cfg,
-            true_cfg_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
             cfg_normalize=True,
         )
         if output_type == "latent" or req.is_dummy_run():
@@ -876,3 +876,21 @@ class JoyImageEditPipeline(
 
     def load_weights(self, weights):
         return AutoWeightsLoader(self).load_weights(weights)
+
+    @staticmethod
+    def resolve_effective_true_cfg_scale(
+        req: OmniDiffusionRequest,
+        default_true_cfg_scale: float = 4.0,
+    ) -> float:
+        sampling_params = req.sampling_params
+        true_cfg_scale = sampling_params.true_cfg_scale
+        guidance_scale = sampling_params.guidance_scale
+        guidance_provided = sampling_params.guidance_scale_provided
+        if true_cfg_scale is None:
+            return float(guidance_scale if guidance_provided else default_true_cfg_scale)
+        if guidance_provided and not math.isclose(float(guidance_scale), float(true_cfg_scale)):
+            raise ValueError(
+                "JoyAI-Image-Edit treats `guidance_scale` as a compatibility alias for "
+                "`true_cfg_scale`. Provide only one value, or provide matching values."
+            )
+        return float(true_cfg_scale)

@@ -196,13 +196,13 @@ denoising.
 #### Guidance Parameters
 
 Use `guidance_scale` for JoyAI classifier-free guidance, matching Diffusers.
-The pipeline defaults to `4.0` when the parameter is omitted. Values greater
-than `1.0` enable CFG; an omitted negative prompt is treated as an empty string.
-Values at or below `1.0` disable CFG.
+The pipeline defaults to `4.0` when the parameter is omitted. `true_cfg_scale`
+remains supported as an alias; if both parameters are supplied, their values
+must match. Values greater than `1.0` enable CFG; an omitted negative prompt is
+treated as an empty string. Values at or below `1.0` disable CFG.
 
 For the offline example, pass `--guidance-scale 4.0` explicitly: the shared
-`image_edit.py` CLI defaults to `1.0`. JoyAI does not use `true_cfg_scale` or
-`--cfg-scale` to control guidance.
+`image_edit.py` CLI defaults to `1.0`.
 
 #### Known Limitations
 

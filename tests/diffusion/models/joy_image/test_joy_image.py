@@ -245,6 +245,12 @@ class _TinyJoyLayerwisePipeline(torch.nn.Module):
             torch.ones(1, 5, dtype=torch.long, device=self.device),
         )
 
+    def resolve_effective_true_cfg_scale(self, req, default_true_cfg_scale=4.0):
+        return JoyImageEditPipeline.resolve_effective_true_cfg_scale(
+            req,
+            default_true_cfg_scale=default_true_cfg_scale,
+        )
+
     def _prepare_latents(self, **kwargs):
         latents = torch.randn(1, 2, 4, 1, 4, 4, device=self.device, dtype=torch.bfloat16)
         return latents, latents[:, :1].clone()
@@ -750,6 +756,27 @@ def test_preprocess_maps_explicit_size_to_nearest_diffusers_bucket(tmp_path):
 
     assert request.sampling_params.height == 1024
     assert request.sampling_params.width == 1024
+
+
+@pytest.mark.parametrize(
+    "params_kwargs, expected_scale",
+    [
+        ({}, 4.0),
+        ({"guidance_scale": 3.5}, 3.5),
+        ({"true_cfg_scale": 4.0}, 4.0),
+        ({"guidance_scale": 4.0, "true_cfg_scale": 4.0}, 4.0),
+    ],
+)
+def test_resolve_effective_true_cfg_scale(params_kwargs, expected_scale):
+    request = _make_request(params=_make_params(**params_kwargs))
+    assert JoyImageEditPipeline.resolve_effective_true_cfg_scale(request) == expected_scale
+
+
+@pytest.mark.parametrize("guidance_scale", [1.0, 3.0])
+def test_explicit_guidance_scale_conflicts_with_true_cfg_scale(guidance_scale):
+    request = _make_request(params=_make_params(guidance_scale=guidance_scale, true_cfg_scale=4.0))
+    with pytest.raises(ValueError, match="compatibility alias"):
+        JoyImageEditPipeline.resolve_effective_true_cfg_scale(request)
 
 
 def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
@@ -1348,8 +1375,7 @@ def test_diffuse_restores_reference_slots_each_step():
         ({"guidance_scale": 2.0}, 2.0),
         ({"guidance_scale": 1.0}, 1.0),
         ({"guidance_scale": 0.0}, 0.0),
-        ({"true_cfg_scale": 8.0}, 4.0),
-        ({"guidance_scale": 2.0, "true_cfg_scale": 8.0}, 2.0),
+        ({"true_cfg_scale": 8.0}, 8.0),
     ],
 )
 def test_forward_uses_guidance_scale_for_cfg(params_kwargs, expected_scale):

@@ -87,7 +87,9 @@ curl -s http://localhost:8092/v1/chat/completions \
 ```
 
 For JoyAI-Image-Edit, set classifier-free guidance with `guidance_scale`
-in `extra_body` (default: `4.0`). Values at or below `1.0` disable CFG.
+in `extra_body` (default: `4.0`). `true_cfg_scale` remains supported as an
+alias; if both are provided, their values must match. Values at or below `1.0`
+disable CFG.
 
 ### Method 2: Using OpenAI Python SDK
 
