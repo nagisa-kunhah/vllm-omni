@@ -1022,6 +1022,31 @@ def test_prepare_latents_casts_vae_encoded_latents_to_requested_dtype():
     assert image_latents.dtype == torch.bfloat16
 
 
+def test_prepare_latents_prepares_offloaded_vae_before_encode():
+    pipeline = object.__new__(JoyImageEditPipeline)
+    pipeline.vae_scale_factor = 8
+    calls = []
+    pipeline._prepare_vae_for_decode = lambda: calls.append("prepare")
+
+    def encode(image, generator):
+        calls.append("encode")
+        return torch.zeros(1, 4, 1, 2, 2, device=image.device, dtype=image.dtype)
+
+    pipeline._encode_vae_image = encode
+    pipeline._prepare_latents(
+        image=torch.zeros(1, 3, 1, 16, 16),
+        batch_size=1,
+        num_channels_latents=4,
+        height=16,
+        width=16,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=None,
+    )
+
+    assert calls == ["prepare", "encode"]
+
+
 def test_encode_vae_image_does_not_forward_noise_generator_to_posterior_sample():
     class FakeLatentDist:
         def __init__(self):

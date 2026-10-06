@@ -680,6 +680,7 @@ class JoyImageEditPipeline(
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(f"Generator list length {len(generator)} must match effective batch size {batch_size}.")
 
+        self._prepare_vae_for_decode()
         image = image.to(device=device, dtype=dtype)
         image_latents = self._encode_vae_image(image, generator)
         image_latents = image_latents.to(device=device, dtype=dtype)
