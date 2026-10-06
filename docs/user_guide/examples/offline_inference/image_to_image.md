@@ -44,7 +44,8 @@ python image_edit.py \
   --output output_joyai_edit.png
 ```
 
-Set `--guidance-scale` explicitly for JoyAI; the shared CLI defaults to `1.0`, which disables CFG.
+JoyAI defaults to guidance scale `4.0`; pass `--guidance-scale` explicitly when
+you need a different value.
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 

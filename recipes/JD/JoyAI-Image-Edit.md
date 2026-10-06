@@ -201,8 +201,8 @@ remains supported as an alias; if both parameters are supplied, their values
 must match. Values greater than `1.0` enable CFG; an omitted negative prompt is
 treated as an empty string. Values at or below `1.0` disable CFG.
 
-For the offline example, pass `--guidance-scale 4.0` explicitly: the shared
-`image_edit.py` CLI defaults to `1.0`.
+The offline example passes `--guidance-scale 4.0` explicitly for clarity; if it
+is omitted, the JoyAI pipeline uses the same `4.0` default.
 
 #### Known Limitations
 

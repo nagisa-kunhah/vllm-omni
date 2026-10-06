@@ -284,9 +284,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfg-scale",
         type=float,
-        default=4.0,
+        default=None,
         help=(
-            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "True classifier-free guidance scale. When omitted, the pipeline uses its model-specific default. "
+            "Guidance scale as defined in Classifier-Free "
             "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
             "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
             "usually at the expense of lower image quality."
@@ -295,9 +296,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
+            "Guidance scale for guidance-distilled models. When omitted, the pipeline uses its model-specific default. "
             "Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale "
             "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
         ),
