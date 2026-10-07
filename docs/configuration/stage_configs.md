@@ -35,7 +35,7 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
-| `engine_output_type` | Runtime output representation such as `text`, `latent`, or `audio`. |
+| `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
 | `async_chunk_process_next_stage_input_func` | Processor used for async chunk handoff. |
@@ -44,6 +44,50 @@ Common `StagePipelineConfig` fields include:
 To add or change topology, define and register a new pipeline variant. Use
 deploy YAML only for runtime placement, resource sizing, connectors, and other
 deployment overrides.
+
+### Engine output types
+
+`engine_output_type` is parsed when the LLM stage's output processor is built
+during service initialization. Invalid values fail startup before requests
+are accepted; engine replicas may already have been initialized at that point
+and are cleaned up on failure.
+
+Use the exact lowercase names listed above. Combinations such as `text+audio`
+or `text,audio` remain supported, with every component canonical. Omitted or
+`None` values retain the default behavior (`TEXT` in the output processor).
+Empty strings, whitespace, case variants, and aliases are rejected.
+
+For existing custom pipelines or direct callers, replace old aliases explicitly:
+
+| Old value | Canonical value |
+| ------- | ------- |
+| `speech`, `wav`, `waveform` | `audio` |
+| `images`, `pixel_values`, `pixels` | `image` |
+| `latents` | `latent` |
+| `tokens` | `text` for text output, or `token_ids` for discrete IDs |
+
+`token_ids` is a separate type, not a `text` alias. It describes discrete
+vocabulary or codebook indices, distinct from continuous latent representations.
+Existing models using `latent` retain their historical payload contracts.
+GLM-Image's AR stage keeps `engine_output_type="token_ids"`; generated IDs still
+travel through `cumulative_token_ids`, and source-image IDs through
+`ids.prior_image`.
+
+Bare primary tensors and generic producer keys (`model_outputs` or `hidden`)
+use the declared type as their default output key, including `token_ids`.
+The normalizer does not inspect or convert their dtype. Distinct auxiliary
+outputs must use explicit field names: `model_outputs` and `hidden` both map
+to the same default key and must not represent two independent outputs.
+GLM-Image disables auxiliary hidden output for its default GPU execution.
+Some runner paths still attach it; that field is then named `token_ids` even
+though it contains hidden states. The GLM-Image bridge ignores this auxiliary
+field and reads generated IDs from `cumulative_token_ids` instead.
+
+Token-ID tensors use the existing dimension-0 accumulation default, subject to
+registered per-key overrides, and remain available after DELTA emissions.
+This is separate from the existing accumulation of `cumulative_token_ids`.
+`final_output_type` and Diffusion's `output_type` are separate settings and are
+unchanged by these rules.
 
 ## Deploy configuration schema
 
@@ -554,8 +598,9 @@ the intended GPU, and warm the complete pipeline before measuring performance.
 
 ## MOSS-TTS Local 1.5 with Model Runner V2
 
-`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` can opt into CUDA MRV2 using
-the shared runtime introduced for Qwen3-TTS:
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` defaults to CUDA MRV2 using
+the shared runtime introduced for Qwen3-TTS. To select the C64 profile without
+MPS explicitly:
 
 ```bash
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
@@ -563,7 +608,7 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
 ```
 
 This profile inherits the batching, codec graph buckets and 1-frame/15-frame
-chunk geometry from `moss_tts_local.yaml`, and selects V2 for both the Local
+chunk geometry from `moss_tts_local_v1.yaml`, and selects V2 for both the Local
 Talker and codec stages. The Local depth predictor exposes the MRV2 `mtp`
 capabilities while retaining its V1 `talker_mtp` implementation, sampling
 defaults and explicit request-seed handling. Codec chunks use the native data
@@ -587,8 +632,12 @@ guarantee that 128 maximum-length prompts fit simultaneously. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-mrv2-and-slot-attention)
 for activation, backend comparisons, memory requirements and benchmark commands.
 
-Omitting `--deploy-config`, or selecting `moss_tts_local.yaml`, retains V1.
-NPU, XPU, ROCm and MUSA overrides also retain V1. This profile does not enable
+Omitting `--deploy-config` selects the C128 system profile on CUDA GPUs with
+at least 140 GiB memory and MPS available. Smaller GPUs or a failed memory
+query use C64 with utilization-based memory budgets; missing MPS selects
+C64 without MPS. Selecting `moss_tts_local.yaml` explicitly uses C64 with MPS.
+Use `moss_tts_local_v1.yaml` for the previous V1 deployment.
+NPU, XPU, ROCm and MUSA overrides retain V1. These profiles do not enable
 MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 outputs 48 kHz stereo audio;
 set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2` when benchmarking raw PCM.
@@ -596,5 +645,5 @@ set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 Event-driven orchestration remains independently selectable with
 `VLLM_OMNI_EVENT_DRIVEN_ORCH=0` or `1`. Keep the runner and deployment identical
 when comparing these modes. Model-runner selection does not change the
-orchestration default or enable experimental reference encoding, chunk ramps,
-generation-output draining or MPS.
+orchestration default. MPS, codec dispatch and graph settings belong to the
+deployment profile; the automatic CUDA default selects MPS when available.

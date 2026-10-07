@@ -28,7 +28,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -42,7 +41,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
@@ -696,7 +695,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         ]
 
 
-class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3DummyInputsBuilder(OmniDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "Hello, this is a test of the CosyVoice3 system capability."
 
@@ -744,6 +743,13 @@ class CosyVoice3Model(
     supports_embed_input_ids_query_start_loc = True
     prefer_model_sampler = True
     _sampling_eps = 1e-5
+
+    @property
+    def owns_generation_output_storage(self) -> bool:
+        """Expose the codec's ownership contract on the model seen by the runner."""
+        return self.model_stage == "cosyvoice3_code2wav" and (
+            getattr(self.code2wav, "owns_generation_output_storage", False) is True
+        )
 
     @property
     def logits_vocab_size(self) -> int | None:
