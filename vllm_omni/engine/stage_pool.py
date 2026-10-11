@@ -571,6 +571,29 @@ class StagePool:
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
 
+    def bind_replica(self, request_id: str, replica_id: int) -> int:
+        """Bind an explicit local target without failover or advancing round robin."""
+        if self.is_distributed:
+            raise StageUnavailableError("Explicit pipeline routes require local stage pools")
+        bound = self.get_bound_replica_id(request_id)
+        if bound is not None and bound != replica_id:
+            raise StageUnavailableError(
+                f"Request {request_id} is already bound to stage-{self.stage_id} replica-{bound}"
+            )
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(f"Stage-{self.stage_id} replica-{replica_id} is unavailable")
+        self._request_bindings[request_id] = replica_id
+        return replica_id
+
+    def _route_target(self, req_state: OrchestratorRequestState, explicit: int | None = None) -> int | None:
+        route = getattr(req_state, "pipeline_route", None)
+        if route is None:
+            return explicit
+        target = route.stage_replica_ids[self.stage_id]
+        if explicit is not None and explicit != target:
+            raise StageUnavailableError("Explicit replica conflicts with the request's pipeline route")
+        return target
+
     def select_replica_id(
         self,
         request_id: str,
@@ -995,8 +1018,10 @@ class StagePool:
         affinity_request_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
+        target_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        target_replica_id = self._route_target(req_state, target_replica_id)
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1011,17 +1036,23 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            replica_id = await self._pick_or_select(
-                request_id,
-                affinity_request_id=affinity_request_id,
+            replica_id = (
+                self.bind_replica(request_id, target_replica_id)
+                if target_replica_id is not None
+                else await self._pick_or_select(request_id, affinity_request_id=affinity_request_id)
             )
             client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            try:
+                await client.add_request_async(request_id, request, params, **submit_kwargs)
+            except Exception:
+                self.release_binding(request_id)
+                raise
             return replica_id
 
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
+        replica_id = (
+            self.bind_replica(request_id, target_replica_id)
+            if target_replica_id is not None
+            else await self._pick_or_select(request_id, affinity_request_id=affinity_request_id)
         )
         client = self.clients[replica_id]
         if client is None:
@@ -1070,7 +1101,10 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
+        target = self._route_target(req_state)
+        replica_id = (
+            self.bind_replica(request_id, target) if target is not None else self.get_bound_replica_id(request_id)
+        )
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
 

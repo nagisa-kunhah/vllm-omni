@@ -8,6 +8,7 @@ import functools
 import re
 import warnings
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -403,8 +404,9 @@ class StageDeployConfig:
     # Stage identity and Omni runtime placement.
     stage_id: int
     devices: str | None = None
-    num_replicas: int = 1
+    num_replicas: int | None = None
     env: dict[str, Any] | None = None
+    explicit_placement_fields: frozenset[str] = field(default_factory=frozenset, repr=False, compare=False)
 
     # False opts this stage out of pipeline-wide async chunking.
     async_chunk: bool | None = None
@@ -528,6 +530,12 @@ class StageDeployConfig:
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.num_replicas is None:
+            self.num_replicas = 1
+        else:
+            self.explicit_placement_fields = self.explicit_placement_fields | {"num_replicas"}
+
 
 @dataclass(frozen=True)
 class DuplexSessionRuntimeConfig:
@@ -583,6 +591,32 @@ class DuplexSessionRuntimeConfig:
                 raise ValueError(f"duplex_session.{name} must be positive")
 
 
+@dataclass(frozen=True)
+class PipelineDeploymentConfig:
+    """Pipeline-wide placement of one local single-GPU replica per device."""
+
+    mode: Literal["colocated_replicas"]
+    devices: str
+    num_replicas: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode != "colocated_replicas":
+            raise ValueError("pipeline_deployment.mode must be 'colocated_replicas'")
+        if not isinstance(self.devices, str):
+            raise ValueError("pipeline_deployment.devices must be a comma-separated string")
+        parts = [part.strip() for part in self.devices.split(",")]
+        if not parts or any(not part.isdecimal() or not part.isascii() for part in parts):
+            raise ValueError("pipeline_deployment.devices must contain nonnegative logical device indices")
+        indices = [int(part) for part in parts]
+        if len(indices) != len(set(indices)):
+            raise ValueError("pipeline_deployment.devices contains duplicate device indices")
+        count = self.num_replicas
+        if count is not None and (type(count) is not int or count <= 0 or count != len(indices)):
+            raise ValueError("pipeline_deployment.num_replicas must be positive and equal the device count")
+        object.__setattr__(self, "devices", ",".join(str(index) for index in indices))
+        object.__setattr__(self, "num_replicas", len(indices))
+
+
 @dataclass
 class DeployConfig:
     """Loaded from deploy/<model>.yaml — the only config file users edit.
@@ -608,6 +642,7 @@ class DeployConfig:
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
+    pipeline_deployment: PipelineDeploymentConfig | None = None
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
@@ -632,6 +667,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "devices",
         "num_replicas",
         "env",
+        "explicit_placement_fields",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -698,8 +734,13 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
-        "num_replicas": int(num_replicas),
+        "num_replicas": int(num_replicas) if "num_replicas" in stage_data or "num_replicas" in runtime_cfg else None,
         "env": env,
+        "explicit_placement_fields": frozenset(
+            name
+            for name in ("devices", "num_replicas")
+            if name in stage_data or name in runtime_cfg or name in (stage_data.get("engine_args") or {})
+        ),
     }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in flat_args:
@@ -850,6 +891,19 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
+    pipeline_deployment_data = raw_dict.get("pipeline_deployment")
+    if pipeline_deployment_data is not None and not isinstance(pipeline_deployment_data, Mapping):
+        raise ValueError("pipeline_deployment must be a mapping")
+    if pipeline_deployment_data is not None:
+        unknown = set(pipeline_deployment_data) - {"mode", "devices", "num_replicas"}
+        if unknown:
+            raise ValueError(f"Unknown pipeline_deployment fields: {', '.join(sorted(unknown))}")
+        try:
+            pipeline_deployment = PipelineDeploymentConfig(**pipeline_deployment_data)
+        except TypeError as exc:
+            raise ValueError(f"Invalid pipeline_deployment: {exc}") from exc
+    else:
+        pipeline_deployment = None
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):
@@ -869,6 +923,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
+        "pipeline_deployment": pipeline_deployment,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
     }
@@ -1244,11 +1299,113 @@ def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployCon
                 )
 
 
+def resolve_pipeline_deployment(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    *,
+    cli_overrides: Mapping[str, Any] | None = None,
+    strategy_specs: Mapping[Any, Any] | None = None,
+) -> DeployConfig:
+    """Validate and expand pipeline-wide placement into an owned deploy copy."""
+    placement = deploy.pipeline_deployment
+    if placement is None:
+        return deploy
+    if strategy_specs is not None:
+        raise ValueError("pipeline_deployment cannot be combined with strategy_specs")
+    if deploy.session_mode != "turn":
+        raise ValueError("pipeline_deployment requires session_mode='turn'")
+    if cli_overrides and cli_overrides.get("session_mode") not in (None, "turn"):
+        raise ValueError("pipeline_deployment requires session_mode='turn'")
+    if deploy.async_chunk is True or (cli_overrides and cli_overrides.get("async_chunk") is True):
+        raise ValueError("pipeline_deployment requires async_chunk=False")
+
+    def reject_stage_placement(stage_id: int, names: set[str]) -> None:
+        if names:
+            raise ValueError(
+                f"pipeline_deployment conflicts with explicit stage {stage_id} placement: {', '.join(sorted(names))}"
+            )
+
+    for stage in deploy.stages:
+        names = set(stage.explicit_placement_fields)
+        if stage.devices is not None:
+            names.add("devices")
+        if stage.num_replicas != 1:
+            names.add("num_replicas")
+        if isinstance(stage.env, Mapping) and "CUDA_VISIBLE_DEVICES" in stage.env:
+            names.add("env.CUDA_VISIBLE_DEVICES")
+        reject_stage_placement(stage.stage_id, names)
+
+    for section in (deploy.platforms or {}).values():
+        for stage in section.get("stages", []):
+            runtime = stage.get("runtime") or {}
+            engine = stage.get("engine_args") or {}
+            names = {name for name in ("devices", "num_replicas") if name in stage or name in runtime or name in engine}
+            env = runtime.get("env", stage.get("env"))
+            if isinstance(env, Mapping) and "CUDA_VISIBLE_DEVICES" in env:
+                names.add("env.CUDA_VISIBLE_DEVICES")
+            reject_stage_placement(stage["stage_id"], names)
+
+    for key, value in (cli_overrides or {}).items():
+        if value is None:
+            continue
+        match = _STAGE_OVERRIDE_PATTERN.match(key)
+        name = match.group(2) if match else key
+        if name in {"devices", "num_replicas"} or (
+            name == "env" and isinstance(value, Mapping) and "CUDA_VISIBLE_DEVICES" in value
+        ):
+            raise ValueError(f"pipeline_deployment conflicts with explicit CLI placement: {key}")
+
+    resolved = deepcopy(deploy)
+    resolved.async_chunk = False
+    by_id = {stage.stage_id: stage for stage in resolved.stages}
+    for topology in pipeline.stages:
+        stage = by_id.get(topology.stage_id)
+        if stage is None:
+            stage = StageDeployConfig(stage_id=topology.stage_id)
+            resolved.stages.append(stage)
+        stage.devices = placement.devices
+        stage.num_replicas = placement.num_replicas
+    return resolved
+
+
+def validate_pipeline_deployment_stages(stages: list[StageConfig]) -> None:
+    """Check effective legacy engine parallel settings after CLI overrides."""
+    dimensions = (
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "pipeline_parallel_size",
+        "ulysses_degree",
+        "ring_degree",
+        "allgather_degree",
+        "cfg_parallel_size",
+        "hsdp_replicate_size",
+    )
+    for stage in stages:
+        engine = stage.yaml_engine_args
+        overrides = stage.runtime_overrides
+        nested = dict(engine.get("parallel_config") or {})
+        nested.update(overrides.get("parallel_config") or {})
+        for name in dimensions:
+            value = overrides.get(name, nested.get(name, engine.get(name, 1)))
+            if value is not None and int(value) != 1:
+                raise ValueError(
+                    f"pipeline_deployment requires one GPU per stage replica; stage {stage.stage_id} has {name}={value}"
+                )
+        if nested.get("use_hsdp", engine.get("use_hsdp", False)):
+            raise ValueError(
+                f"pipeline_deployment requires one GPU per stage replica; stage {stage.stage_id} uses HSDP"
+            )
+
+
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
+    *,
+    cli_overrides: Mapping[str, Any] | None = None,
+    strategy_specs: Mapping[Any, Any] | None = None,
 ) -> list[StageConfig]:
     """Merge pipeline + deploy + platform overrides → list[StageConfig]."""
+    deploy = resolve_pipeline_deployment(pipeline, deploy, cli_overrides=cli_overrides, strategy_specs=strategy_specs)
     deploy = _apply_platform_overrides(deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
@@ -1307,6 +1464,8 @@ def merge_pipeline_deploy(
                 yaml_extras=extras,
             )
         )
+    if deploy.pipeline_deployment is not None:
+        validate_pipeline_deployment_stages(result)
     return result
 
 

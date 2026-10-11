@@ -195,6 +195,8 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         request_id: str,
         prompt: Any,
+        *,
+        target_replica_id: int | None = None,
     ) -> int | None:
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
@@ -210,7 +212,9 @@ class AsyncOmniEngine(OmniEngineBase):
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
             return None
 
-        if self._stage_pool_is_distributed(stage0_pool):
+        if target_replica_id is not None:
+            replica_id = stage0_pool.bind_replica(request_id, target_replica_id)
+        elif self._stage_pool_is_distributed(stage0_pool):
             preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
             if not callable(preselect_replica_id):
                 logger.debug(
@@ -276,6 +280,11 @@ class AsyncOmniEngine(OmniEngineBase):
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
         params = effective_sampling_params_list[0]
+        pipeline_route = None
+        if self._pipeline_router is not None:
+            if resumable or message_type != "add_request":
+                raise ValueError("Pipeline deployment does not support resumable or streaming-update requests")
+            pipeline_route = self._pipeline_router.select()
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
@@ -329,6 +338,7 @@ class AsyncOmniEngine(OmniEngineBase):
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
+                **({"target_replica_id": pipeline_route.stage_replica_ids[0]} if pipeline_route is not None else {}),
             )
 
             # Full input processing (tokenization, multimodal, etc.)
@@ -396,6 +406,7 @@ class AsyncOmniEngine(OmniEngineBase):
         return StageSubmissionMessage(
             type=message_type,
             request_id=request_id,
+            pipeline_replica_id=pipeline_route.pipeline_replica_id if pipeline_route is not None else None,
             prompt=prompt,
             original_prompt=original_prompt,
             output_prompt_text=output_prompt_text,
@@ -552,6 +563,8 @@ class AsyncOmniEngine(OmniEngineBase):
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
         except BaseException:
+            if self._pipeline_router is not None:
+                self.stage_pools[0].release_binding(request_id)
             if isinstance(prompt, dict):
                 for artifact_dir in prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None) or ():
                     if isinstance(artifact_dir, str):
@@ -575,6 +588,8 @@ class AsyncOmniEngine(OmniEngineBase):
 
             self.request_queue.sync_q.put(msg)
         except BaseException:
+            if self._pipeline_router is not None:
+                self.stage_pools[0].release_binding(request_id)
             for artifact_dir in msg.request_artifact_dirs or ():
                 shutil.rmtree(artifact_dir, ignore_errors=True)
             raise

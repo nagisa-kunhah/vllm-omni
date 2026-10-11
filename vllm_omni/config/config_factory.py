@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     normalize_pipeline_cli_overrides,
+    validate_pipeline_deployment_stages,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
@@ -514,7 +515,9 @@ class StageConfigFactory:
 
         pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
 
-        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg)
+        stages = merge_pipeline_deploy(
+            pipeline_cfg, deploy_cfg, cli_overrides=cli_overrides, strategy_specs=strategy_specs
+        )
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)
@@ -523,6 +526,9 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+
+        if deploy_cfg.pipeline_deployment is not None:
+            validate_pipeline_deployment_stages(stages)
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)

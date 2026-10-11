@@ -59,6 +59,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+from vllm_omni.engine.pipeline_router import PipelineReplicaRoute, PipelineReplicaRouter
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
@@ -200,6 +201,7 @@ class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
 
     request_id: str
+    pipeline_route: PipelineReplicaRoute | None = None
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
@@ -320,6 +322,7 @@ class OrchestratorBase:
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
         event_driven_orch_default: bool = False,
+        pipeline_router: PipelineReplicaRouter | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -328,6 +331,7 @@ class OrchestratorBase:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self.pipeline_router = pipeline_router
         self.log_stats = log_stats
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
@@ -1432,15 +1436,25 @@ class OrchestratorBase:
             replica_id,
             error,
         )
+        if self.pipeline_router is not None:
+            self.pipeline_router.mark_unavailable(stage_id, replica_id)
         pool.evict_replica(replica_id)
         self._remove_stage_replica_waiting(stage_id, replica_id)
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
-            if stage_id not in req_state.stage_submit_ts:
-                continue
-            bound = pool.get_bound_replica_id(req_id)
-            if bound == replica_id or not stage_has_live:
+            route = req_state.pipeline_route
+            if route is not None:
+                failed = (
+                    stage_id <= req_state.final_stage_id
+                    and stage_id not in req_state.finished_stage_ids
+                    and route.stage_replica_ids[stage_id] == replica_id
+                )
+            else:
+                if stage_id not in req_state.stage_submit_ts:
+                    continue
+                failed = pool.get_bound_replica_id(req_id) == replica_id or not stage_has_live
+            if failed:
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error=str(error),
@@ -2290,6 +2304,12 @@ class OrchestratorBase:
             await self._fail_request_dead_stage(req_id, next_logical)
             return
         next_client = next_pool.stage_client
+        if req_state.pipeline_route is not None:
+            target = req_state.pipeline_route.stage_replica_ids[next_logical]
+            if not next_pool.is_replica_available(target):
+                await self._fail_request_dead_stage(req_id, next_logical)
+                return
+            next_client = next_pool.clients[target]
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
@@ -2958,6 +2978,18 @@ class Orchestrator(OrchestratorBase):
         """Handle an add_request message from the main thread."""
         stage_id = 0
         request_id = msg.request_id
+        pipeline_route = None
+        if self.pipeline_router is not None:
+            if msg.pipeline_replica_id is None:
+                cleanup_request_artifact_dirs(set(msg.request_artifact_dirs or ()))
+                await self._fail_request_client_error(request_id, stage_id, "Missing pipeline route at admission")
+                return
+            try:
+                pipeline_route = self.pipeline_router.get_route(msg.pipeline_replica_id)
+            except ValueError as exc:
+                cleanup_request_artifact_dirs(set(msg.request_artifact_dirs or ()))
+                await self._fail_request_client_error(request_id, stage_id, str(exc))
+                return
         prompt = msg.prompt
         original_prompt = msg.original_prompt
         sampling_params_list = msg.sampling_params_list
@@ -2966,7 +2998,7 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
-        if not self.stage_pools[stage_id].live_replica_ids():
+        if pipeline_route is None and not self.stage_pools[stage_id].live_replica_ids():
             # Stage 0 lost all replicas between the HTTP-layer errored check and
             # dispatch. Runs before request state / running counter registration,
             # so the helper's cleanup is a no-op here.
@@ -3001,6 +3033,7 @@ class Orchestrator(OrchestratorBase):
 
         req_state = OrchestratorRequestState(
             request_id=request_id,
+            pipeline_route=pipeline_route,
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
@@ -3010,6 +3043,15 @@ class Orchestrator(OrchestratorBase):
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
+        if pipeline_route is not None and not self.pipeline_router.is_route_available(pipeline_route):
+            await self._fail_request_client_error(
+                request_id,
+                stage_id,
+                "Selected pipeline replica became unavailable before admission",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                error_type="PipelineUnavailableError",
+            )
+            return
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
@@ -3099,6 +3141,7 @@ class Orchestrator(OrchestratorBase):
 
         companion_state = OrchestratorRequestState(
             request_id=companion_id,
+            pipeline_route=parent_state.pipeline_route,
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,

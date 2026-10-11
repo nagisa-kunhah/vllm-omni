@@ -14,10 +14,10 @@ DEFAULT_CLIENT_ERROR_TYPE = "BadRequestError"
 
 class OmniClientError(ValueError):
     """
-    Request-scoped error that should be surfaced as a 4xx response.
+    Request-scoped error with an explicit HTTP status.
     One example of using OmniClientError is GuardrailViolationError, which is captured and resurfaced
-    as HTTP 400 error code, instead of a generic 500. OmniClientError should be used for any exceptions
-    which need to be resurfaced as 4xx, as opposed to EngineDeadError/EngineGenerateError which are resurfaced as 500.
+    as HTTP 400 error code, instead of a generic 500. A service-unavailable
+    pipeline route uses 503 without marking the whole engine dead.
     """
 
     def __init__(
@@ -72,7 +72,9 @@ def raise_client_error_or(
     Centralizes the "client-error-or-fallback" decision shared by the engine
     error paths so the status mapping lives in one place.
     """
-    if is_client_error_status(status_code):
+    if is_client_error_status(status_code) or (
+        status_code == HTTPStatus.SERVICE_UNAVAILABLE.value and error_type == "PipelineUnavailableError"
+    ):
         raise client_error_from_metadata(
             message,
             status_code=status_code,

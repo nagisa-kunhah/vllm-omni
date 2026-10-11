@@ -197,6 +197,25 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 
 **Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
 
+To deploy one complete pipeline replica per GPU, set the top-level
+`pipeline_deployment` mapping instead of per-stage placement:
+
+```yaml
+pipeline_deployment:
+  mode: colocated_replicas
+  devices: "0,1"
+  num_replicas: 2
+```
+
+Every registered stage starts one local replica on each listed logical CUDA
+device. The host selects one complete pipeline for each request and routes all
+its stages to that device. `num_replicas` is optional and, when present, must
+match the device count. Stage-level `devices`, `num_replicas`, and
+`CUDA_VISIBLE_DEVICES` placement conflict with this mode. It requires one GPU
+per stage replica, one API process, turn-based requests, and `async_chunk: false`.
+It is currently CUDA-only. An unavailable stage replica makes its entire
+pipeline unavailable; active requests on that pipeline do not migrate.
+
 ### Connector schema
 
 Each entry under top-level `connectors:` follows this shape:

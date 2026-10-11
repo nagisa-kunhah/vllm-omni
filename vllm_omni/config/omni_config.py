@@ -40,6 +40,7 @@ from vllm_omni.config.stage_config import (
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
+    PipelineDeploymentConfig,
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
@@ -56,6 +57,7 @@ from vllm_omni.config.stage_config import (
     merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
+    resolve_pipeline_deployment,
     resolve_stage_async_chunk,
     resolve_stage_model_runner,
     update_deploy_config_async_chunk_enabled,
@@ -1619,6 +1621,7 @@ class VllmOmniOrchestratorConfig:
     worker_backend: str = "multi_process"
     ray_address: str | None = None
     deploy_config_path: str | None = None
+    pipeline_deployment: PipelineDeploymentConfig | None = None
     omni_master_address: str | None = None
     omni_master_port: int | None = None
     omni_dp_size_local: int = Field(default=1, ge=1)
@@ -2248,6 +2251,9 @@ class VllmOmniConfig:
             if cli_overrides.get(name) is not None:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
+        deploy = resolve_pipeline_deployment(
+            pipeline_cfg, deploy, cli_overrides=cli_overrides, strategy_specs=strategy_specs
+        )
         deploy = _apply_platform_overrides(deploy)
 
         cli_async_chunk = cli_overrides.get("async_chunk")
@@ -2332,6 +2338,15 @@ class VllmOmniConfig:
             )
             for topology in pipeline_cfg.stages
         )
+        if deploy.pipeline_deployment is not None:
+            for stage in stage_configs:
+                parallel = stage.parallel_config
+                if parallel.world_size != 1 or parallel.data_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                    raise ValueError(
+                        f"pipeline_deployment requires one GPU per stage replica; stage {stage.stage_id} "
+                        f"has world_size={parallel.world_size}, data_parallel_size={parallel.data_parallel_size}, "
+                        f"pipeline_parallel_size={parallel.pipeline_parallel_size}"
+                    )
         if strategy_result is not None:
             from vllm_omni.config.composable_parallel import check_device_layout
 
@@ -2349,6 +2364,7 @@ class VllmOmniConfig:
 
         orchestrator_config = cast(Any, VllmOmniOrchestratorConfig)(
             deploy_config_path=loaded_deploy_config_path,
+            pipeline_deployment=deploy.pipeline_deployment,
             **_orchestrator_cli_overrides(cli_overrides),
         )
         return cast(Any, cls)(

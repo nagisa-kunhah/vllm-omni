@@ -39,6 +39,29 @@ vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --po
 
 For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
 
+### Full-pipeline replicas (experimental)
+
+For two GPUs that can each hold both stages, use the separate throughput profile:
+
+```bash
+MODEL=inclusionAI/Ming-Image-0.1-Design
+vllm serve "$MODEL" --omni \
+  --deploy-config vllm_omni/deploy/ming_image_pipeline_replicas.yaml \
+  --port 8091
+```
+
+The server selects a complete pipeline once per request and keeps both stages on
+the selected GPU. The `pipeline_deployment.devices` list sets the logical CUDA
+device IDs; `num_replicas` must equal its length. Do not set `devices` or
+`num_replicas` on individual stages in this profile. This profile currently
+requires local CUDA serving with one API process, one GPU per stage replica,
+`session_mode: turn`, and `async_chunk: false`. A failed replica's in-flight
+requests fail rather than moving to another GPU; new requests use remaining
+complete replicas. Single-GPU memory fit and two-GPU throughput still need H100
+validation before treating this as a production profile. The example reserves
+0.55 of each GPU for stage 0 and 0.35 for stage 1; tune these budgets after
+measuring actual memory use on the target hardware.
+
 ## Text-to-image
 
 Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.

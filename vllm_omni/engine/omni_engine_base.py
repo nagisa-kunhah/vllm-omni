@@ -56,6 +56,7 @@ from vllm_omni.engine.messages import (
     OutputMessage,
 )
 from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
+from vllm_omni.engine.pipeline_router import PipelineReplicaRouter
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
@@ -124,6 +125,7 @@ class OmniEngineBase:
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
+    _pipeline_router: PipelineReplicaRouter | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -370,6 +372,9 @@ class OmniEngineBase:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
+        pipeline_deployment = getattr(getattr(self, "_config_resolution", None), "pipeline_deployment", None)
+        if pipeline_deployment is None:
+            pipeline_deployment = getattr(getattr(self, "deploy_config", None), "pipeline_deployment", None)
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
             model=self.model,
@@ -388,8 +393,10 @@ class OmniEngineBase:
             request_queue=self.request_queue,
             log_stats=self._log_stats,
             client_config=self._client_config,
+            pipeline_deployment=pipeline_deployment,
         )
         self._runtime.initialize()
+        self._pipeline_router = getattr(self._runtime, "pipeline_router", None)
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
@@ -463,6 +470,7 @@ class OmniEngineBase:
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 event_driven_orch_default=self._event_driven_orch_default,
+                pipeline_router=self._pipeline_router,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

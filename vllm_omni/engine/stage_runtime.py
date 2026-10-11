@@ -35,6 +35,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.pipeline_router import PipelineReplicaRouter, build_pipeline_routes
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -174,6 +175,7 @@ class StageRuntime:
         parallel_stage_init: bool = False,
         log_stats: bool = False,
         client_config: OmniClientConfig | None = None,
+        pipeline_deployment: Any = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -207,6 +209,15 @@ class StageRuntime:
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
         self._mps_servers: dict[str, CudaMPSServer] = {}
+        self._pipeline_deployment = pipeline_deployment
+        self.pipeline_routes = ()
+        self.pipeline_router: PipelineReplicaRouter | None = None
+        if pipeline_deployment is not None:
+            if async_chunk or self._external_stage_addresses or self._client_count != 1:
+                raise ValueError("Pipeline deployment requires local non-chunked serving with one API process")
+            if not current_omni_platform.is_cuda():
+                raise ValueError("Pipeline deployment currently supports CUDA only")
+            self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -599,6 +610,20 @@ class StageRuntime:
         )
         self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
+        if self._pipeline_deployment is not None:
+            self.pipeline_routes = build_pipeline_routes(
+                stage_plans,
+                devices=tuple(d.strip() for d in self._pipeline_deployment.devices.split(",")),
+                visible_devices=self._init_visible_devices_baseline,
+                uuid_for_device=physical_gpu_uuid,
+            )
+            for route in self.pipeline_routes:
+                logger.info(
+                    "Pipeline replica %d: GPU %s, stage replicas %s",
+                    route.pipeline_replica_id,
+                    route.gpu_uuid,
+                    route.stage_replica_ids,
+                )
         return stage_plans
 
     def _finalize_initialized_stages(
@@ -608,6 +633,15 @@ class StageRuntime:
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        if self.pipeline_routes:
+
+            def is_available(stage_id: int, replica_id: int) -> bool:
+                pool = self.stage_pools[stage_id]
+                return pool.is_replica_available(replica_id) and not getattr(
+                    pool.clients[replica_id], "_engine_dead", False
+                )
+
+            self.pipeline_router = PipelineReplicaRouter(self.pipeline_routes, is_available=is_available)
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Hook for runtimes that need infrastructure before replica init."""
@@ -1703,8 +1737,13 @@ def create_stage_runtime(
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
     client_config: OmniClientConfig | None = None,
+    pipeline_deployment: Any = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
+    if pipeline_deployment is not None and (
+        single_stage_mode or omni_master_address or omni_master_port or omni_dp_size_local != 1
+    ):
+        raise ValueError("Pipeline deployment does not support distributed or headless serving")
     if single_stage_mode:
         if not omni_master_address or not omni_master_port:
             raise ValueError("Distributed mode requires omni_master_address and omni_master_port")
@@ -1735,4 +1774,5 @@ def create_stage_runtime(
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
         client_config=client_config,
+        pipeline_deployment=pipeline_deployment,
     )

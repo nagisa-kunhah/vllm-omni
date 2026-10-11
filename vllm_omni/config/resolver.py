@@ -14,7 +14,7 @@ from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_s
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
-from vllm_omni.config.stage_config import PipelineConfig
+from vllm_omni.config.stage_config import PipelineConfig, PipelineDeploymentConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
@@ -30,6 +30,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    pipeline_deployment: PipelineDeploymentConfig | None = None
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -174,6 +175,7 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        pipeline_deployment=structured_config.orchestrator_config.pipeline_deployment,
     )
 
 
