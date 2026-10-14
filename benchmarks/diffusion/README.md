@@ -183,3 +183,39 @@ and checks bitwise repeatability for repeated requests at the same hit boundary.
 Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
 pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
 DFX uses the repository's normal model/cache resolution.
+
+## Qwen-Image-2.1 compilation comparison
+
+`qwen_image_21_compile.py` compares default versus GEMM-autotuned regional
+compilation in a local single-GPU diffusion engine. Both modes use BF16,
+dynamic shapes and explicit decode graphs. The tuned mode enables the scoped
+`diffusion_compile_gemm_autotune` configuration field, with environment-based
+autotuning disabled in both modes. Run baseline first, then tune:
+
+```bash
+python benchmarks/diffusion/qwen_image_21_compile.py \
+  --model Qwen/Qwen-Image-2.1 --output-dir ./qwen-compile --mode baseline
+python benchmarks/diffusion/qwen_image_21_compile.py \
+  --model Qwen/Qwen-Image-2.1 --output-dir ./qwen-compile --mode tune
+```
+
+The default cases cover 1024 short/long prompts, one-reference editing, and
+2048 generation, with one first request and three steady requests each.
+Use `--cases short1024` for a smaller run, `--repetitions` to change sample
+count, and `--revision` to pin the model. Editing uses the baseline short-prompt
+image unless `--reference` supplies the same image for both modes.
+
+Per-mode JSONL files in `analysis/` include request measurements and case
+summaries (steady median/min/max, peak memory, graph fallback counts and repeat
+hash equality). Final decoded arrays and PNGs are saved in `outputs/` for
+cross-mode correctness checks. Records include source/runtime provenance and
+reference-image hashes. Timing excludes output transfer and serialization;
+first-request measurements include lazy work and are not guaranteed cold-cache
+compilation. Preserve the same device and cache settings between modes, and use
+a fresh output directory for an independent experiment. See the
+[regional compilation guide](../../docs/user_guide/diffusion/regional_compilation.md)
+for autotuning configuration and startup tradeoffs.
+
+The [H20 measurement report](qwen_image_21_compile_h20.md) records a pinned
+four-workload comparison, startup costs, output checks and a reversed-order
+baseline measurement.
