@@ -639,6 +639,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-gemm-autotune",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Benchmark ATen and Triton GEMM candidates in the generic diffusion compile path. "
+                "Disabled by default; may improve steady latency at the cost of longer compilation."
+            ),
+        )
+        omni_config_group.add_argument(
             "--enable-cuda-graph-decode",
             action=argparse.BooleanOptionalAction,
             default=None,

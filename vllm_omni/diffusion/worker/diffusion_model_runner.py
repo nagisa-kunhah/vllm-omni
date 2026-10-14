@@ -251,16 +251,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        compile_options: dict[str, Any] = {}
+        if self.od_config.diffusion_compile_gemm_autotune:
+            compile_options.update(max_autotune_gemm=True, max_autotune_gemm_backends="ATEN,TRITON")
+            logger.info("Model runner: %s enables GEMM autotuning with ATen and Triton candidates.", attr_name)
         if getattr(model, "enable_cuda_graph_decode", False):
             # Decode-graph models still compile their blocks: graph capture
             # records the compiled (fused) kernels. Scope inductor cudagraphs
             # to this compile so the two graph layers never stack, without
             # changing torch.compile for every other model in the process.
-            compile_kwargs["options"] = {
-                "triton.cudagraphs": False,
-                "triton.cudagraph_trees": False,
-            }
+            compile_options.update({"triton.cudagraphs": False, "triton.cudagraph_trees": False})
             logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+
+        if compile_options:
+            compile_kwargs["options"] = compile_options
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         try:
