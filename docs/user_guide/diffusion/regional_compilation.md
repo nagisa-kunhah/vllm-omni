@@ -34,6 +34,49 @@ that provide their own `setup_compile()` implementation manage their compilation
 policy independently. Compilation is lazy, so backend or graph errors can first
 surface on the initial request.
 
+## GEMM autotuning
+
+Enable GEMM autotuning for the generic diffusion compilation path with:
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni --diffusion-compile-gemm-autotune
+```
+
+The equivalent per-stage deploy configuration is:
+
+```yaml
+stages:
+  - stage_id: 0
+    diffusion_compile_gemm_autotune: true
+```
+
+Python callers can pass `diffusion_compile_gemm_autotune=True` to `Omni` or
+`OmniDiffusionConfig`. The option defaults to false. Disable it explicitly with
+`--no-diffusion-compile-gemm-autotune` when overriding a stage configuration.
+
+When enabled, the model runner passes `max_autotune_gemm=True` and
+`max_autotune_gemm_backends="ATEN,TRITON"` to the transformer's `torch.compile`.
+These options apply to that compilation without changing process-wide Inductor
+settings. Regional and full compilation scopes both support the option. Dynamic
+shapes remain controlled independently. Existing explicit decode CUDA Graph
+settings are preserved, including disabling Inductor's own graph layer.
+
+Autotuning benchmarks GEMM candidates during compilation, so measure first-request
+and steady latency separately. Compare decoded outputs because changing GEMM
+implementations or fusion can change floating-point rounding. The option follows
+the generic compile lifecycle: `--enforce-eager` bypasses it, and pipelines with
+their own `setup_compile()` implementation manage compilation independently.
+When disabled, the runner leaves GEMM options unset and existing external
+Inductor environment settings still apply.
+
+For a repeatable Qwen-Image-2.1 comparison, use
+[`qwen_image_21_compile.py`](../../../benchmarks/diffusion/qwen_image_21_compile.py).
+Its `tune` mode uses this configuration field, with environment-based autotuning
+disabled in both modes to isolate the change. It records first-request and steady
+timings, graph captures and fallbacks, memory peaks, and decoded outputs. See the
+[benchmark instructions](../../../benchmarks/diffusion/README.md#qwen-image-21-compilation-comparison)
+for the baseline/tuned workflow.
+
 ## Pinning one packed shape (MiniMax-H3)
 
 Compiled regions are keyed by input shape. MiniMax-H3 packs a request into a
