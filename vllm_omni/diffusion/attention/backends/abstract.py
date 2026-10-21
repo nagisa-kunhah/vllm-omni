@@ -86,6 +86,18 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        """Return whether this backend can consume an arbitrary 4D QK mask.
+
+        A dense mask has shape ``[B, H or 1, Q, KV]`` and cannot generally be
+        represented by a padding-only or piecewise-causal FlashAttention plan.
+        Automatic backend selection may fall back to SDPA for calls that
+        require one; an explicit selection must fail with an actionable error.
+        """
+        del attention_spec
+        return False
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         """Whether a 2D mask excludes K/V only, including when Q and K have equal lengths."""
         del attention_spec

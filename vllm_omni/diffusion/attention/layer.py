@@ -770,6 +770,25 @@ class Attention(nn.Module):
                 if blocked is not None:
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and attn_metadata.attn_mask.ndim == 4
+            and self.attn_backend is not None
+            and not self.attn_backend.supports_dense_attention_mask(getattr(self, "attn_spec", None))
+        ):
+            backend_name = self.attn_backend.get_name()
+            if self.backend_explicit:
+                raise NotImplementedError(
+                    f"Attention backend '{backend_name}' was explicitly selected but cannot consume "
+                    "a dense [B, H, Q, KV] attention mask. Select TORCH_SDPA or let the platform "
+                    "default choose the backend for this workload."
+                )
+            logger.warning_once(
+                "Attention backend %s cannot consume a dense [B, H, Q, KV] mask; using SDPA for this call.",
+                backend_name,
+            )
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
         self._assert_metadata_compatible(attn_metadata)
 
         if (

@@ -29,6 +29,11 @@ class CuDNNAttentionBackend(AttentionBackend):
         del attention_spec
         return True
 
+    @classmethod
+    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return list(
