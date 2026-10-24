@@ -30,7 +30,9 @@ class CuDNNAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
-    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        # The dense path forwards attn_mask to scaled_dot_product_cudnn_attention,
+        # which accepts [B, 1, Q, KV] Boolean masks.
         del attention_spec
         return True
 

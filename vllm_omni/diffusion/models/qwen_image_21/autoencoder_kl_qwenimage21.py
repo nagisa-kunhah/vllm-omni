@@ -48,7 +48,17 @@ def _cudnn_deterministic():
     pressure cuDNN may fall back to workspace-limited or non-deterministic
     algorithms, which makes tiled decode results vary run-to-run on shared
     GPUs. Pinning deterministic algorithms removes that source of variance.
+
+    ``torch.backends.cudnn`` also controls MIOpen convolution policy in ROCm
+    builds. Do not force cuDNN's deterministic policy there: MIOpen does not
+    provide a suitable deterministic algorithm for every Qwen-Image 2.1 VAE
+    shape, and the independent Diffusers reference uses MIOpen's default
+    policy as well.
     """
+    if torch.version.hip is not None:
+        yield
+        return
+
     previous = torch.backends.cudnn.deterministic
     torch.backends.cudnn.deterministic = True
     try:
