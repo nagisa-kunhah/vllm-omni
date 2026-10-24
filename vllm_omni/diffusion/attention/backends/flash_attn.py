@@ -204,6 +204,13 @@ class FlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        # NPU forwards dense QK masks to MindIE-SD (or torch_npu for causal
+        # attention). CUDA's padding-only varlen path cannot consume them.
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         if not current_omni_platform.is_cuda():
