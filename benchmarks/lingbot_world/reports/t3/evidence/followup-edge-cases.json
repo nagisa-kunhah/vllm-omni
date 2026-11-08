@@ -1,0 +1,97 @@
+{
+  "cases": [
+    {
+      "size": [
+        48,
+        64
+      ],
+      "layout": "contiguous",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        64
+      ],
+      "layout": "width_slice",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        64
+      ],
+      "layout": "height_slice",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        64
+      ],
+      "layout": "reverse",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        64
+      ],
+      "layout": "readonly",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        66
+      ],
+      "layout": "contiguous",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        66
+      ],
+      "layout": "width_slice",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        66
+      ],
+      "layout": "height_slice",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        66
+      ],
+      "layout": "reverse",
+      "exact_bytes": true,
+      "frames": 12
+    },
+    {
+      "size": [
+        48,
+        66
+      ],
+      "layout": "readonly",
+      "exact_bytes": true,
+      "frames": 12
+    }
+  ],
+  "numpy_lifetime_retained": true,
+  "pyav_version": "18.1.0",
+  "limitations": "No concurrent mutation of input supported; CPU checks only"
+}
