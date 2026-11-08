@@ -334,7 +334,9 @@ async def stream_video(args: argparse.Namespace) -> None:
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
-        async with connect(url, max_size=None) as websocket:
+        # MP4 is already compressed; deflate adds CPU work before output credit
+        # can be returned to the generator, for little reduction in bytes.
+        async with connect(url, max_size=None, compression=None) as websocket:
             ws = websocket
             async with send_lock:
                 await websocket.send(json.dumps(payload))

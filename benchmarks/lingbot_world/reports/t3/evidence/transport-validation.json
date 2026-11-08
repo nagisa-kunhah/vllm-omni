@@ -1,0 +1,38 @@
+[
+  {
+    "compression": "deflate",
+    "negotiated_extension": "permessage-deflate; server_max_window_bits=12; client_max_window_bits=12",
+    "reader_delay_s": 0,
+    "messages": 82,
+    "bytes": 41971695,
+    "sha256": "2dabf9b6d6bfedd7cb1931c692e5f3977bd025dd5012f34008b30ea76a1feeb1",
+    "exact_payload_and_order": true
+  },
+  {
+    "compression": "deflate",
+    "negotiated_extension": "permessage-deflate; server_max_window_bits=12; client_max_window_bits=12",
+    "reader_delay_s": 0.025,
+    "messages": 82,
+    "bytes": 41971695,
+    "sha256": "2dabf9b6d6bfedd7cb1931c692e5f3977bd025dd5012f34008b30ea76a1feeb1",
+    "exact_payload_and_order": true
+  },
+  {
+    "compression": null,
+    "negotiated_extension": null,
+    "reader_delay_s": 0,
+    "messages": 82,
+    "bytes": 41971695,
+    "sha256": "2dabf9b6d6bfedd7cb1931c692e5f3977bd025dd5012f34008b30ea76a1feeb1",
+    "exact_payload_and_order": true
+  },
+  {
+    "compression": null,
+    "negotiated_extension": null,
+    "reader_delay_s": 0.025,
+    "messages": 82,
+    "bytes": 41971695,
+    "sha256": "2dabf9b6d6bfedd7cb1931c692e5f3977bd025dd5012f34008b30ea76a1feeb1",
+    "exact_payload_and_order": true
+  }
+]
