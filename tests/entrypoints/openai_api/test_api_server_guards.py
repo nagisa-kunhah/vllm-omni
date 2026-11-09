@@ -95,7 +95,18 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize(
+    ("disable_compression", "uvicorn_kwargs", "expected_kwargs"),
+    [
+        (False, {}, {}),
+        (False, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": True}),
+        (False, {"ws_per_message_deflate": False}, {"ws_per_message_deflate": False}),
+        (True, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": False}),
+    ],
+)
+async def test_omni_run_server_worker_forwards_client_config(
+    monkeypatch, disable_compression, uvicorn_kwargs, expected_kwargs
+):
     captured: dict[str, object] = {}
 
     @asynccontextmanager
@@ -113,18 +124,20 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
 
-    async def fake_serve_http(app, **_kwargs):
+    async def fake_serve_http(app, **kwargs):
         assert app.state.api_server_count == 2
+        actual = {key: value for key, value in kwargs.items() if key == "ws_per_message_deflate"}
+        assert actual == expected_kwargs
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
 
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
-    args = _minimal_args(model="dummy")
+    args = _minimal_args(model="dummy", disable_websocket_compression=disable_compression)
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **uvicorn_kwargs)
     assert captured["client_config"] is config
 
 

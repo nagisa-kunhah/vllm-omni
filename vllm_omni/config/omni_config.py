@@ -78,6 +78,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "disable_websocket_compression",
         "command",
         "headless",
         "model",
