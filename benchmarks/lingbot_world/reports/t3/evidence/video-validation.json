@@ -1,0 +1,44 @@
+[
+  {
+    "path": "artifacts/t3_profile/handoff/no_deflate/session_00/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  },
+  {
+    "path": "artifacts/t3_profile/handoff/no_deflate/session_01/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  },
+  {
+    "path": "artifacts/t3_profile/handoff/no_deflate/session_02/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  },
+  {
+    "path": "artifacts/t3_profile/handoff/deflate_control/session_00/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  },
+  {
+    "path": "artifacts/t3_profile/handoff/deflate_control/session_01/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  },
+  {
+    "path": "artifacts/t3_profile/handoff/deflate_control/session_02/video.mp4",
+    "frames": 477,
+    "expected": 477,
+    "ordered": true,
+    "passed": true
+  }
+]

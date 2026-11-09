@@ -1,0 +1,26 @@
+[
+  {
+    "session": "copy0",
+    "frames": 285,
+    "strictly_ordered_pts": true,
+    "controls_presented": 3
+  },
+  {
+    "session": "borrow0",
+    "frames": 285,
+    "strictly_ordered_pts": true,
+    "controls_presented": 3
+  },
+  {
+    "session": "borrow1",
+    "frames": 285,
+    "strictly_ordered_pts": true,
+    "controls_presented": 3
+  },
+  {
+    "session": "copy1",
+    "frames": 285,
+    "strictly_ordered_pts": true,
+    "controls_presented": 3
+  }
+]

@@ -1,0 +1,36 @@
+{
+  "live_deflate": {
+    "chunks": 24,
+    "frame_callbacks": 285,
+    "quality": {
+      "totalVideoFrames": 285,
+      "droppedVideoFrames": 23
+    },
+    "latencies_ms": {
+      "control-00": 2750.3999998092663,
+      "control-01": 2500.3000000953684,
+      "control-02": 2516.600000190735
+    },
+    "stall_seconds": 9.861300001144414,
+    "stall_count": 23,
+    "boundary_misses": [],
+    "ordered_media_times": true
+  },
+  "live_no_deflate": {
+    "chunks": 24,
+    "frame_callbacks": 285,
+    "quality": {
+      "totalVideoFrames": 285,
+      "droppedVideoFrames": 23
+    },
+    "latencies_ms": {
+      "control-00": 2617.9999999999986,
+      "control-01": 2351.1000003814715,
+      "control-02": 2334.100000381472
+    },
+    "stall_seconds": 8.218399999141695,
+    "stall_count": 23,
+    "boundary_misses": [],
+    "ordered_media_times": true
+  }
+}
